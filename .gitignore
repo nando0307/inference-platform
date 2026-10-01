@@ -1,0 +1,24 @@
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# Local environment files and secrets
+.env
+.env.*
+!.env.example
+
+# macOS
+.DS_Store
+
+# Local model artifacts and logs
+/models/
+/logs/
+
+# Model weights stored elsewhere
+*.bin
+*.safetensors
+*.gguf
