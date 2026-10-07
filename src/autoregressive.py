@@ -1,5 +1,22 @@
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+)
+
+print("Decoding method:")
+print("1. Greedy")
+print("2. Sampling")
+
+while True:
+    choice = input("Choose 1 or 2: ").strip()
+
+    if choice in {"1", "2"}:
+        break
+
+    print("Please enter 1 or 2.")
+
+temperature = 0.7
 
 print("Loading Model... ")
 model_name = "Qwen/Qwen2.5-0.5B-Instruct"
@@ -53,15 +70,26 @@ with torch.inference_mode():
             use_cache=False,
         )
 
-        # 2. Get next-token scores: [1, S, V] -> [1,V]
-        next_token_logits = outputs.logits[:, -1, :]
+        # 2. choose the next token
+        next_token_logits = outputs.logits[:, -1, :]  # [1, V]
+        if choice == "1":
+            # Greedy
+            next_token = torch.argmax(
+                next_token_logits,
+                dim=-1,
+                keepdim=True,
+            )
+        else:
+            # Sampling
+            probabilities = torch.softmax(
+                next_token_logits / temperature,
+                dim=-1,
+            )
 
-        # 3. Choose one token, retaining shape [1,1]
-        next_token = torch.argmax(
-            next_token_logits,
-            dim=-1,
-            keepdim=True,
-        )
+            next_token = torch.multinomial(
+                probabilities,
+                num_samples=1,
+            )
 
         # 4. Append the chosen token and its mask entry
         input_ids = torch.cat([input_ids, next_token], dim=1)
@@ -79,7 +107,7 @@ with torch.inference_mode():
             f"text={tokenizer.decode([token_id])!r}"
         )
 
-        # 5. Stop if the model chose an end-of-sequence token.
+        # 4. Stop if the model chose an end-of-sequence token.
         if token_id in eos_token_ids:
             print("Stopped: end-of-sequence token.")
             break
