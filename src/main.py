@@ -33,7 +33,7 @@ text = tokenizer.apply_chat_template(
 model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
 
 with torch.inference_mode():
-    outputs = model(**model_inputs)
+    outputs = model(**model_inputs, use_cache=False)
 
 logits = outputs.logits
 prob = torch.softmax(logits[0, -1, :], dim=-1)
@@ -56,7 +56,43 @@ next_token_logits = logits[0, -1, :]
 print("Next-token logits shape:", next_token_logits.shape)
 print("First 10 vocabulary scores:", next_token_logits[:10])
 
-logits = outputs.logits
+next_token_id = torch.argmax(next_token_logits, dim=-1).item()
+
+print("Chosen token ID:", next_token_id)
+print("Chosen token text:", repr(tokenizer.decode([next_token_id])))
+
+# original input
+input_ids = model_inputs["input_ids"]
+# match the next token with input id's dtype and device
+next_token_tensor = input_ids.new_tensor([[next_token_id]])
+
+extended_ids = torch.cat([input_ids, next_token_tensor], dim=1)
+extended_mask = torch.cat(
+    [model_inputs["attention_mask"], torch.ones_like(next_token_tensor)],
+    dim=1,
+)
+print("\nBefore append:", input_ids.shape)
+print("After append:", extended_ids.shape)
+
+with torch.inference_mode():
+    second_outputs = model(
+        input_ids=extended_ids,
+        attention_mask=extended_mask,
+        use_cache=False,
+    )
+
+second_token_logits = second_outputs.logits[0, -1, :]
+second_token_id = torch.argmax(second_token_logits).item()
+
+print("Second forward-pass logits:", second_outputs.logits.shape)
+print("Second token ID:", second_token_id)
+print("Second token text:", repr(tokenizer.decode([second_token_id])))
+
+print(
+    "First two generated tokens:",
+    repr(tokenizer.decode([next_token_id, second_token_id])),
+)
+
 
 # generated_ids = [
 #     output_ids[len(input_ids) :]
