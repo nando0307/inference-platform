@@ -1,5 +1,5 @@
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 print("Loading Model... ")
 model_name = "Qwen/Qwen2.5-0.5B-Instruct"
@@ -31,6 +31,24 @@ text = tokenizer.apply_chat_template(
     add_generation_prompt=True,
 )
 model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+input_ids = model_inputs["input_ids"]
+embedding_layer = model.get_input_embeddings()
+with torch.inference_mode():
+    embeddings = embedding_layer(input_ids)
+
+print("\nToken IDs shape:", input_ids.shape)
+print("Embedding table shape:", embedding_layer.weight.shape)
+print("Input embeddings shape:", embeddings.shape)
+
+
+# Inspect Qwen's actual attention dimensions
+config = model.config
+
+print("\nHidden dimension:", config.hidden_size)
+print("Query heads:", config.num_attention_heads)
+print("Key/value heads:", config.num_key_value_heads)
+print("Transformer layers:", config.num_hidden_layers)
+
 
 with torch.inference_mode():
     outputs = model(**model_inputs, use_cache=False)
