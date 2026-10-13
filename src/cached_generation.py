@@ -3,6 +3,7 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
 )
+from time import perf_counter
 
 print("Loading Model... ")
 model_name = "Qwen/Qwen2.5-0.5B-Instruct"
@@ -42,18 +43,33 @@ elif isinstance(eos_token_ids, int):
     eos_token_ids = [eos_token_ids]
 
 with torch.inference_mode():
+    # Warm up the prompt-forward path. Do not reuse this run's cache.
+    warmup_outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        use_cache=True,
+    )
+    del warmup_outputs
     # Prefill: process the entire prompt once.
+    prefill_start = perf_counter()
+
     outputs = model(
         input_ids=input_ids,
         attention_mask=attention_mask,
         use_cache=True,
     )
+
+    prefill_seconds = perf_counter() - prefill_start
     past_key_values = outputs.past_key_values
 
     print("Input IDs shape:", input_ids.shape)
     print("Logits shape:", outputs.logits.shape)
     print("Cache type:", type(past_key_values).__name__)
     print("Cached sequence length:", past_key_values.get_seq_length())
+
+    decode_start = None
+    decode_seconds = 0.0
+    stop_reason = "maximum new tokens"
 
     for step in range(max_new_tokens):
         # Select from prefill logits first, then from the previous decode step.
@@ -65,21 +81,16 @@ with torch.inference_mode():
         token_id = next_token.item()
         generated_ids.append(token_id)
 
-        print(
-            f"Step {step + 1}: "
-            f"id={token_id}, "
-            f"text={tokenizer.decode([token_id])!r}, "
-            f"logits={tuple(outputs.logits.shape)}, "
-            f"cache_length={past_key_values.get_seq_length()}"
-        )
-
         # Selection does not grow the cache. Stop before an unnecessary forward pass.
         if token_id in eos_token_ids:
-            print("Stopped: end-of-sequence token.")
+            stop_reason = "end-of-sequence token"
             break
         if step + 1 == max_new_tokens:
-            print("Stopped: maximum new tokens.")
             break
+
+        # Start after selecting token 1, only if another token is needed.
+        if step == 0:
+            decode_start = perf_counter()
 
         attention_mask = torch.cat(
             [attention_mask, torch.ones_like(next_token)],
@@ -95,5 +106,13 @@ with torch.inference_mode():
         )
         past_key_values = outputs.past_key_values
 
+    if decode_start is not None:
+        decode_seconds = perf_counter() - decode_start
+
+print(f"Prompt forward-pass time: {prefill_seconds * 1000:.2f} ms")
+print(f"Subsequent generation time: {decode_seconds * 1000:.2f} ms")
+print(f"Tokens generated after the first: {max(0, len(generated_ids) - 1)}")
+print(f"Final cache length: {past_key_values.get_seq_length()}")
+print(f"Stopped: {stop_reason}.")
 print("\nResponse:")
 print(tokenizer.decode(generated_ids, skip_special_tokens=True))

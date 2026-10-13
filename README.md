@@ -53,7 +53,7 @@ attention scores, run the full Transformer, or create a KV cache.
 ## Uncached autoregressive generation
 
 ```bash
-python src/autoregressive.py
+python src/uncached_generation.py
 ```
 
 At the terminal prompt, choose:
@@ -68,7 +68,7 @@ prompt. Each iteration processes the entire current sequence with
 extending the attention mask. Previous positions are recomputed at every step.
 
 Generation stops at one of the model's configured EOS token IDs or after
-`max_new_tokens` (currently 1000). Each step prints the updated sequence length,
+`max_new_tokens` (currently 100). Each step prints the updated sequence length,
 selected token ID, and token text. The final response decodes only the generated
 IDs, excluding the prompt. Individual token text is diagnostic only.
 
@@ -81,12 +81,24 @@ Run `python src/cached_generation.py` in the project environment.
 
 The script processes the prompt once (prefill), then passes only the newest
 selected token and the existing KV cache into each decode forward pass.
-It prints token IDs, logits shapes, and cache lengths, then decodes the generated
-IDs together into the final response. Individual token text is diagnostic only.
+It prints prompt tensor shapes and cache information, then decodes the generated
+IDs together into the final response. There is no per-token printing in the loop.
 
 Generation stops at a configured EOS token or `max_new_tokens` (currently 100).
 The last selected token is not fed back into the model after stopping, so the
 final cache length is prompt length + generated token count - 1.
-Keep `src/autoregressive.py` as the uncached comparison, with matching prompts
+Keep `src/uncached_generation.py` as the uncached comparison, with matching prompts
 and greedy settings. Matching tokens checks generation mechanics, not factual
 accuracy or speed.
+
+On CPU, the script reports one prompt forward-pass time after an untimed prompt
+warm-up, whose outputs and cache are discarded. It separately times subsequent
+generation, starting after selecting token 1 and ending after selecting the last
+token and checking its stopping condition. For 100 output tokens, that interval
+covers 99 decode forward passes and their token selections, plus attention-mask
+updates and Python loop overhead. Loading, tokenization, diagnostic printing,
+and final text decoding are outside both timed intervals.
+
+These are single-run observations, not repeated benchmark estimates. The prompt
+forward-pass time is not full time to first token, and the prompt-only warm-up
+does not separately warm up the single-token decode path.
