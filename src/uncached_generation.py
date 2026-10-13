@@ -29,7 +29,7 @@ model.eval()
 print("Loading tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-prompt = "Hello world! Which paper mark the turning point for AI research? Write it in 25 words."
+prompt = "Hello world! Which paper mark the turning point for AI research?"
 tokens = tokenizer.tokenize(prompt)
 print(f"tokens for the prompt: {tokens}")
 ids = tokenizer.convert_tokens_to_ids(tokens)
@@ -53,7 +53,7 @@ input_ids = model_inputs["input_ids"]
 attention_mask = model_inputs["attention_mask"]
 
 prompt_length = input_ids.shape[1]
-max_new_tokens = 1000
+max_new_tokens = 100
 
 eos_token_ids = model.generation_config.eos_token_id
 if eos_token_ids is None:
