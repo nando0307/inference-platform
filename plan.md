@@ -46,7 +46,8 @@ with evidence.
 - Review my code and reasoning.
 - Help distinguish application bugs, environment problems, and library issues.
 - Offer hints before complete solutions.
-- Avoid modifying my files unless I explicitly request it.
+- Explain proposed file changes and wait for explicit confirmation before editing.
+  Pasted results or a request to continue learning are not edit permission.
 
 ### How I will ask for help
 
@@ -76,10 +77,10 @@ For experiments:
 
 ### Keep the roadmap separate from the lab notes
 
-Use `plan.md` as the stable roadmap. Keep the active assignment, predictions,
-commands, results, and open questions in a separate lab notebook such as
-`docs/lab-notes.md` when the README becomes crowded. Do not create empty
-documentation files in advance.
+Use `plan.md` as the stable roadmap. The active checkpoint, commands, results,
+and open questions live in [logs/practice.md](logs/practice.md). Read that handoff
+before resuming a session; roadmap checkboxes are not a live completion ledger.
+Do not create empty documentation files in advance.
 
 Work on one bounded question at a time. End each assignment with a short
 "what I learned" note and a working Git checkpoint. A stage is complete when
@@ -1267,38 +1268,20 @@ reference before writing code.
 
 ---
 
-# 10. Immediate Next Assignment
+# 10. Current Checkpoint and Next Assignment
 
-## Assignment: Inspect One Next-Token Prediction
+Read [the session handoff in logs/practice.md](logs/practice.md) first.
+The earlier one-token prediction assignment has been completed, followed by
+manual greedy generation, basic sampling, Q/K/V inspection, cache reuse, and
+a first single-run cached-versus-uncached timing comparison.
 
-Do this before starting the API.
+The learner stopped after the 34-token-prompt, 100-output-token comparison
+to prepare a Git checkpoint. The measured results and exact timer boundaries
+are recorded in the handoff. Do not restart the one-token exercise or assume
+that every Stage 1 acceptance criterion has been completed.
 
-### Tasks
+The next proposed assignment is a controlled longer-prompt comparison, holding
+model, CPU float32, greedy decoding, EOS rules, and output limit fixed.
+It has not been implemented or measured. Discuss the prediction first and
+obtain explicit confirmation before modifying files.
 
-1. Reuse the working model and tokenized input.
-2. Run one forward pass without `generate()`.
-3. Print the logits shape.
-4. Select the next-token logits.
-5. Convert them to probabilities.
-6. Display the five highest-probability candidates.
-7. Check that probabilities across the full vocabulary sum approximately to one;
-   the displayed top five generally will not.
-
-### Bring to the review
-
-- The code I added.
-- The actual logits shape.
-- The five candidates and probabilities.
-- My explanation of the tensor dimensions.
-- My explanation of why I selected the final input position.
-- My prediction of which token greedy decoding would choose.
-
-### Completion condition
-
-I can explain the result without relying on “the library does it.”
-
-Use a short fixed prompt and evaluation/inference mode. Do not interpret token
-probability as the probability that an eventual answer is true.
-
-Only then move on to choosing a token and building the short manual generation
-loop.

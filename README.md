@@ -6,6 +6,13 @@ my dream is to becoming a llm engineer xD
 ```
 ```
 
+## Current learning checkpoint
+
+Read [the session handoff in logs/practice.md](logs/practice.md) before continuing
+with a new mentor. It records the completed cached/uncached timing experiment,
+measured results, edit-permission requirements, and the next unstarted experiment.
+Use [plan.md](plan.md) for the broader roadmap.
+
 ## Inspect tokenization and two-token generation
 
 Run from the repository root in the project environment:
@@ -63,14 +70,16 @@ At the terminal prompt, choose:
   then selecting a token with `torch.multinomial`.
 
 The script uses the same Qwen model in float32 and prepares a chat-formatted
-prompt. Each iteration processes the entire current sequence with
-`use_cache=False`, selects a token, and appends it to the input IDs while
-extending the attention mask. Previous positions are recomputed at every step.
+prompt. After prefill, it selects a token and, if generation continues, appends
+it to the input IDs and extends the attention mask. Each subsequent forward
+processes the entire growing sequence with `use_cache=False`.
 
-Generation stops at one of the model's configured EOS token IDs or after
-`max_new_tokens` (currently 100). Each step prints the updated sequence length,
-selected token ID, and token text. The final response decodes only the generated
-IDs, excluding the prompt. Individual token text is diagnostic only.
+Generation stops at a configured EOS token ID or `max_new_tokens` (currently 100).
+It reports prompt forward-pass time, subsequent-generation time, actual tokens
+generated after the first, and the stop reason. Both timers use the same
+boundaries as the cached script below, following an untimed prompt warm-up.
+There is no per-token printing inside the timed loop. The final response decodes
+only the generated IDs, excluding the prompt.
 
 Sampling currently has no top-k or top-p filtering and no fixed random seed,
 so sampled responses can differ between runs.
