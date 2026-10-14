@@ -16,7 +16,20 @@ model.eval()
 print("Loading tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-prompt = "Hello world! Which paper mark the turning point for AI research?"
+prompt = (
+    "Read the following background information.\n\n"
+    + (
+        "An inference service receives a request, tokenizes the prompt, "
+        "runs a language model, and returns generated tokens. "
+        "The service must balance response latency, throughput, and memory use."
+        "A longer context gives the model more information to attend to, "
+        "but also increases the amount of attention state involved in generation.\n"
+    )
+    * 8
+    + "\nExplain how an inference service processes a request, "
+    "from receiving the prompt to returning the generated response. "
+    "Give a detailed explanation."
+)
 
 messages = [
     {"role": "system", "content": "You are Qwen, a helpful assistant"},
@@ -67,6 +80,22 @@ with torch.inference_mode():
     print("Cache type:", type(past_key_values).__name__)
     print("Cached sequence length:", past_key_values.get_seq_length())
 
+    first_layer = past_key_values.layers[0]
+
+    print("First-layer keys shape:", first_layer.keys.shape)
+    print("First-layer values shape:", first_layer.values.shape)
+    print("Cache dtype:", first_layer.keys.dtype)
+    print("Bytes per element:", first_layer.keys.element_size())
+    print("Cached layers:", len(past_key_values.layers))
+
+    prefill_cache_bytes = 0
+
+    for layer in past_key_values.layers:
+        prefill_cache_bytes += layer.keys.numel() * layer.keys.element_size()
+        prefill_cache_bytes += layer.values.numel() * layer.values.element_size()
+
+    print(f"KV storage after prefill: {prefill_cache_bytes / 1024**2:.2f} MiB")
+
     decode_start = None
     decode_seconds = 0.0
     stop_reason = "maximum new tokens"
@@ -116,3 +145,10 @@ print(f"Final cache length: {past_key_values.get_seq_length()}")
 print(f"Stopped: {stop_reason}.")
 print("\nResponse:")
 print(tokenizer.decode(generated_ids, skip_special_tokens=True))
+final_cache_bytes = 0
+
+for layer in past_key_values.layers:
+    final_cache_bytes += layer.keys.numel() * layer.keys.element_size()
+    final_cache_bytes += layer.values.numel() * layer.values.element_size()
+
+print(f"KV storage after generation: {final_cache_bytes / 1024**2:.2f} MiB")

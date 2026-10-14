@@ -16,8 +16,8 @@ venv/
 
 # Local model artifacts and logs
 /models/
-/logs/
-
+/logs/*
+!/logs/*.md
 # Model weights stored elsewhere
 *.bin
 *.safetensors

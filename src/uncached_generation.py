@@ -31,7 +31,20 @@ model.eval()
 print("Loading tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-prompt = "Hello world! Which paper mark the turning point for AI research?"
+prompt = (
+    "Read the following background information.\n\n"
+    + (
+        "An inference service receives a request, tokenizes the prompt, "
+        "runs a language model, and returns generated tokens. "
+        "The service must balance response latency, throughput, and memory use."
+        "A longer context gives the model more information to attend to, "
+        "but also increases the amount of attention state involved in generation.\n"
+    )
+    * 8
+    + "\nExplain how an inference service processes a request, "
+    "from receiving the prompt to returning the generated response. "
+    "Give a detailed explanation."
+)
 tokens = tokenizer.tokenize(prompt)
 print(f"tokens for the prompt: {tokens}")
 ids = tokenizer.convert_tokens_to_ids(tokens)
