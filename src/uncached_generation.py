@@ -4,6 +4,7 @@ import torch
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
+    GenerationConfig,
 )
 
 print("Decoding method:")
@@ -31,20 +32,7 @@ model.eval()
 print("Loading tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-prompt = (
-    "Read the following background information.\n\n"
-    + (
-        "An inference service receives a request, tokenizes the prompt, "
-        "runs a language model, and returns generated tokens. "
-        "The service must balance response latency, throughput, and memory use."
-        "A longer context gives the model more information to attend to, "
-        "but also increases the amount of attention state involved in generation.\n"
-    )
-    * 8
-    + "\nExplain how an inference service processes a request, "
-    "from receiving the prompt to returning the generated response. "
-    "Give a detailed explanation."
-)
+prompt = "Reply with exactly one word: Hello"
 tokens = tokenizer.tokenize(prompt)
 print(f"tokens for the prompt: {tokens}")
 ids = tokenizer.convert_tokens_to_ids(tokens)
@@ -158,3 +146,33 @@ print(f"Tokens generated after the first: {max(0, len(generated_ids) - 1)}")
 print(f"Stopped: {stop_reason}.")
 print("\nResponse:")
 print(tokenizer.decode(generated_ids, skip_special_tokens=True))
+
+
+comparison_config = GenerationConfig(
+    do_sample=False,
+    num_beams=1,
+    repetition_penalty=1.0,
+    max_new_tokens=max_new_tokens,
+    use_cache=False,
+    eos_token_id=model.generation_config.eos_token_id,
+    pad_token_id=tokenizer.pad_token_id,
+    temperature=1.0,
+    top_p=1.0,
+    top_k=50,
+)
+
+with torch.inference_mode():
+    reference_output = model.generate(
+        **model_inputs,
+        generation_config=comparison_config,
+    )
+
+# generate() returns the prompt followed by the generated tokens.
+prompt_length = model_inputs["input_ids"].shape[1]
+reference_ids = reference_output[0, prompt_length:].tolist()
+
+print("\nManual generated tokens:", len(generated_ids))
+print("Hugging Face generated tokens:", len(reference_ids))
+print("Exact token-ID match:", generated_ids == reference_ids)
+
+assert generated_ids == reference_ids, "Manual and Hugging Face token IDs differ."

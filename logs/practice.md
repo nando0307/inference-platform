@@ -5,18 +5,19 @@ my dream is to becoming a llm engineer xD
 ```
 
 
-# Session handoff: 2026-10-13
+# Session handoff: 2026-10-14
 
 ## Start here, next mentor
 
-The learner has completed manual cached and uncached generation, single-run
-timing comparisons with 34-token and 516-token prompts, and direct inspection
-of KV tensor storage after prefill and generation. Do not restart at installing
-Transformers, `model.generate()`, tokenization, or selecting one token.
+The learner has completed manual cached and uncached generation, short/long
+prompt timing comparisons, KV tensor storage inspection, token-ID comparisons
+against Hugging Face `generate()` for token-limit and EOS stopping, and an
+initial synchronized CPU/MPS float32 comparison. Do not restart the basics.
 
-This is Stage 1's basic KV-cache/prefill/decode work, extended with introductory
-timing and memory experiments. It is not completion of the full benchmarking,
-cache-scaling, or serving roadmap.
+The next milestone discussed is a minimal single-worker HTTP server using
+Transformers `generate()`, retaining the manual scripts as learning references.
+Manual top-k/top-p lessons were explicitly skipped, not completed. No server
+has been implemented or authorized by this documentation update.
 The stable roadmap is [plan.md](../plan.md); its checkboxes are not a live
 completion ledger. Use this handoff and the actual code for the current state.
 
@@ -32,7 +33,8 @@ completion ledger. Use this handoff and the actual code for the current state.
 - The learner explicitly declined repeated runs and median calculations for
   this experiment. Respect that choice and label results as single-run
   observations, not statistically stable benchmarks.
-- Do not jump to FastAPI, vLLM, GPU optimization, or a larger architecture yet.
+- Move toward the minimal local API next; do not jump to vLLM, CUDA,
+  multi-worker infrastructure, or a larger architecture yet.
 - This project runs Qwen locally, not through an OpenAI inference API.
 
 ## Current scripts
@@ -45,15 +47,21 @@ completion ledger. Use this handoff and the actual code for the current state.
 - `src/uncached_generation.py`: renamed from `src/autoregressive.py`; menu
   choice `1` is greedy, `2` is temperature-0.7 multinomial sampling. Recomputes
   the growing prefix with `use_cache=False`. Includes prompt warm-up and
-  separate prompt/subsequent-generation timers.
+  separate prompt/subsequent-generation timers and a greedy `generate()`
+  token-ID comparison. Choose menu option `1` for that comparison; the appended
+  reference is greedy even if the manual path's sampling option is chosen.
 - `src/cached_generation.py`: greedy generation; full-prompt prefill followed
   by single-token forwards passing `past_key_values`, with a full growing
   attention mask. Includes matching warm-up and timing boundaries, first-layer
   K/V shape/dtype inspection, and total KV tensor bytes before and after generation.
+  It now selects `device = "cpu"` or `"mps"` while retaining float32, synchronizes
+  MPS at timer boundaries, and compares output IDs against cached `generate()`.
+  The current saved device is `"cpu"`.
 - Both generation scripts use a 100-new-token limit and the model's configured
   EOS IDs, decode the generated IDs together, and print outside the timed loop.
-- Both generation scripts currently contain the same 516-token long prompt.
-  The 34-token prompt below is a historical baseline, not the current input.
+- Both scripts currently use `Reply with exactly one word: Hello`, which yields
+  28 chat-formatted prompt tokens. The 34-token and 516-token prompts below are
+  historical experiment inputs, not the current input.
 
 ## Concepts covered and demonstrated
 
@@ -136,8 +144,8 @@ measurement of length alone.
 The learner ran `python src/uncached_generation.py` with menu choice `1`, then
 `python src/cached_generation.py`. Both reported 516 input tokens and 99 tokens
 after the first, stopping at the 100-token limit. The pasted responses matched;
-unlike the short-prompt comparison, no programmatic long-prompt token-ID equality
-check was recorded.
+at this point no programmatic long-prompt token-ID equality check was recorded.
+Experiment 4 later verified both manual paths against Hugging Face on this prompt.
 
 Actual prompt used in both scripts:
 
@@ -281,6 +289,139 @@ Both reported 99 tokens after the first and stopped at the token limit.
 Do not cherry-pick the fastest timing across these runs or pair one with an
 unrelated uncached run as though they were a new controlled comparison.
 
+## Experiment 4: manual generation versus Hugging Face
+
+### What was compared
+
+Reuse the same loaded model and the original `model_inputs`. Match model,
+device, dtype, attention mask, EOS IDs, output limit, and greedy settings.
+Do not pass the already-grown input sequence or completed cache into the
+reference call.
+
+Each script now creates a `GenerationConfig` and calls `model.generate()`
+after the manual experiment, outside its timed intervals. For this decoder-only
+model, the reference returns prompt plus generated tokens; slice off the
+original prompt length before comparing against the manual `generated_ids`.
+The comparison prints token counts and exact list equality, then asserts it.
+
+### User-reported correctness results
+
+| Input and stopping case | Manual cached vs cached generate | Manual uncached vs uncached generate |
+|---|---|---|
+| 516-token prompt, 100 output tokens, token limit | Exact token-ID match | Exact token-ID match |
+| 28-token prompt, 10 output tokens including EOS | Exact token-ID match | Exact token-ID match |
+
+The short prompt is `Reply with exactly one word: Hello`. The observed response
+was `Hello! How can I assist you today?`. Ignoring the one-word instruction is
+model behavior, not a generation-loop mismatch. Both paths stopped on EOS
+before the 100-token limit.
+
+For the short cached run: 28 prefill positions, 9 subsequent generated tokens,
+and final cache length `28 + 9 = 37`. Printed logical KV storage was 0.66 MiB
+after prefill and 0.87 MiB after generation.
+
+### Generation defaults correction
+
+The initial comparison warned that `temperature`, `top_p`, and `top_k` were
+invalid for greedy decoding. Inspection of the installed Transformers code
+showed that unset `GenerationConfig` fields are filled from the model's saved
+configuration. A fresh config alone does not isolate all model defaults.
+
+The learner made these settings explicit in both comparison configs:
+
+```python
+do_sample=False
+num_beams=1
+repetition_penalty=1.0
+temperature=1.0
+top_p=1.0
+top_k=50
+```
+
+`top_k=50` is the installed library's default accepted by greedy validation;
+it does not restrict greedy selection because sampling filters are inactive
+when `do_sample=False`. Each script uses its matching `use_cache` setting,
+the model's EOS IDs, tokenizer pad ID, and the same `max_new_tokens`.
+Later learner runs showed exact matches without the warning.
+
+These cases establish agreement on the tested inputs and stopping conditions,
+not universal equivalence or factual accuracy. Sampling parity is not tested.
+
+## Experiment 5: CPU versus Apple GPU (MPS)
+
+### Setup and timing correction
+
+The learner confirmed `torch.backends.mps.is_built()` and `is_available()`
+both returned `True`. MPS is PyTorch's Apple GPU backend, not CUDA.
+
+Use only `src/cached_generation.py` for the device comparison. Keep Qwen 0.5B,
+float32, batch size 1, the same 28-token prompt, greedy selection, cache reuse,
+EOS rules, and the 100-token limit fixed. Move the loaded model with `.to(device)`;
+the existing `.to(model.device)` moves tokenizer outputs to the same device.
+
+Initial MPS execution was correct but lacked explicit synchronization. Its
+reported 158.91 ms prefill and 797.98 ms subsequent time are not the final
+properly bounded CPU/MPS comparison. GPU work can be queued before completion.
+
+Four conditional `torch.mps.synchronize()` calls were added:
+
+1. Before starting the prefill timer, so warm-up work has finished.
+2. Before stopping the prefill timer, so measured prompt work has finished.
+3. Before starting the subsequent-generation timer.
+4. Before stopping that timer.
+
+These guards run only when `device == "mps"`. They do not introduce an explicit
+synchronize after every forward call, although the loop's `next_token.item()`
+already requires each selected token to become available to Python.
+Synchronization corrects measurement boundaries; it is not a speed optimization.
+
+### Final paired observations reported by the learner
+
+The learner ran MPS first, then CPU, using the same cached script.
+
+| Measurement | CPU float32 | MPS float32 |
+|---|---:|---:|
+| Prompt tokens | 28 | 28 |
+| Generated tokens including EOS | 10 | 10 |
+| Prompt forward pass | 80.29 ms | 43.95 ms |
+| Subsequent generation, 9 tokens | 669.87 ms | 246.99 ms |
+| Average subsequent time/token | 74.43 ms | 27.44 ms |
+| Final cache length | 37 | 37 |
+| Final logical K/V storage | 0.87 MiB | 0.87 MiB |
+| Manual vs generate on that device | Exact match | Exact match |
+
+Observed MPS speedup: `80.29 / 43.95 = 1.83x` for prefill and
+`669.87 / 246.99 = 2.71x` for subsequent generation.
+
+The printed responses matched across devices, and the exact token-ID assertion
+passed against `generate()` on each device. No separate cross-device ID
+comparison was recorded. Equal logical K/V bytes reflect equal shapes and dtype,
+not necessarily equal total memory allocations on the two backends.
+
+This is one short single-request observation per device, not a steady-state
+benchmark or a guarantee for other prompts. Only prompt warm-up is performed;
+first-use decode initialization is not separately excluded. Do not mix these
+measurements with the earlier 516-token runs.
+
+## Sampling scope and planned HTTP behavior
+
+The learner said they had already explored temperature and explicitly chose to
+skip the manual top-k/top-p lessons. Mark these skipped, not implemented.
+
+- The manual cached loop remains greedy only.
+- The manual uncached loop supports greedy or temperature-based multinomial
+  sampling, but neither manual loop implements top-k/top-p filtering.
+- Proposed server path: keep these scripts as educational references and use
+  Hugging Face `generate()` for the first HTTP implementation.
+- A client can request supported sampling settings, but the server must validate
+  them and pass them to a runtime that actually implements them. Do not accept
+  parameters and silently ignore them.
+- The planned initial API includes `top_p`; top-k can remain an explicit internal
+  setting rather than a public request field. Sampling filters are inactive for
+  greedy decoding. Define and document parameter combinations accordingly.
+- Make generation defaults explicit instead of inheriting Qwen's saved defaults.
+  Skipping manual filter implementation does not prevent using library sampling.
+
 ## Repository checkpoints and documentation
 
 Recent commits inspected while updating this log:
@@ -290,10 +431,12 @@ Recent commits inspected while updating this log:
 | `e18ed80` | 2026-10-12 | Cached greedy generation, uncached script rename, script documentation |
 | `11ccaba` | 2026-10-13 | Cached/uncached latency measurement and documentation |
 | `c75022f` | 2026-10-13 | KV-cache timing results and session checkpoint |
+| `1e4c4ee` | 2026-10-13 | Prompt-length experiments, KV-memory inspection, and tracked learning log |
 
-The current files include the longer prompts and memory inspection. The latest
-listed commit does not establish that these newer changes have been committed.
-No commit was created as part of this log update.
+The current files additionally include `generate()` parity checks and the cached
+script's CPU/MPS selection and synchronized timing. These are pending changes
+alongside this log update at the time of inspection. No commit was created by
+the agent as part of this update.
 
 Documentation roles: README is the entry point and run guide; this file holds
 experiment evidence and the live learning handoff; `plan.md` is the roadmap.
@@ -301,20 +444,23 @@ Keep detailed measurements here rather than copying them into every document.
 
 ## Exact stopping point and how to resume
 
-The prompt-length experiment and basic K/V memory inspection are complete.
-The latest checkpoint is the learner's observed 12.09 MiB after prefill and
-14.41 MiB after generation at cache lengths 516 and 615. Do not repeat those
-experiments merely because an older roadmap section still calls them proposed.
+Generation parity checks now pass for both the long token-limit case and the
+short early-EOS case. The first synchronized CPU/MPS comparison is complete:
+MPS showed 1.83x prefill and 2.71x subsequent-generation speedup in the recorded
+short-prompt runs. Do not restart these exercises or force the skipped sampling
+lessons before continuing.
 
-No next coding experiment has been agreed. Resume with a short review of
-compute saved versus memory retained, then agree on one bounded Stage 1 task.
-A reasonable remaining task is a matched greedy comparison against Hugging
-Face `generate()`; it is a proposal, not an implemented or approved change.
-Ask before editing files, or provide a small exercise for the learner to write.
+Next milestone discussed: Stage 2's minimal local HTTP service, using
+`generate()` and retaining the manual scripts. Start with one loaded model,
+one controlled inference execution path, ordinary non-streaming responses,
+validated request limits/settings, token counts, finish reasons, and readiness.
+Add streaming only after ordinary requests work. Follow the roadmap's local
+chat-completions subset rather than building a large backend abstraction.
+Discuss the exact first task and obtain permission before editing files.
 
-Other roadmap work not established by this session: `generate()` parity,
-top-k/top-p sampling, a controlled temperature study, CPU/MPS comparison,
-repeated statistical benchmarks, total/peak process-memory profiling, actual
-concurrency/batching experiments, and any HTTP server. Do not mark all of
-Stage 1 or the deeper cache-scaling phase complete.
+Still not established: a formal temperature study, manual top-k/top-p filtering
+(explicitly skipped), repeated statistical benchmarks, total/peak process-memory
+profiling, actual concurrency/batching experiments, precision/quantization
+comparisons, or any HTTP server. Basic Stage 1 milestones have been exercised
+with that sampling scope decision; do not claim the entire roadmap is complete.
 

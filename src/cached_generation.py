@@ -2,34 +2,27 @@ import torch
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
+    GenerationConfig,
 )
 from time import perf_counter
+
+device = "cpu"  # Change to "cpu" for CPU execution.
 
 print("Loading Model... ")
 model_name = "Qwen/Qwen2.5-0.5B-Instruct"
 model = AutoModelForCausalLM.from_pretrained(
     model_name,
     dtype=torch.float32,
-)
+).to(device)
 model.eval()
+
+print("Model device:", model.device)
+print("Model dtype:", model.dtype)
 
 print("Loading tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-prompt = (
-    "Read the following background information.\n\n"
-    + (
-        "An inference service receives a request, tokenizes the prompt, "
-        "runs a language model, and returns generated tokens. "
-        "The service must balance response latency, throughput, and memory use."
-        "A longer context gives the model more information to attend to, "
-        "but also increases the amount of attention state involved in generation.\n"
-    )
-    * 8
-    + "\nExplain how an inference service processes a request, "
-    "from receiving the prompt to returning the generated response. "
-    "Give a detailed explanation."
-)
+prompt = "Reply with exactly one word: Hello"
 
 messages = [
     {"role": "system", "content": "You are Qwen, a helpful assistant"},
@@ -64,6 +57,9 @@ with torch.inference_mode():
     )
     del warmup_outputs
     # Prefill: process the entire prompt once.
+    # Wait for GPU completion at timing boundaries, not every forward pass.
+    if device == "mps":
+        torch.mps.synchronize()
     prefill_start = perf_counter()
 
     outputs = model(
@@ -72,6 +68,8 @@ with torch.inference_mode():
         use_cache=True,
     )
 
+    if device == "mps":
+        torch.mps.synchronize()
     prefill_seconds = perf_counter() - prefill_start
     past_key_values = outputs.past_key_values
 
@@ -119,6 +117,8 @@ with torch.inference_mode():
 
         # Start after selecting token 1, only if another token is needed.
         if step == 0:
+            if device == "mps":
+                torch.mps.synchronize()
             decode_start = perf_counter()
 
         attention_mask = torch.cat(
@@ -136,6 +136,8 @@ with torch.inference_mode():
         past_key_values = outputs.past_key_values
 
     if decode_start is not None:
+        if device == "mps":
+            torch.mps.synchronize()
         decode_seconds = perf_counter() - decode_start
 
 print(f"Prompt forward-pass time: {prefill_seconds * 1000:.2f} ms")
@@ -152,3 +154,32 @@ for layer in past_key_values.layers:
     final_cache_bytes += layer.values.numel() * layer.values.element_size()
 
 print(f"KV storage after generation: {final_cache_bytes / 1024**2:.2f} MiB")
+
+comparison_config = GenerationConfig(
+    do_sample=False,
+    num_beams=1,
+    repetition_penalty=1.0,
+    max_new_tokens=max_new_tokens,
+    use_cache=True,
+    eos_token_id=model.generation_config.eos_token_id,
+    pad_token_id=tokenizer.pad_token_id,
+    temperature=1.0,
+    top_p=1.0,
+    top_k=50,
+)
+
+with torch.inference_mode():
+    reference_output = model.generate(
+        **model_inputs,
+        generation_config=comparison_config,
+    )
+
+# generate() returns the prompt followed by the generated tokens.
+prompt_length = model_inputs["input_ids"].shape[1]
+reference_ids = reference_output[0, prompt_length:].tolist()
+
+print("\nManual generated tokens:", len(generated_ids))
+print("Hugging Face generated tokens:", len(reference_ids))
+print("Exact token-ID match:", generated_ids == reference_ids)
+
+assert generated_ids == reference_ids, "Manual and Hugging Face token IDs differ."
