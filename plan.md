@@ -348,96 +348,611 @@ manual-loop comparisons, sampling settings, and CPU/MPS observations.
 
 How does a script become a long-running inference service?
 
-## Concepts
+## Scope and baseline
 
-- HTTP requests and responses.
-- Request validation.
-- Application startup and shutdown.
-- Model lifecycle.
-- Error responses.
-- Streaming.
-- Readiness versus process liveness.
+Build a localhost HTTP service that loads `Qwen/Qwen2.5-0.5B-Instruct` once,
+supports ordinary and streaming chat completions, validates requests, rejects
+overlapping inference, and recovers correctly from errors and disconnected
+clients.
 
-## Assignments
+This is a learner-driven roadmap, not a record of completed implementation.
+Work through one checkpoint at a time and verify its completion criteria before
+continuing. Discuss the first coding task and obtain permission before source
+edits or package installation. Updating this roadmap does not authorize
+implementing the service.
 
-- [ ] Separate reusable inference logic from terminal input/output.
-- [ ] Load the tokenizer and model during application startup.
-- [ ] Implement a documented subset of `POST /v1/chat/completions`.
-- [ ] Accept a fixed supported `model`, `messages`, `max_tokens`, `temperature`,
-  `top_p`, and `stream`; reject unsupported features rather than ignoring them.
-- [ ] Return generated text and token counts.
-- [ ] Bound input and output tokens together against the supported context
-  window, including chat-template tokens; reject excess input rather than
-  silently truncating it.
-- [ ] Reject invalid parameter combinations clearly.
-- [ ] Add a readiness endpoint that reports whether inference is available.
-- [ ] Add `stream=true` server-sent events after ordinary responses work.
-- [ ] Keep the service bound to localhost initially.
-- [ ] Serialize model execution off the event loop; while busy, reject new work
-  with a documented response instead of building an unbounded wait queue.
-- [ ] Add basic request IDs, completion/error status, and duration logging
-  without recording private prompts.
+- Keep CPU float32 for the initial server; MPS remains a separate experiment.
+- Use Hugging Face `generate()` with `use_cache=True`.
+- Preserve all four educational scripts. Do not import an executable experiment
+  module into the application.
+- Use one process, one loaded model, and one admitted producer at a time.
+- Bind to localhost only. No containers, authentication system, persistent
+  conversation store, frontend, or generic backend interface are needed.
+- Support at most 2048 total formatted tokens and 512 new tokens per request.
+- Reproducible benchmarking belongs to Stage 3. Bounded request queues,
+  cooperative cancellation, and slow-consumer policies belong to Stage 4.
 
-Do not begin with a complicated backend interface. Extract only what the API
-actually needs.
+## Checkpoint 1: Understand the service boundary
 
-### Minimal API contract
+**Question:** What changes when a script serves many requests without exiting?
 
-Use `max_tokens` as the external output cap and map it to Transformers'
-`max_new_tokens`. Define API `temperature=0` as greedy decoding; map positive
-temperature to sampling instead of passing zero to Transformers. Specify
-remaining internal defaults, including top-k and repetition penalty.
+- [ ] Trace the current script: load model, format prompt, tokenize, generate,
+  print, exit.
+- [ ] Trace the service: start process, load once, accept requests, validate,
+  acquire the inference slot, prepare input, generate, return a result, repeat.
+- [ ] Identify process-lifetime state: model weights, tokenizer, model
+  configuration, one execution worker, and admission guard.
+- [ ] Identify request-local state: messages, input tensors, generation
+  settings, generated IDs, KV cache owned by that generation call, response ID,
+  timing, and streaming queue.
+- [ ] Keep the initial CPU float32 baseline and use library generation rather
+  than implementing another sampling or attention loop.
 
-Return a model identifier, assistant message, finish reason, and token usage.
-For streaming, document `choices[].delta.content`, the terminal finish reason,
-and the `[DONE]` event. This is a small compatible subset, not a promise to
-implement every OpenAI API feature. Tools, images, and reasoning-specific fields
-are outside this stage.
+**Explain before continuing:** Weights are shared learned parameters. Generated
+sequences and KV caches encode a particular request's context; reusing them
+across unrelated requests would mix conversations.
 
-### Safe execution from the first endpoint
+**Done when:** You can draw the request path and explain each object's lifetime.
 
-A synchronous FastAPI endpoint may execute in a threadpool, allowing several
-requests to enter the model concurrently. An asynchronous endpoint that calls
-blocking generation directly can block the event loop. Neither gives the
-serialized baseline automatically.
+## Checkpoint 2: Extract reusable inference
 
-Use one controlled background execution path and a busy/admission guard.
-Hold ownership until generation has actually ended, including on errors or
-client disconnects. Stage 4 replaces immediate busy rejection with a bounded
-queue and adds detailed cancellation behavior.
+**Question:** What should inference return instead of printing?
 
-### Streaming text correctly
+- [ ] Create `src/inference.py`, independent of HTTP and terminal input.
+- [ ] Define `load_runtime() -> Runtime`; load weights only inside this function.
+- [ ] Define a small `Runtime` dataclass with `model`, `tokenizer`,
+  `eos_token_ids: set[int]`, and `context_limit: int`.
+- [ ] Define a small `GenerationResult` dataclass with `text: str`,
+  `prompt_tokens: int`, `generated_ids: list[int]`, and
+  `finish_reason: Literal["stop", "length"]`.
+- [ ] Define `ContextLimitError` for oversized requests.
+- [ ] Implement this reusable boundary:
 
-Investigate `TextIteratorStreamer` for incremental detokenization and a
-background producer. A token is not necessarily a complete word or Unicode
-character, and a text chunk is not necessarily one token. Do not independently
-decode each token and blindly concatenate the strings.
+```python
+generate(
+    runtime,
+    messages,
+    *,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    streamer=None,
+    on_prepared=None,
+) -> GenerationResult
+```
 
-Ensure failures and disconnects terminate the producer/consumer flow rather
-than leaving the reader waiting forever. Streamer text output is suitable for
-measuring visible delivery, but not by itself for exact first-token timing.
+Reuse the service-relevant loading, template, device, EOS-normalization, and
+output-slicing operations from `src/cached_generation.py`, not its experiment,
+timers, console output, or parity assertions.
+
+- [ ] Keep CPU execution, `dtype=torch.float32`, and `model.eval()`.
+- [ ] Enter `torch.inference_mode()` inside the function executed by the worker.
+  The context is thread-local; wrapping only the HTTP caller is insufficient.
+- [ ] Apply the chat template with `tokenize=False` and
+  `add_generation_prompt=True`.
+- [ ] Tokenize with `add_special_tokens=False`, an attention mask, and no
+  truncation. Move tensors to the model's device.
+- [ ] Pass messages through without adding an application-defined system
+  message. Any template-added system text remains tokenizer behavior.
+- [ ] Validate the combined context budget before generation.
+- [ ] Invoke the optional no-argument `on_prepared()` callback only after input
+  preparation and context validation succeed, before generation.
+- [ ] Slice `output_ids[0, prompt_length:]` so completion text excludes input.
+- [ ] Decode with `skip_special_tokens=True` and
+  `clean_up_tokenization_spaces=False`; streaming must use the same settings.
+- [ ] Count generated IDs, including EOS, rather than visible text.
+- [ ] Report `stop` if the final generated ID is EOS, including at the cap;
+  otherwise report `length` when the output budget is exhausted.
+- [ ] Let unexpected failures propagate rather than returning empty success.
+
+**Exercise:** Load one runtime and call `generate()` twice. Confirm there is no
+interactive prompt and each result contains only its own completion.
+
+**Done when:** Importing the module does not load weights, and both calls reuse
+one runtime.
+
+## Checkpoint 3: Define the request contract
+
+**Question:** What does the service promise, and what must it reject?
+
+- [ ] Create Pydantic request models in `src/api.py`.
+- [ ] Define `ChatMessage` with roles `system`, `user`, or `assistant` and
+  nonempty string content. Reject whitespace-only content but retain valid text
+  exactly as supplied.
+- [ ] Define `ChatCompletionRequest` using the following rules.
+- [ ] Reject extra fields at both request and message levels.
+- [ ] Require at least one message without imposing alternating-role rules.
+
+| Field | Rule | Default |
+|---|---|---|
+| `model` | Exactly `Qwen/Qwen2.5-0.5B-Instruct` | Required |
+| `messages` | Nonempty array of supported messages | Required |
+| `max_tokens` | Integer from 1 through 512 | `100` |
+| `temperature` | Finite number from 0 through 2 | `0` |
+| `top_p` | Finite number greater than 0 and at most 1 | `1` |
+| `stream` | Boolean | `false` |
+
+- [ ] Reject numeric strings, booleans used as numbers, nonfinite values, and
+  nonboolean `stream` values. Ordinary JSON integers remain valid temperature
+  and top-p numbers.
+- [ ] Reject tools, image content, `n`, client `top_k`, `stop`, `seed`,
+  `stream_options`, and all other unsupported fields.
+- [ ] Until Checkpoint 9, reject `stream=true` with HTTP 422 and code
+  `unsupported_parameter`; remove this temporary restriction when streaming
+  is implemented.
+
+This is a documented chat-completions subset, not full OpenAI API compatibility.
+
+**Explain before continuing:** Parsing a field is not implementing its behavior.
+Accepting and ignoring a setting falsely promises support.
+
+**Done when:** Missing, malformed, unknown, and unsupported fields have
+predictable rejection behavior.
+
+## Checkpoint 4: Map settings to generation explicitly
+
+**Question:** How does an API parameter change generation?
+
+- [ ] Construct a fresh `GenerationConfig` per request. Never mutate shared
+  `model.generation_config`.
+- [ ] Map external `max_tokens` to internal `max_new_tokens`.
+- [ ] Set `use_cache=True`, `num_beams=1`, `num_return_sequences=1`, and
+  `repetition_penalty=1.0`.
+- [ ] Preserve the configured EOS IDs from `model.generation_config`, not only
+  the single EOS ID from `model.config`.
+- [ ] Use the tokenizer's pad ID, falling back to the first configured EOS ID.
+  If neither exists, fail startup clearly rather than guessing.
+
+| API input | Library-facing settings |
+|---|---|
+| `temperature == 0` | `do_sample=False`, `temperature=1.0`, `top_p=1.0`, `top_k=50` |
+| `temperature > 0` | `do_sample=True`, requested temperature/top-p, `top_k=0` |
+
+- [ ] Reject temperature zero with `top_p != 1.0` as HTTP 422
+  `invalid_parameter_combination`; top-p does not change greedy decoding.
+
+The inspected Qwen snapshot `7ae557604adf67be50417f59c2c2f167def9a775` saves
+sampling enabled, temperature `0.7`, top-p `0.8`, top-k `20`, and repetition
+penalty `1.1`. Override all five as specified. Preserve both EOS IDs,
+`[151645, 151643]`. Do not suppress configuration warnings or edit pretrained
+files. If the snapshot changes, inspect its settings and explicitly neutralize
+new sampling/logit modifiers that would change the documented contract.
+
+**Exercises:**
+- Repeat identical greedy inputs on the same runtime and compare generated IDs.
+- Generate with temperature `0.7` and top-p `0.9`.
+- Reject temperature `0` with top-p `0.9`.
+- Do not require sampled outputs to differ; equal samples can occur.
+
+**Done when:** Every accepted parameter has an explained implementation without
+invalid-generation-flag warnings.
+
+## Checkpoint 5: Enforce the combined context budget
+
+**Question:** Why can a short-looking message exceed a token budget?
+
+- [ ] Set `context_limit = min(2048, model.config.max_position_embeddings)`.
+- [ ] Fail startup if the declared model limit is absent or invalid. Do not
+  guess a limit or apply positional-extension settings.
+- [ ] After formatting and tokenization, require:
+
+```text
+prompt_tokens + requested_max_tokens <= context_limit
+```
+
+Count the whole formatted conversation, role markers, template-added system
+text, and assistant generation prefix. The 2048-token limit is local serving
+policy, not a claim about Qwen's architectural maximum.
+
+- [ ] Return HTTP 400 `context_length_exceeded` when the combined budget exceeds
+  the limit.
+- [ ] Include prompt count, requested output count, and supported limit in the
+  error, without echoing input.
+- [ ] Do not truncate messages, discard history, or reduce the output cap.
+- [ ] Accept exact fits and reject one token over.
+- [ ] Validate before `model.generate()` and before SSE headers are committed.
+
+**Exercise:** Use the actual tokenizer to find a near-boundary prompt. Test an
+output cap that exactly fits, then increase it by one. Repeat for streaming
+after Checkpoint 9.
+
+**Done when:** Actual formatted-token counts enforce both boundaries.
+
+## Checkpoint 6: Give the application a lifecycle
+
+**Question:** When is the process alive, and when can it perform inference?
+
+- [ ] Add `fastapi` and `uvicorn` to `requirements.txt` during implementation.
+  Keep the existing `.venv` and its PyTorch/Transformers versions.
+- [ ] Create `app = FastAPI(lifespan=lifespan)` in `src/api.py` using
+  `contextlib.asynccontextmanager`, not import-time loading or deprecated event
+  decorators.
+- [ ] Store runtime, worker, admission guard, and shutdown state on `app.state`.
+
+Startup:
+1. Initialize state as unavailable.
+2. Load tokenizer and model exactly once through `load_runtime()`.
+3. Create `ThreadPoolExecutor(max_workers=1)` and a `threading.Lock`.
+4. Mark initialized only after successful loading.
+5. Propagate startup failure; do not serve a healthy-looking app without a model.
+
+| Endpoint/state | Status | Body |
+|---|---|---|
+| `GET /health`, serving HTTP | 200 | `{"status":"alive"}` |
+| `GET /ready`, initialized and idle | 200 | `{"ready":true,"status":"ready"}` |
+| `GET /ready`, busy | 503 | `{"ready":false,"status":"busy"}` |
+| `GET /ready`, shutting down, if reachable | 503 | `{"ready":false,"status":"shutting_down"}` |
+
+Uvicorn may refuse connections while lifespan startup loads weights. Connection
+refusal is not an HTTP 503 response; do not claim a pre-start response unless
+one was actually received.
+
+Shutdown:
+1. Mark unavailable and prevent new admissions.
+2. Wait for the admitted producer to finish.
+3. Shut down the executor, then drop runtime references.
+4. Never unload the model while its worker is executing.
+
+**Exercise:** Start the service, wait for readiness, send two requests, verify
+one startup load, and stop it normally.
+
+**Done when:** Model lifetime matches application lifetime.
+
+## Checkpoint 7: Serialize inference without blocking HTTP
+
+**Question:** Why does `async def` not make model computation asynchronous?
+
+Implement this before accepting the first generation request.
+
+- [ ] Perform cheap schema validation before admission.
+- [ ] Return HTTP 503 `not_ready` if uninitialized or shutting down.
+- [ ] Acquire the guard with `acquire(blocking=False)` before submitting work.
+- [ ] Return HTTP 429 `server_busy` immediately if occupied.
+- [ ] Submit only admitted work to the dedicated executor. Its internal queue
+  must not become an application request queue.
+- [ ] Run tokenization, context validation, and generation in the producer,
+  keeping shared tokenizer use serialized and off the event loop.
+- [ ] Retain the producer future until actual completion, shield it from HTTP
+  cancellation, and observe exceptions even if the client disconnects.
+- [ ] Release admission in the producer's `finally`, after its work exits.
+- [ ] If submission fails before the producer starts, release the guard in the
+  submitting path and return HTTP 500 `generation_failed`.
+- [ ] For streaming, maintain a per-request preparation signal resolved by
+  `on_prepared()` or by preparation failure. Never leave it unresolved.
+- [ ] Await preparation before returning `StreamingResponse`.
+
+Do not call blocking generation, queue reads, or thread joins on the event loop.
+Do not use an `asyncio.Lock` that makes excess requests wait.
+
+**Exercises:** During a long generation, verify health remains 200, readiness is
+503 busy, and a second valid generation receives 429. Verify readiness returns
+after actual producer completion.
+
+**Done when:** At most one producer uses the model/tokenizer while HTTP remains
+responsive.
+
+## Checkpoint 8: Return ordinary completions and useful errors
+
+**Question:** How does a model result become an HTTP response?
+
+- [ ] Implement async `POST /v1/chat/completions` through the admission/worker
+  path, not by calling blocking generation directly.
+- [ ] For `stream=false`, return HTTP 200 with:
+  - `id`: `chatcmpl-` followed by UUID hex.
+  - `object`: `chat.completion`.
+  - `created`: integer Unix timestamp.
+  - `model`: the fixed supported model ID.
+  - One choice with `index: 0`, assistant message content, and finish reason
+    `stop` or `length`.
+  - Integer `usage.prompt_tokens`, `usage.completion_tokens`, and
+    `usage.total_tokens`.
+- [ ] Compute completion tokens from `len(result.generated_ids)` and total
+  tokens from prompt plus completion. Do not report the requested cap as actual
+  usage when EOS stopped early.
+- [ ] Use this consistent error envelope:
+
+```json
+{
+  "error": {
+    "code": "context_length_exceeded",
+    "message": "A useful description without private input.",
+    "request_id": "..."
+  }
+}
+```
+
+| HTTP status | Code and cause |
+|---|---|
+| 422 | `invalid_request`: malformed JSON, missing/unknown fields, invalid types/ranges, unsupported model or roles |
+| 422 | `invalid_parameter_combination`: incompatible supported settings |
+| 422 | `unsupported_parameter`: streaming before Checkpoint 9 |
+| 400 | `context_length_exceeded`: combined token budget exceeded |
+| 429 | `server_busy`: an admitted producer owns inference |
+| 503 | `not_ready`: unavailable or shutting down |
+| 500 | `generation_failed`: unexpected preparation/inference failure |
+
+- [ ] Customize FastAPI validation errors to omit raw inputs and bodies.
+  Locations and constraints may be included, but not private content.
+- [ ] Never expose raw unexpected exception text or tracebacks in responses.
+- [ ] Preserve normal 404/405 routing behavior.
+
+**Exercises:** Successful curl request, unsupported model, empty messages,
+negative token cap, unknown field, early EOS, and a deliberately small cap.
+
+**Done when:** Ordinary HTTP generation works with truthful usage and finish
+reasons.
+
+## Checkpoint 9: Stream text before generation finishes
+
+**Question:** Are you streaming tokens, text, or HTTP events?
+
+- [ ] Remove the temporary rejection of `stream=true`.
+- [ ] Reread the installed `TextIteratorStreamer` implementation before building
+  the consumer.
+- [ ] Create one streamer per request with `skip_prompt=True`,
+  `skip_special_tokens=True`, `clean_up_tokenization_spaces=False`, and
+  `timeout=0.1`.
+- [ ] Pass it into the same admitted producer and reusable `generate()`.
+  Do not introduce a second model-execution thread or generation algorithm.
+- [ ] Read its blocking queue off the event loop.
+- [ ] Translate iterator outcomes into plain text/timeout/end values; do not
+  propagate `StopIteration` through an asyncio future.
+- [ ] On timeout, recheck producer completion/error and client connectivity.
+  Timeout alone is not failure.
+- [ ] End promptly on producer failure, even without a streamer sentinel.
+- [ ] If the sentinel arrives first, await the producer result before declaring
+  successful termination.
+- [ ] Skip empty text chunks and count tokens from producer-generated IDs.
+  Do not re-tokenize streamed text or independently decode each token.
+
+Use `Content-Type: text/event-stream`, `Cache-Control: no-cache`, and frames
+formatted as `data: <JSON>\n\n`.
+
+Successful stream contract:
+1. Initial chunk: `object: "chat.completion.chunk"` with
+   `choices: [{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]`.
+2. Content chunks: newly available text in `choices[0].delta.content`, with null
+   finish reason.
+3. Terminal chunk: empty delta, actual finish reason, and top-level `usage`
+   matching ordinary generation counts.
+4. Exactly one final frame: `data: [DONE]\n\n`.
+
+Keep ID, model, and creation timestamp consistent throughout. Terminal usage is
+an explicitly documented local extension; `stream_options` remains unsupported.
+
+**Exercises:**
+- Use `curl -N` and observe progressive output.
+- Prove nonempty content reaches the client before the producer finishes; the
+  initial role event alone is not evidence of useful streaming.
+- Compare concatenated streamed text with ordinary output for identical greedy
+  inputs on the same runtime and with matching decode settings.
+- Include multilingual text and punctuation to check incremental decoding.
+- Inspect chunk boundaries: chunks are not token counts, and some tokens do not
+  immediately produce printable text.
+
+**Done when:** Incremental content arrives before completion and ends with
+truthful metadata and one `[DONE]`.
+
+## Checkpoint 10: Handle failure and disconnect ownership
+
+**Question:** Who owns inference after a client disappears?
+
+- [ ] Before headers, return ordinary HTTP errors using Checkpoint 8.
+- [ ] After headers, do not attempt to rewrite HTTP status. On producer failure,
+  emit the same error envelope as SSE with code `generation_failed`, if still
+  connected, followed by `[DONE]`.
+- [ ] Do not emit a successful terminal finish reason or fabricated usage for
+  incomplete generation.
+- [ ] On disconnect, stop delivering output but retain admission until the
+  producer actually exits.
+- [ ] Let finite generation finish under existing caps, discard undelivered
+  output, reclaim request state, and observe any producer exception.
+- [ ] Do not spawn another model call because the HTTP coroutine was canceled.
+- [ ] Verify a later request succeeds after a failed producer exits.
+
+The library queue is not intrinsically bounded, but this stage admits only one
+producer with at most 512 generated tokens. Explicit slow-consumer backpressure
+and cooperative stopping belong to Stage 4.
+
+A permanently stuck native call cannot safely be killed by canceling a Python
+future. Leave inference unavailable and require process restart; do not fake
+recovery or launch a replacement producer over the same model.
+
+**Exercises:** Disconnect after the first content event. Confirm busy rejection
+while inference remains active and success afterward. Inject a controlled
+generation failure; confirm stream termination without a missing-sentinel hang,
+then successful recovery. Use a deterministic held producer in regression tests
+to prove ownership rather than relying on a race with natural completion.
+
+**Done when:** Neither failures nor disconnects leak ownership or release it
+before model work ends.
+
+## Checkpoint 11: Add request IDs and private lifecycle logging
+
+**Question:** How do you diagnose failures without saving conversations?
+
+- [ ] Use standard Python logging with JSON records.
+- [ ] Generate a server-side UUID per chat request; do not trust an arbitrary
+  incoming identifier.
+- [ ] Return `X-Request-ID` and include the ID in errors and lifecycle logs.
+- [ ] Record acceptance/rejection and final outcome.
+- [ ] Record model, stream mode, known HTTP status, monotonic duration in
+  milliseconds, and outcome: `completed`, `rejected`, `failed`, or `disconnected`.
+- [ ] Record actual prompt/output counts when available; never fabricate them.
+- [ ] Start timing before validation/admission and finish successful delivery
+  timing after the ordinary body or final SSE event is sent.
+- [ ] Distinguish HTTP disconnect time from eventual producer completion.
+  Measure any generation-duration field separately around the producer.
+- [ ] For unexpected failures, record exception class and sanitized error code,
+  not arbitrary exception text.
+
+Never log messages, rendered prompts, generated text, token IDs, raw bodies,
+authorization headers, or raw validation-input values. These are lifecycle
+measurements, not Stage 3 TTFT/TPOT benchmarks.
+
+**Exercise:** Send an unmistakable private marker in valid and invalid requests.
+Inspect logs for request correlation and status while confirming the marker and
+generated content are absent.
+
+**Done when:** Requests are diagnosable without exposing conversation content.
+
+## Checkpoint 12: Prove the complete service
+
+- [ ] Add permanent behavioral regressions in `tests/test_api.py` using the
+  standard-library `unittest` runner; add `httpx` only if needed as a test client.
+- [ ] Cover combined context exact-fit and one-token-over boundaries, including
+  template overhead.
+- [ ] Cover invalid numeric types, nonfinite values, unknown fields, and
+  incompatible greedy/top-p settings.
+- [ ] Hold a producer and prove 429 rejection while health remains responsive.
+- [ ] Prove consumer cancellation/disconnect does not admit work before actual
+  producer exit.
+- [ ] Prove failure before preparation resolves the waiter as an ordinary error.
+- [ ] Prove failure after stream start terminates without a successful finish
+  event and permits a later request.
+- [ ] Prove EOS at the output cap reports `stop`.
+- [ ] Prove private inputs are absent from validation responses and logs.
+- [ ] Run the actual application with the real Qwen model over HTTP. Held or
+  failing fixtures prove transitions, not real-model integration.
+- [ ] Update existing run/contract documentation and `logs/practice.md` with
+  observed evidence after implementation. Do not manually edit generated
+  changelogs.
+
+### Environment and launch
+
+The following are future implementation checks, not claims that a server exists
+or these checks have passed. Run from the repository using its existing `.venv`.
+After dependency edits are authorized and applied:
+
+```bash
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m uvicorn src.api:app \
+  --host 127.0.0.1 --port 8000 --workers 1
+```
+
+Do not use reload or multiple worker processes for evidence collection. Load
+the real model from cache or download it; never substitute fake answers if
+loading fails.
+
+### Ordinary success and readiness
+
+```bash
+curl -i http://127.0.0.1:8000/health
+curl -i http://127.0.0.1:8000/ready
+curl -i http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen/Qwen2.5-0.5B-Instruct","messages":[{"role":"user","content":"Explain prefill in two sentences."}],"max_tokens":100,"temperature":0,"top_p":1,"stream":false}'
+```
+
+Expect health 200, idle readiness 200, and completion 200 with assistant text,
+request ID, correct counts, and `stop` or `length`. Repeat without another model
+load. Do not assert exact natural-language wording.
+
+### Invalid settings and oversized input
+
+```bash
+curl -i http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen/Qwen2.5-0.5B-Instruct","messages":[{"role":"user","content":"Hello"}],"temperature":0,"top_p":0.9}'
+
+.venv/bin/python -c 'import json; print(json.dumps({"model":"Qwen/Qwen2.5-0.5B-Instruct","messages":[{"role":"user","content":"hello "*5000}],"max_tokens":100}))' | \
+  curl -i http://127.0.0.1:8000/v1/chat/completions \
+    -H 'Content-Type: application/json' --data-binary @-
+```
+
+Expect 422 `invalid_parameter_combination` for the first and 400
+`context_length_exceeded` for the second, without echoed input. Repeat oversized
+input with `stream=true`; expect ordinary HTTP 400, not a late SSE validation
+error. Separately prove exact-fit and one-token-over boundaries with the actual
+tokenizer. Also verify a valid sampling request with temperature `0.7`, top-p
+`0.9`.
+
+### Streaming, overlap, and disconnect
+
+In terminal A:
+
+```bash
+curl -N -i http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen/Qwen2.5-0.5B-Instruct","messages":[{"role":"user","content":"Write a detailed numbered explanation of how an inference service processes a request."}],"max_tokens":512,"temperature":0,"top_p":1,"stream":true}'
+```
+
+During generation, use terminal B for health, readiness, and the ordinary
+completion command. Expect health 200, ready 503 busy, and completion 429.
+Observe nonempty streamed content before producer completion, then truthful
+terminal usage/finish reason and one `[DONE]`. Verify readiness and a new
+completion succeed afterward.
+
+Repeat and interrupt terminal A after content starts. Verify ownership remains
+until producer exit, then availability returns. A short remaining generation
+may finish before the next request arrives; use the held-producer regression
+to prove the invariant rather than treating that race as failure.
+
+Compare ordinary and concatenated streamed greedy text on the same runtime,
+including multilingual text and punctuation.
+
+### Controlled failure and regression run
+
+Use a temporary harness with the actual application and loaded Qwen model.
+Wrap one `model.forward` call to raise a controlled `RuntimeError` after at
+least one successful decode step. Observe stream termination and slot recovery,
+restore the method in `finally`, and send a successful real request afterward.
+Do not add a public failure-injection endpoint or production debug flag.
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+### Evidence to retain
+
+Record actual settings, status codes, token counts, finish reasons, and ownership
+transitions for ordinary success, invalid settings, oversized input, streaming,
+overlap, disconnect, and producer failure. Distinguish visible-first-text timing
+from first generated-token timing. A streamer chunk is not a token, and these
+single runs are not benchmarks.
+
+If weights/network access are unavailable, finish reachable validation/protocol
+checks and report the missing artifact. Do not claim end-to-end completion or
+silently substitute a different model.
+
+### Learning checks
+
+Answer without referring to implementation:
+
+1. Why load the model once rather than per request?
+2. Why does importing the application not load weights?
+3. How do `model.eval()` and `torch.inference_mode()` differ?
+4. Why format messages before counting tokens?
+5. How does external `max_tokens` map to internal `max_new_tokens`?
+6. What does temperature zero mean in this API?
+7. Why is top-p inactive for greedy decoding?
+8. Why can visible text and completion-token count differ?
+9. Why does `async def` not prevent blocking computation?
+10. Why does a single-worker executor still need admission control?
+11. How do liveness, readiness, and busy status differ?
+12. Why is a text chunk not a token?
+13. What changes after streaming headers are committed?
+14. Why does disconnect not necessarily stop computation?
+15. Why must ownership last until producer exit?
 
 ## Acceptance criteria
 
-- Multiple requests reuse the already-loaded model.
-- Invalid requests receive useful errors.
-- The server does not claim readiness before model loading succeeds.
-- Ordinary and streaming responses have a documented contract.
-- Streaming begins before the complete response has been generated.
-- Two simultaneous requests cannot accidentally start two generation calls.
-- Requests beyond the supported context window are rejected clearly.
-- A producer failure terminates the stream and releases inference ownership.
+Stage 2 is complete only when all of the following are demonstrated:
 
-## Evidence
+- Multiple requests reuse one loaded model.
+- Ordinary and streaming HTTP requests follow the documented contract.
+- All stated validation rules hold, including combined formatted-token budgets.
+- Usage and finish reasons reflect actual generated IDs.
+- Readiness is not claimed before successful loading or while inference is busy.
+- Overlapping inference is rejected while health remains responsive.
+- Nonempty streamed content reaches the client before generation finishes.
+- Producer failure terminates the stream and allows recovery after worker exit.
+- Disconnect does not release admission while model work is still running.
+- Request IDs and lifecycle logs support diagnosis without conversation content.
+- Actual Qwen-over-HTTP smoke evidence complements behavioral regressions.
 
-Documented commands that exercise:
-
-- A successful request.
-- An invalid request.
-- An oversized request.
-- A streaming request.
-- Two overlapping requests demonstrating the initial busy response.
-- A streaming disconnect or generation failure.
+A working non-streaming endpoint is an intermediate checkpoint, not completion
+of this stage.
 
 ## Suggested commit
 
