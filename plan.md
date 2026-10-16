@@ -398,15 +398,15 @@ across unrelated requests would mix conversations.
 
 **Question:** What should inference return instead of printing?
 
-- [ ] Create `src/inference.py`, independent of HTTP and terminal input.
-- [ ] Define `load_runtime() -> Runtime`; load weights only inside this function.
-- [ ] Define a small `Runtime` dataclass with `model`, `tokenizer`,
+- [x] Create `src/inference.py`, independent of HTTP and terminal input.
+- [x] Define `load_runtime() -> Runtime`; load weights only inside this function.
+- [x] Define a small `Runtime` dataclass with `model`, `tokenizer`,
   `eos_token_ids: set[int]`, and `context_limit: int`.
-- [ ] Define a small `GenerationResult` dataclass with `text: str`,
+- [x] Define a small `GenerationResult` dataclass with `text: str`,
   `prompt_tokens: int`, `generated_ids: list[int]`, and
   `finish_reason: Literal["stop", "length"]`.
-- [ ] Define `ContextLimitError` for oversized requests.
-- [ ] Implement this reusable boundary:
+- [x] Define `ContextLimitError` for oversized requests.
+- [x] Implement this reusable boundary:
 
 ```python
 generate(
@@ -425,25 +425,25 @@ Reuse the service-relevant loading, template, device, EOS-normalization, and
 output-slicing operations from `src/cached_generation.py`, not its experiment,
 timers, console output, or parity assertions.
 
-- [ ] Keep CPU execution, `dtype=torch.float32`, and `model.eval()`.
-- [ ] Enter `torch.inference_mode()` inside the function executed by the worker.
+- [x] Keep CPU execution, `dtype=torch.float32`, and `model.eval()`.
+- [x] Enter `torch.inference_mode()` inside the function executed by the worker.
   The context is thread-local; wrapping only the HTTP caller is insufficient.
-- [ ] Apply the chat template with `tokenize=False` and
+- [x] Apply the chat template with `tokenize=False` and
   `add_generation_prompt=True`.
-- [ ] Tokenize with `add_special_tokens=False`, an attention mask, and no
+- [x] Tokenize with `add_special_tokens=False`, an attention mask, and no
   truncation. Move tensors to the model's device.
-- [ ] Pass messages through without adding an application-defined system
+- [x] Pass messages through without adding an application-defined system
   message. Any template-added system text remains tokenizer behavior.
-- [ ] Validate the combined context budget before generation.
-- [ ] Invoke the optional no-argument `on_prepared()` callback only after input
+- [x] Validate the combined context budget before generation.
+- [x] Invoke the optional no-argument `on_prepared()` callback only after input
   preparation and context validation succeed, before generation.
-- [ ] Slice `output_ids[0, prompt_length:]` so completion text excludes input.
-- [ ] Decode with `skip_special_tokens=True` and
+- [x] Slice `output_ids[0, prompt_length:]` so completion text excludes input.
+- [x] Decode with `skip_special_tokens=True` and
   `clean_up_tokenization_spaces=False`; streaming must use the same settings.
-- [ ] Count generated IDs, including EOS, rather than visible text.
-- [ ] Report `stop` if the final generated ID is EOS, including at the cap;
+- [x] Count generated IDs, including EOS, rather than visible text.
+- [x] Report `stop` if the final generated ID is EOS, including at the cap;
   otherwise report `length` when the output budget is exhausted.
-- [ ] Let unexpected failures propagate rather than returning empty success.
+- [x] Let unexpected failures propagate rather than returning empty success.
 
 **Exercise:** Load one runtime and call `generate()` twice. Confirm there is no
 interactive prompt and each result contains only its own completion.

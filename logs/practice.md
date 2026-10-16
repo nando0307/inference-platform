@@ -450,13 +450,70 @@ MPS showed 1.83x prefill and 2.71x subsequent-generation speedup in the recorded
 short-prompt runs. Do not restart these exercises or force the skipped sampling
 lessons before continuing.
 
-Next milestone discussed: Stage 2's minimal local HTTP service, using
-`generate()` and retaining the manual scripts. Start with one loaded model,
-one controlled inference execution path, ordinary non-streaming responses,
-validated request limits/settings, token counts, finish reasons, and readiness.
-Add streaming only after ordinary requests work. Follow the roadmap's local
-chat-completions subset rather than building a large backend abstraction.
-Discuss the exact first task and obtain permission before editing files.
+Stage 2 Checkpoint 1 is complete: the learner distinguished shared model weights
+from request-local KV caches, client-supplied conversation history from retained
+server state, and immediate busy rejection from a future request queue.
+
+With permission, implemented the loading portion of Checkpoint 2 in
+`src/inference.py`: `Runtime` and `load_runtime()`. Loading is explicit, uses
+CPU float32 and evaluation mode, preserves configured EOS IDs, and validates
+the model context limit and availability of a pad/EOS token. The caller owns
+the returned runtime and must reuse it; the loader is not a singleton.
+
+Verification on 2026-10-15 using `.venv/bin/python`:
+- Import succeeded while both `from_pretrained` entry points were patched to
+  raise if invoked, proving import does not load model/tokenizer resources.
+- An explicit real Qwen load returned device `cpu`, dtype `torch.float32`,
+  training mode `False`, EOS IDs `[151643, 151645]`, pad ID `151643`, declared
+  context `32768`, and supported context `2048`.
+- Throwaway configuration checks passed for single/absent EOS normalization,
+  EOS fallback eligibility, a smaller declared context, rejection of six invalid
+  context limits (`None`, `True`, `0`, `-1`, `2048.0`, `"2048"`), and rejection
+  when both pad and EOS are absent.
+
+Completed the reusable generation portion of Checkpoint 2 on 2026-10-16:
+`GenerationResult`, `ContextLimitError`, and `generate()` now live in
+`src/inference.py`. The function formats client messages without adding an
+application system message, tokenizes without duplicate special tokens or
+truncation, checks the combined budget, builds a fresh generation config, and
+returns completion-only text, prompt count, generated IDs, and finish reason.
+Inference mode is entered inside the function, including when called in a
+worker thread. Optional preparation and streamer hooks are available for the
+later HTTP implementation.
+
+Real Qwen smoke evidence, using one CPU runtime and `.venv/bin/python`:
+
+| Case | Settings | Prompt tokens | Completion tokens | Finish |
+|---|---|---|---|---|
+| First independent request | Greedy, cap 16, top-p 1 | 36 | 10 | `stop` |
+| Second independent request | Greedy, cap 16, top-p 1 | 43 | 2 | `stop` |
+| Sampling | Temperature 0.7, top-p 0.9, cap 16 | 36 | 10 | `stop` |
+| Small output cap | Greedy, cap 1, top-p 1 | 43 | 1 | `length` |
+| Exact combined budget | Greedy, cap 28, top-p 1 | 2020 | 23 | `stop` |
+
+- The two requests asked for a greeting and the answer to `2 + 2`. The arithmetic
+  completion decoded to `4`; its second generated ID was EOS. With cap 1, the
+  same visible answer had finish reason `length`, demonstrating that visible
+  text alone does not determine usage or finish reason.
+- Repeating the first greedy request produced identical generated IDs.
+- Calls reused the runtime with model/tokenizer loading disabled after startup.
+- Real worker forward calls observed inference mode enabled. The saved model
+  generation config was unchanged, and no invalid-generation-flag warnings
+  appeared.
+- Library-streamed text matched ordinary decoded text. This was not an HTTP or
+  incremental-delivery test.
+- The actual formatted boundary prompt used 2020 tokens: cap 28 was accepted;
+  cap 29 raised `ContextLimitError` before generation or preparation callback.
+- Temperature zero with top-p 0.9 was rejected before generation.
+- Throwaway fixtures verified EOS exactly at the cap reports `stop` and
+  unexpected generation failures propagate. Import isolation also passed again.
+
+Next task: Checkpoint 3, define the HTTP request schema in `src/api.py`. The
+generation mappings and token-budget behavior already needed by the reusable
+function are implemented, but their HTTP validation/error mapping remains for
+later checkpoints. No HTTP service or permanent regression suite exists yet.
+Existing educational scripts remain unchanged. Continue incrementally with the
+learner rather than implementing the remaining service unprompted.
 
 Still not established: a formal temperature study, manual top-k/top-p filtering
 (explicitly skipped), repeated statistical benchmarks, total/peak process-memory
