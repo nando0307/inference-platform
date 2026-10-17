@@ -508,12 +508,44 @@ Real Qwen smoke evidence, using one CPU runtime and `.venv/bin/python`:
 - Throwaway fixtures verified EOS exactly at the cap reports `stop` and
   unexpected generation failures propagate. Import isolation also passed again.
 
-Next task: Checkpoint 3, define the HTTP request schema in `src/api.py`. The
-generation mappings and token-budget behavior already needed by the reusable
-function are implemented, but their HTTP validation/error mapping remains for
-later checkpoints. No HTTP service or permanent regression suite exists yet.
-Existing educational scripts remain unchanged. Continue incrementally with the
-learner rather than implementing the remaining service unprompted.
+Implemented the Python validation portion of Checkpoint 3 in `src/api.py`:
+`ChatMessage` and `ChatCompletionRequest`. Added the direct dependency
+`pydantic>=2,<3`; the existing environment installed Pydantic 2.14.1 without
+replacing PyTorch or Transformers. FastAPI and Uvicorn remain for the lifecycle
+checkpoint.
+
+The models enforce strict numeric/boolean types, finite numeric ranges, a fixed
+model ID, supported roles, nonempty messages/content, and forbidden extra fields.
+Whitespace-only content is rejected while valid text is preserved exactly.
+Consecutive same-role messages are accepted. Integer temperature/top-p values
+are accepted, but booleans and numeric strings are not.
+
+Cross-field validation exposes `invalid_parameter_combination` for greedy
+decoding with non-default top-p. Streaming is temporarily rejected with
+`unsupported_parameter`. These are Pydantic validation codes, not observed HTTP
+responses; no endpoint or HTTP 422 mapping exists yet.
+
+Verification:
+- `.venv/bin/python -m unittest discover -s tests -v`: 11 passing behavioral
+  tests in `tests/test_api.py`, covering Python and JSON validation, numeric
+  boundaries/types, nonfinite numbers, malformed JSON, unsupported fields/model/
+  roles, content preservation, incompatible settings, and streaming rejection.
+- A separate executable smoke accepted a valid request and filled defaults
+  (100 output tokens, temperature 0, top-p 1, stream false). It rejected numeric
+  strings, numeric booleans, unknown fields, incompatible settings, and streaming
+  with the expected distinct validation types.
+- Import and validation succeeded with model/tokenizer loading entry points
+  patched to fail if called. No Qwen weights were loaded for these checks.
+- A private marker used as an invalid numeric value was absent from the rendered
+  exception string. `hide_input_in_errors=True` does not sanitize structured
+  `.errors()` results; the future HTTP boundary still needs deliberate error
+  mapping without raw inputs or arbitrary exception text.
+
+Next task: review Checkpoint 4's existing generation-parameter mapping with the
+learner, then connect the request contract to the later application lifecycle,
+admission path, and error responses. The Python validation portion is exercised,
+not an HTTP API. Existing educational scripts and inference code are unchanged
+by this checkpoint.
 
 Still not established: a formal temperature study, manual top-k/top-p filtering
 (explicitly skipped), repeated statistical benchmarks, total/peak process-memory

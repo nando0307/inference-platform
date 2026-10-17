@@ -455,13 +455,13 @@ one runtime.
 
 **Question:** What does the service promise, and what must it reject?
 
-- [ ] Create Pydantic request models in `src/api.py`.
-- [ ] Define `ChatMessage` with roles `system`, `user`, or `assistant` and
+- [x] Create Pydantic request models in `src/api.py`.
+- [x] Define `ChatMessage` with roles `system`, `user`, or `assistant` and
   nonempty string content. Reject whitespace-only content but retain valid text
   exactly as supplied.
-- [ ] Define `ChatCompletionRequest` using the following rules.
-- [ ] Reject extra fields at both request and message levels.
-- [ ] Require at least one message without imposing alternating-role rules.
+- [x] Define `ChatCompletionRequest` using the following rules.
+- [x] Reject extra fields at both request and message levels.
+- [x] Require at least one message without imposing alternating-role rules.
 
 | Field | Rule | Default |
 |---|---|---|
@@ -472,14 +472,18 @@ one runtime.
 | `top_p` | Finite number greater than 0 and at most 1 | `1` |
 | `stream` | Boolean | `false` |
 
-- [ ] Reject numeric strings, booleans used as numbers, nonfinite values, and
+- [x] Reject numeric strings, booleans used as numbers, nonfinite values, and
   nonboolean `stream` values. Ordinary JSON integers remain valid temperature
   and top-p numbers.
-- [ ] Reject tools, image content, `n`, client `top_k`, `stop`, `seed`,
+- [x] Reject tools, image content, `n`, client `top_k`, `stop`, `seed`,
   `stream_options`, and all other unsupported fields.
 - [ ] Until Checkpoint 9, reject `stream=true` with HTTP 422 and code
   `unsupported_parameter`; remove this temporary restriction when streaming
   is implemented.
+
+The Python request models and temporary `unsupported_parameter` validation code
+are implemented and verified. HTTP 422 mapping remains pending until the HTTP
+boundary exists; this checklist item is not yet complete end to end.
 
 This is a documented chat-completions subset, not full OpenAI API compatibility.
 
