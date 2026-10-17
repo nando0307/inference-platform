@@ -497,14 +497,14 @@ predictable rejection behavior.
 
 **Question:** How does an API parameter change generation?
 
-- [ ] Construct a fresh `GenerationConfig` per request. Never mutate shared
+- [x] Construct a fresh `GenerationConfig` per request. Never mutate shared
   `model.generation_config`.
 - [ ] Map external `max_tokens` to internal `max_new_tokens`.
-- [ ] Set `use_cache=True`, `num_beams=1`, `num_return_sequences=1`, and
+- [x] Set `use_cache=True`, `num_beams=1`, `num_return_sequences=1`, and
   `repetition_penalty=1.0`.
-- [ ] Preserve the configured EOS IDs from `model.generation_config`, not only
+- [x] Preserve the configured EOS IDs from `model.generation_config`, not only
   the single EOS ID from `model.config`.
-- [ ] Use the tokenizer's pad ID, falling back to the first configured EOS ID.
+- [x] Use the tokenizer's pad ID, falling back to the first configured EOS ID.
   If neither exists, fail startup clearly rather than guessing.
 
 | API input | Library-facing settings |
@@ -528,6 +528,17 @@ new sampling/logit modifiers that would change the documented contract.
 - Reject temperature `0` with top-p `0.9`.
 - Do not require sampled outputs to differ; equal samples can occur.
 
+Verified on 2026-10-17 with actual Qwen generation and validated request objects:
+greedy/sampling/greedy calls reused one runtime, greedy IDs matched across the
+sampling call, per-call configurations were distinct, and saved model settings
+were unchanged. Both EOS IDs, normal padding, the first-EOS padding fallback,
+and output caps were exercised without Python or Transformers warnings.
+The Python request-to-function exercise passed `request.max_tokens` as
+`max_new_tokens`; production HTTP binding and HTTP 422 mapping remain unchecked
+until the endpoint exists. Invalid combinations already fail in both request
+validation and direct inference before a model call. Detailed evidence is in
+`logs/practice.md`.
+
 **Done when:** Every accepted parameter has an explained implementation without
 invalid-generation-flag warnings.
 
@@ -535,10 +546,10 @@ invalid-generation-flag warnings.
 
 **Question:** Why can a short-looking message exceed a token budget?
 
-- [ ] Set `context_limit = min(2048, model.config.max_position_embeddings)`.
-- [ ] Fail startup if the declared model limit is absent or invalid. Do not
+- [x] Set `context_limit = min(2048, model.config.max_position_embeddings)`.
+- [x] Fail startup if the declared model limit is absent or invalid. Do not
   guess a limit or apply positional-extension settings.
-- [ ] After formatting and tokenization, require:
+- [x] After formatting and tokenization, require:
 
 ```text
 prompt_tokens + requested_max_tokens <= context_limit
@@ -550,15 +561,24 @@ policy, not a claim about Qwen's architectural maximum.
 
 - [ ] Return HTTP 400 `context_length_exceeded` when the combined budget exceeds
   the limit.
-- [ ] Include prompt count, requested output count, and supported limit in the
+- [x] Include prompt count, requested output count, and supported limit in the
   error, without echoing input.
-- [ ] Do not truncate messages, discard history, or reduce the output cap.
-- [ ] Accept exact fits and reject one token over.
-- [ ] Validate before `model.generate()` and before SSE headers are committed.
+- [x] Do not truncate messages, discard history, or reduce the output cap.
+- [x] Accept exact fits and reject one token over.
+- [x] Validate before `model.generate()` and the preparation callback.
+- [ ] Validate before SSE headers are committed when the HTTP stream exists.
 
 **Exercise:** Use the actual tokenizer to find a near-boundary prompt. Test an
 output cap that exactly fits, then increase it by one. Repeat for streaming
 after Checkpoint 9.
+
+Inference-level verification on 2026-10-17: seven offline budget regressions in
+`tests/test_inference.py` passed alongside the 11 request-schema tests. A real
+Qwen four-message prompt contained 1943 formatted tokens; an output allowance
+of 105 fit the 2048-token limit, while 106 raised `ContextLimitError` before
+preparation or generation. Rejection also passed with a library streamer
+supplied. No HTTP response or SSE headers were exercised; those checks remain
+pending. The existing production budget code required no changes.
 
 **Done when:** Actual formatted-token counts enforce both boundaries.
 

@@ -541,11 +541,136 @@ Verification:
   `.errors()` results; the future HTTP boundary still needs deliberate error
   mapping without raw inputs or arbitrary exception text.
 
-Next task: review Checkpoint 4's existing generation-parameter mapping with the
-learner, then connect the request contract to the later application lifecycle,
-admission path, and error responses. The Python validation portion is exercised,
-not an HTTP API. Existing educational scripts and inference code are unchanged
-by this checkpoint.
+Verified Checkpoint 4's inference-side mapping on 2026-10-17 without changing
+production code. The existing implementation already supplies explicit
+generation settings. The cached Qwen generation config still declares sampling
+enabled, temperature 0.7, top-p 0.8, top-k 20, repetition penalty 1.1, pad ID
+151643, and EOS IDs `[151645, 151643]`; no new saved sampling modifiers were
+present.
+
+A throwaway `.venv/bin/python` harness loaded Qwen once and used
+`ChatCompletionRequest.model_validate_json()` before calling `generate()`.
+It passed `request.max_tokens` as `max_new_tokens`, converted each validated
+message with `model_dump()`, and forwarded temperature/top-p explicitly.
+The common prompt was `What is 2 + 2? Reply with only the number.`
+
+| Case | Temperature / top-p | Requested cap | Prompt tokens | Generated tokens | Finish |
+|---|---|---|---|---|---|
+| Greedy before sampling | 0 / 1 | 16 | 43 | 2 | `stop` |
+| Sampling | 0.7 / 0.9 | 16 | 43 | 2 | `stop` |
+| Greedy after sampling | 0 / 1 | 16 | 43 | 2 | `stop` |
+| Small output cap | 0 / 1 | 1 | 43 | 1 | `length` |
+| Missing tokenizer pad ID | 0 / 1 | 16 | 43 | 2 | `stop` |
+
+All five completions decoded to `4`. Equal sampled and greedy text is valid,
+not evidence that sampling was disabled. The harness observed the real
+generation-call settings: sampling used `do_sample=True`, temperature 0.7,
+top-p 0.9, and top-k 0; greedy used `do_sample=False` and library values
+temperature 1, top-p 1, and top-k 50. Top-k 50 is inactive in greedy mode.
+
+Additional observations:
+- Greedy IDs were identical before and after sampling.
+- Every call received a distinct `GenerationConfig`; cache enabled, one beam,
+  one returned sequence, and repetition penalty 1 were explicitly set.
+- The saved model generation config remained unchanged after each call.
+- Both configured EOS IDs were preserved. Ordinary pad ID was 151643.
+- Temporarily removing the tokenizer pad ID selected the first configured EOS
+  ID, 151645, and real generation succeeded. The tokenizer pad ID was restored
+  in `finally`; no pretrained file was modified.
+- Temperature 0/top-p 0.9 was rejected by the request model with
+  `invalid_parameter_combination` and by direct inference with `ValueError`,
+  before any model-generation call.
+- The exercise recorded zero Python warnings and zero Transformers warnings.
+
+To exercise the same request-to-inference boundary from the repository root:
+
+```bash
+.venv/bin/python - <<'PY'
+from src.api import ChatCompletionRequest
+from src.inference import MODEL_ID, generate, load_runtime
+
+runtime = load_runtime()
+for temperature, top_p in [(0, 1), (0.7, 0.9), (0, 1)]:
+    request = ChatCompletionRequest.model_validate({
+        "model": MODEL_ID,
+        "messages": [
+            {"role": "user", "content": "What is 2 + 2? Reply with only the number."}
+        ],
+        "max_tokens": 16,
+        "temperature": temperature,
+        "top_p": top_p,
+    })
+    result = generate(
+        runtime,
+        [message.model_dump() for message in request.messages],
+        max_new_tokens=request.max_tokens,
+        temperature=request.temperature,
+        top_p=request.top_p,
+    )
+    print(temperature, top_p, result.text, result.generated_ids, result.finish_reason)
+PY
+```
+
+The inference-side checkpoint is verified. Production HTTP binding of
+`max_tokens` and the HTTP 422 error response remain pending; this exercise was
+Python-to-model, not HTTP. No extra wrapper, permanent test, or endpoint was
+added for these verification-only exercises.
+
+Verified the inference portion of Checkpoint 5 on 2026-10-17. The production
+budget check already met the requirements, so `src/inference.py` was unchanged.
+Added seven behavioral regressions in `tests/test_inference.py`:
+- Exact-fit acceptance counts every history turn and template marker and retains
+  the full requested output allowance.
+- One-token-over rejection occurs before the preparation callback and model
+  generation; the error includes counts without private content.
+- An oversized prompt is rejected rather than silently shortened.
+- Earlier turns cannot be discarded to make a request fit.
+- Valid preparation signals precede actual model execution.
+- The runtime respects a smaller declared model context and the local 2048 cap.
+- Missing, noninteger, boolean, or nonpositive declared limits fail loading.
+
+The boundary fixtures use an in-memory tokenizer and a tiny locally constructed
+GPT-2 model, not downloaded Qwen weights. Generation is real for accepted test
+inputs, with EOS disabled to exercise the entire output budget. Initialization
+uses an isolated random state. Separate loading-error fixtures do not load
+weights. This keeps the regression suite deterministic and offline.
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+Result: all 18 tests passed (11 request-schema tests and 7 new inference tests).
+
+Separate real-Qwen smoke:
+- Loaded one CPU runtime and supplied four messages: a system instruction, a
+  user message containing `"hello " * 1900`, an assistant reply, and a final
+  user request for the number 4.
+- Message content alone used 1920 tokens. Full chat formatting used 1943,
+  including 23 tokens of template overhead.
+- Requested output cap 105 exactly fit `1943 + 105 = 2048`. Actual generation
+  ended at 19 output tokens with finish reason `stop`.
+- Observed generation inputs matched the entire independently tokenized chat,
+  and the configured output cap remained 105.
+- The same prompt with cap 106 passed request-schema validation but raised
+  `ContextLimitError`: prompt count 1943, requested output 106, limit 2048.
+  Neither the preparation callback nor model generation ran.
+- Repeated that rejection with a `TextIteratorStreamer` supplied directly to
+  inference. It emitted no output and again did not signal preparation or run
+  the model. This is library-level coverage, not an accepted HTTP stream request.
+
+The first smoke harness incorrectly assumed `apply_chat_template(tokenize=True)`
+returned a token list. Inspection showed the installed Transformers returns a
+`BatchEncoding`; reading its `input_ids` corrected the harness, and the smoke
+then passed. Production already counts tensor input IDs and was unaffected.
+
+HTTP 400 mapping and pre-SSE-header rejection remain unverified because no
+endpoint exists. The plan keeps these items unchecked instead of treating a
+Python exception as an HTTP response.
+
+Next task: Checkpoint 6, application lifecycle and health/readiness. This is
+where FastAPI/Uvicorn and a lifespan-managed runtime enter the implementation.
+Generation endpoints still require the admission/worker path in Checkpoint 7
+before being exposed. Continue incrementally with the learner.
 
 Still not established: a formal temperature study, manual top-k/top-p filtering
 (explicitly skipped), repeated statistical benchmarks, total/peak process-memory
