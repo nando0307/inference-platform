@@ -1,4 +1,5 @@
 import asyncio
+from _thread import LockType
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from threading import Lock
@@ -9,7 +10,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_core import PydanticCustomError
 
-from .inference import MODEL_ID, load_runtime
+from .inference import MODEL_ID, GenerationResult, Runtime, generate, load_runtime
 
 
 class ChatMessage(BaseModel):
@@ -63,6 +64,64 @@ class ChatCompletionRequest(BaseModel):
         return self
 
 
+class InferenceUnavailable(RuntimeError):
+    """The application is not accepting inference work."""
+
+
+class InferenceBusy(RuntimeError):
+    """Another producer owns the inference slot."""
+
+
+def submit_inference(
+    app: FastAPI, request: ChatCompletionRequest
+) -> asyncio.Future[GenerationResult]:
+    """Admit a validated request on the event loop and return a protected result."""
+    loop = asyncio.get_running_loop()
+    state = app.state
+    if not getattr(state, "initialized", False) or state.shutting_down:
+        raise InferenceUnavailable("Inference is not available.")
+    if not state.admission_guard.acquire(blocking=False):
+        raise InferenceBusy("Another inference request is running.")
+
+    try:
+        producer = loop.run_in_executor(
+            state.executor, _run_inference, state.runtime, request, state.admission_guard
+        )
+    except Exception:
+        state.admission_guard.release()
+        raise
+
+    state.producer_futures.add(producer)
+    producer.add_done_callback(lambda future: _observe_completion(app, future))
+    # Cancellation of the consumer must not cancel queued/running producer work.
+    result = asyncio.shield(producer)
+    # Also observe an abandoned result, including callers that add another shield.
+    result.add_done_callback(lambda future: _observe_completion(app, future))
+    return result
+
+
+def _run_inference(
+    runtime: Runtime, request: ChatCompletionRequest, guard: LockType
+) -> GenerationResult:
+    try:
+        return generate(
+            runtime,
+            [message.model_dump() for message in request.messages],
+            max_new_tokens=request.max_tokens,
+            temperature=request.temperature,
+            top_p=request.top_p,
+        )
+    finally:
+        guard.release()
+
+
+def _observe_completion(app: FastAPI, future: asyncio.Future[GenerationResult]) -> None:
+    app.state.producer_futures.discard(future)
+    if not future.cancelled():
+        # Observing does not consume the exception for other awaiters.
+        future.exception()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     state = app.state
@@ -71,6 +130,7 @@ async def lifespan(app: FastAPI):
     state.runtime = None
     state.executor = None
     state.admission_guard = Lock()
+    state.producer_futures = set()
 
     try:
         # Startup must finish before requests can use the model.
@@ -85,6 +145,8 @@ async def lifespan(app: FastAPI):
             # Retain the runtime until all worker computation has actually ended.
             await asyncio.to_thread(state.executor.shutdown, wait=True)
             state.executor = None
+        if state.producer_futures:
+            await asyncio.gather(*state.producer_futures, return_exceptions=True)
         state.runtime = None
 
 

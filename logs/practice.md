@@ -725,14 +725,79 @@ and shutdown states were verified with controlled fixtures, not concurrent
 real-model HTTP generation. README now documents launch, readiness, shutdown,
 and test commands.
 
-Next task: Checkpoint 7, serialized inference and immediate busy admission.
-Use the existing executor/guard and retain producer ownership until actual
-completion, including when the HTTP consumer disappears. Expose generation
-only after this execution path is safe.
+Implemented the internal Checkpoint 7 execution path in `src/api.py`:
+- `submit_inference(app, request)` accepts a validated request on the event loop,
+  rejects unavailable state or an occupied guard without waiting, and submits
+  only admitted work to the dedicated executor.
+- `InferenceUnavailable` and `InferenceBusy` distinguish admission failures.
+  Submission failures release the guard and propagate unchanged.
+- `_run_inference()` performs message conversion and reusable generation on the
+  worker, including tokenization and context validation. Its `finally` owns
+  guard release.
+- `_observe_completion()` removes completed futures and retrieves exceptions
+  without logging raw details. Both the underlying producer and returned
+  consumer result are observed.
+- `app.state.producer_futures` retains underlying work. The returned future is
+  already shielded, rather than requiring every caller to remember a shield.
+  Canceling it does not cancel the producer or release the guard. Adding another
+  caller-side shield is unnecessary but does not leave abandoned errors
+  unobserved.
+- Lifespan shutdown waits for executor work and drains retained future
+  completion before clearing runtime references.
+
+Added five admission tests and updated the held-worker shutdown regression to
+use actual admission. Covered busy rejection without queueing, off-event-loop
+execution, consumer cancellation while busy, context/generation failure
+recovery, submission failure cleanup, unavailable-state rejection, and failure
+observation after the consumer abandons its result. A loop exception-handler
+check verifies abandoned failures do not become unhandled-future errors.
+Shutdown also rejects new submissions and retains runtime through producer exit.
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+Result: all 29 tests passed. No new dependency or inference-algorithm change was
+needed.
+
+A temporary real-Qwen harness started the actual Uvicorn application on an
+ephemeral `127.0.0.1` port and submitted validated requests on its event loop.
+Generation settings were greedy, top-p 1, output cap 16. The prompt was
+`What is 2 + 2? Reply with only the number.`
+
+Observed:
+- One runtime load across all requests.
+- Initial HTTP readiness 200.
+- After one successful real forward call, a controlled gate held the worker.
+  HTTP health remained 200 and readiness returned 503 busy. A second internal
+  submission immediately raised `InferenceBusy`; this was not HTTP 429.
+- Canceling the Python result future left the producer pending and retained.
+  Another submission still raised `InferenceBusy` until the gate was released.
+- Actual generation finished with 43 prompt tokens, 2 completion tokens, and
+  `stop`; HTTP readiness returned 200.
+- A 2530-token formatted prompt with output cap 16 raised `ContextLimitError`
+  against the 2048 limit and released admission.
+- A temporary wrapper raised on the second real `model.forward` call. The
+  exception propagated and admission recovered. The original method was
+  restored by the patch context.
+- A subsequent real request decoded to `4`, with 43 prompt tokens,
+  2 completion tokens, and `stop`. Readiness was 200 and no producer futures
+  remained retained.
+- Uvicorn shut down cleanly; executor/runtime references were cleared and the
+  harness exited with code 0. No harness file or server remains.
+
+The real HTTP traffic exercised health/readiness only. Generation was submitted
+internally; no completion route, HTTP 429/503/500 error mapping, SSE preparation
+signal, or network-disconnect verification was added. The plan keeps those
+acceptance items pending.
+
+Next task: Checkpoint 8, expose ordinary chat completions through this admission
+path and map results/errors to HTTP. Add streaming preparation and consumption
+when implementing Checkpoint 9; keep the same producer ownership.
 
 Still not established: a formal temperature study, manual top-k/top-p filtering
 (explicitly skipped), repeated statistical benchmarks, total/peak process-memory
-profiling, actual concurrency/batching experiments, precision/quantization
+profiling, load/concurrency benchmarks, batching experiments, precision/quantization
 comparisons, or a chat-completion HTTP endpoint. Basic Stage 1 milestones have
 been exercised with the sampling scope decision; the whole roadmap is not complete.
 

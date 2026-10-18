@@ -50,10 +50,22 @@ waits for executor work off the event loop, then releases the runtime. It does
 not cancel native model computation; a permanently stuck worker can prevent
 graceful shutdown.
 
-Only health/readiness routes are implemented for the local service.
-`POST /v1/chat/completions`, generation admission, HTTP error mapping, and SSE
-remain later checkpoints. The executor and guard exist, but no HTTP generation
-request can be submitted yet.
+Only health/readiness routes are exposed for the local service.
+`POST /v1/chat/completions`, HTTP error mapping, and SSE remain later checkpoints.
+
+The internal execution path is `submit_inference(app, validated_request)` in
+`src/api.py`. Call it on the running application's event loop with an already
+validated `ChatCompletionRequest`, then await the returned future. It rejects
+unavailable state with `InferenceUnavailable` and an occupied slot with
+`InferenceBusy`; excess work is not queued.
+
+The dedicated worker performs formatting, tokenization, context validation, and
+generation, releasing the guard only when its work exits. The returned result
+is already shielded: canceling its consumer does not cancel the retained producer
+or free the slot early. Completion callbacks observe errors even when delivery
+is abandoned; they do not log raw exception text. Shutdown drains producer
+completion before clearing the runtime. These are Python execution guarantees,
+not yet HTTP 429/503 responses or verified network-disconnect behavior.
 
 ## Run behavioral tests
 
@@ -61,10 +73,10 @@ request can be submitted yet.
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-The suite covers request validation, context budgets, and lifecycle transitions.
-It uses offline inference fixtures and controlled lifecycle resources; `httpx`
-is the HTTP test client. Real-Qwen smoke evidence is recorded separately in
-`logs/practice.md`.
+The suite covers request validation, context budgets, lifecycle transitions,
+busy admission, consumer cancellation, and failure recovery. It uses offline
+inference fixtures and controlled worker resources; `httpx` is the HTTP test
+client. Real-Qwen smoke evidence is recorded separately in `logs/practice.md`.
 
 ## Inspect tokenization and two-token generation
 

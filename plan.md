@@ -637,19 +637,21 @@ two chat-completion requests remain pending until Checkpoint 8.
 
 Implement this before accepting the first generation request.
 
-- [ ] Perform cheap schema validation before admission.
+- [x] Accept a schema-validated `ChatCompletionRequest` before admission.
 - [ ] Return HTTP 503 `not_ready` if uninitialized or shutting down.
-- [ ] Acquire the guard with `acquire(blocking=False)` before submitting work.
+- [x] Acquire the guard with `acquire(blocking=False)` before submitting work.
 - [ ] Return HTTP 429 `server_busy` immediately if occupied.
-- [ ] Submit only admitted work to the dedicated executor. Its internal queue
+- [x] Submit only admitted work to the dedicated executor. Its internal queue
   must not become an application request queue.
-- [ ] Run tokenization, context validation, and generation in the producer,
+- [x] Run tokenization, context validation, and generation in the producer,
   keeping shared tokenizer use serialized and off the event loop.
-- [ ] Retain the producer future until actual completion, shield it from HTTP
-  cancellation, and observe exceptions even if the client disconnects.
-- [ ] Release admission in the producer's `finally`, after its work exits.
-- [ ] If submission fails before the producer starts, release the guard in the
-  submitting path and return HTTP 500 `generation_failed`.
+- [x] Retain the producer future until actual completion, shield it from consumer
+  cancellation, and observe exceptions even if the consumer disappears.
+- [x] Release admission in the producer's `finally`, after its work exits.
+- [x] If submission fails before the producer starts, release the guard in the
+  submitting path and propagate the failure.
+- [ ] Map submission failure to HTTP 500 `generation_failed`.
+- [ ] Verify ownership when a real HTTP client disconnects.
 - [ ] For streaming, maintain a per-request preparation signal resolved by
   `on_prepared()` or by preparation failure. Never leave it unresolved.
 - [ ] Await preparation before returning `StreamingResponse`.
@@ -660,6 +662,17 @@ Do not use an `asyncio.Lock` that makes excess requests wait.
 **Exercises:** During a long generation, verify health remains 200, readiness is
 503 busy, and a second valid generation receives 429. Verify readiness returns
 after actual producer completion.
+
+The internal path is implemented through `submit_inference()`, `_run_inference()`,
+and `_observe_completion()`, with `InferenceUnavailable` and `InferenceBusy`.
+The returned result future is already shielded, so callers may await it directly.
+Underlying producers remain retained separately until actual completion.
+Five admission regressions and the updated shutdown test passed in the 29-test
+suite. A real-Qwen harness verified live health 200/readiness 503 busy, immediate
+Python busy rejection, retained ownership after consumer cancellation, context
+and controlled-forward-failure recovery, and readiness 200 afterward, with one
+model load. HTTP chat responses, real network disconnects, and the streaming
+preparation signal remain pending; no completion endpoint was added here.
 
 **Done when:** At most one producer uses the model/tokenizer while HTTP remains
 responsive.

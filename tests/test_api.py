@@ -1,15 +1,22 @@
 import asyncio
+import gc
 import json
 import unittest
 
-from threading import Event, Timer
+from threading import Event, Timer, get_ident
 from unittest.mock import patch
 
 import httpx
 from pydantic import ValidationError
 
-from src.api import ChatCompletionRequest, app
-from src.inference import MODEL_ID
+from src.api import (
+    ChatCompletionRequest,
+    InferenceBusy,
+    InferenceUnavailable,
+    app,
+    submit_inference,
+)
+from src.inference import ContextLimitError, GenerationResult, MODEL_ID
 
 
 def request_data(**changes):
@@ -233,17 +240,16 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         shutdown_started = Event()
         executor = app.state.executor
         guard = app.state.admission_guard
-        guard.acquire()
 
-        def held_producer():
+        def held_producer(*args, **kwargs):
             started.set()
-            try:
-                release.wait()
-                return app.state.runtime
-            finally:
-                guard.release()
+            release.wait()
+            return app.state.runtime
 
-        future = executor.submit(held_producer)
+        generation_patch = patch("src.api.generate", side_effect=held_producer)
+        generation_patch.start()
+        self.addCleanup(generation_patch.stop)
+        future = submit_inference(app, ChatCompletionRequest.model_validate(request_data()))
         original_shutdown = executor.shutdown
 
         def observed_shutdown(*args, **kwargs):
@@ -270,11 +276,17 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     ready.json(), {"ready": False, "status": "shutting_down"}
                 )
+                with self.assertRaises(InferenceUnavailable):
+                    submit_inference(
+                        app, ChatCompletionRequest.model_validate(request_data())
+                    )
                 release.set()
                 await asyncio.wait_for(shutdown_task, timeout=3)
             self.assertIs(future.result(), self.runtime)
             self.assertIsNone(app.state.runtime)
             self.assertIsNone(app.state.executor)
+            self.assertEqual(app.state.producer_futures, set())
+            self.assertFalse(guard.locked())
         finally:
             release.set()
             safety_release.cancel()
@@ -283,6 +295,153 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                 await context.__aexit__(None, None, None)
             else:
                 await shutdown_task
+
+
+class AdmissionTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        loader_patch = patch("src.api.load_runtime", return_value=object())
+        loader_patch.start()
+        self.addCleanup(loader_patch.stop)
+        context = app.router.lifespan_context(app)
+        await context.__aenter__()
+        self.addAsyncCleanup(context.__aexit__, None, None, None)
+        self.client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        )
+        self.addAsyncCleanup(self.client.aclose)
+        self.request = ChatCompletionRequest.model_validate(request_data())
+        self.result = GenerationResult("answer", 3, [7], "length")
+
+    async def test_unavailable_state_rejects_before_submitting_work(self):
+        for initialized, shutting_down in ((False, False), (True, True)):
+            with self.subTest(initialized=initialized, shutting_down=shutting_down):
+                with (
+                    patch.object(app.state, "initialized", initialized),
+                    patch.object(app.state, "shutting_down", shutting_down),
+                ):
+                    with self.assertRaises(InferenceUnavailable):
+                        submit_inference(app, self.request)
+                self.assertFalse(app.state.admission_guard.locked())
+                self.assertEqual(app.state.producer_futures, set())
+
+    async def test_busy_rejection_and_consumer_cancellation_keep_worker_owned(self):
+        started = Event()
+        release = Event()
+        loop_thread = get_ident()
+
+        def held_generation(*args, **kwargs):
+            self.assertNotEqual(get_ident(), loop_thread)
+            started.set()
+            if not release.wait(5):
+                raise TimeoutError("Test producer was not released.")
+            return self.result
+
+        with patch("src.api.generate", side_effect=held_generation):
+            result = submit_inference(app, self.request)
+            producer = next(iter(app.state.producer_futures))
+            try:
+                self.assertTrue(await asyncio.to_thread(started.wait, 2))
+                with self.assertRaises(InferenceBusy):
+                    submit_inference(app, self.request)
+                self.assertEqual(app.state.producer_futures, {producer})
+                health = await self.client.get("/health")
+                ready = await self.client.get("/ready")
+                self.assertEqual(health.status_code, 200)
+                self.assertEqual(ready.status_code, 503)
+                self.assertEqual(ready.json(), {"ready": False, "status": "busy"})
+
+                consumer_started = asyncio.Event()
+
+                async def consume():
+                    consumer_started.set()
+                    return await result
+
+                consumer = asyncio.create_task(consume())
+                await consumer_started.wait()
+                consumer.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await consumer
+                self.assertTrue(result.cancelled())
+                self.assertFalse(producer.cancelled())
+                self.assertFalse(producer.done())
+                self.assertTrue(app.state.admission_guard.locked())
+                self.assertEqual(app.state.producer_futures, {producer})
+                with self.assertRaises(InferenceBusy):
+                    submit_inference(app, self.request)
+            finally:
+                release.set()
+                await asyncio.wait_for(asyncio.shield(producer), timeout=3)
+
+            self.assertFalse(app.state.admission_guard.locked())
+            self.assertEqual(app.state.producer_futures, set())
+            ready = await self.client.get("/ready")
+            self.assertEqual(ready.status_code, 200)
+            recovered = await submit_inference(app, self.request)
+            self.assertEqual(recovered, self.result)
+
+    async def test_context_and_generation_failures_release_slot_for_recovery(self):
+        for failure in (ContextLimitError("Oversized request"), RuntimeError("Failed")):
+            with self.subTest(failure=type(failure).__name__):
+                with patch("src.api.generate", side_effect=[failure, self.result]):
+                    with self.assertRaises(type(failure)):
+                        await submit_inference(app, self.request)
+                    self.assertFalse(app.state.admission_guard.locked())
+                    self.assertEqual(app.state.producer_futures, set())
+                    recovered = await submit_inference(app, self.request)
+                    self.assertEqual(recovered, self.result)
+
+    async def test_submission_failure_releases_slot_for_recovery(self):
+        with patch.object(app.state.executor, "submit", side_effect=RuntimeError("No worker")):
+            with self.assertRaises(RuntimeError):
+                submit_inference(app, self.request)
+        self.assertFalse(app.state.admission_guard.locked())
+        self.assertEqual(app.state.producer_futures, set())
+        with patch("src.api.generate", return_value=self.result):
+            recovered = await submit_inference(app, self.request)
+        self.assertEqual(recovered, self.result)
+
+    async def test_abandoned_failure_is_observed_and_does_not_leak_busy_slot(self):
+        started = Event()
+        release = Event()
+        completed = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        unhandled = []
+        loop.set_exception_handler(lambda loop, context: unhandled.append(context))
+
+        def failing_generation(*args, **kwargs):
+            started.set()
+            if not release.wait(5):
+                raise TimeoutError("Test producer was not released.")
+            raise RuntimeError("Private failure details")
+
+        try:
+            with patch("src.api.generate", side_effect=failing_generation):
+                result = submit_inference(app, self.request)
+                producer = next(iter(app.state.producer_futures))
+                producer.add_done_callback(lambda future: completed.set())
+                try:
+                    self.assertTrue(await asyncio.to_thread(started.wait, 2))
+                    result.cancel()
+                    with self.assertRaises(InferenceBusy):
+                        submit_inference(app, self.request)
+                finally:
+                    release.set()
+                    await asyncio.wait_for(completed.wait(), timeout=3)
+                self.assertFalse(app.state.admission_guard.locked())
+                self.assertEqual(app.state.producer_futures, set())
+                # Never await or retrieve the producer exception in this test.
+                del producer
+                del result
+            await asyncio.sleep(0)
+            gc.collect()
+            self.assertEqual(unhandled, [])
+            with patch("src.api.generate", return_value=self.result):
+                recovered = await submit_inference(app, self.request)
+            self.assertEqual(recovered, self.result)
+        finally:
+            release.set()
+            loop.set_exception_handler(previous_handler)
 
 
 if __name__ == "__main__":
