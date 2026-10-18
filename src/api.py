@@ -3,14 +3,26 @@ from _thread import LockType
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from threading import Lock
+from time import time
 from typing import Literal, Self
+from uuid import uuid4
 
 from fastapi import FastAPI, Request
+from fastapi.exception_handlers import http_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_core import PydanticCustomError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from .inference import MODEL_ID, GenerationResult, Runtime, generate, load_runtime
+from .inference import (
+    MODEL_ID,
+    ContextLimitError,
+    GenerationResult,
+    Runtime,
+    generate,
+    load_runtime,
+)
 
 
 class ChatMessage(BaseModel):
@@ -151,6 +163,112 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+def _error_response(
+    status_code: int, code: str, message: str, request_id: str
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": {"code": code, "message": message, "request_id": request_id}
+        },
+        headers={"X-Request-ID": request_id},
+    )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_error(request: Request, error: StarletteHTTPException):
+    # FastAPI wraps invalid JSON encoding as a body-parsing HTTP 400.
+    if (
+        error.status_code == 400
+        and isinstance(error.__cause__, UnicodeError)
+        and request.method == "POST"
+        and request.url.path == "/v1/chat/completions"
+    ):
+        return _error_response(
+            422, "invalid_request", "Request body must contain valid JSON.", uuid4().hex
+        )
+    return await http_exception_handler(request, error)
+
+
+@app.exception_handler(RequestValidationError)
+async def invalid_request(request: Request, error: RequestValidationError):
+    request_id = uuid4().hex
+    first = error.errors()[0]
+    error_type = first["type"]
+    if error_type == "invalid_parameter_combination":
+        code = error_type
+        message = "Greedy decoding requires top_p=1.0."
+    elif error_type == "unsupported_parameter":
+        code = error_type
+        message = "Streaming is not supported yet."
+    else:
+        code = "invalid_request"
+        # Never serialize raw validation inputs, contexts, messages, or field names.
+        if error_type == "json_invalid":
+            message = "Request body must contain valid JSON."
+        elif error_type == "extra_forbidden":
+            message = "Unknown request or message fields are not supported."
+        else:
+            location = first.get("loc", ())
+            field = location[1] if len(location) > 1 else None
+            message = {
+                "model": f"model must be {MODEL_ID}.",
+                "messages": (
+                    "messages must be a nonempty array with supported roles "
+                    "(system, user, assistant) and nonblank string content."
+                ),
+                "max_tokens": "max_tokens must be an integer from 1 through 512.",
+                "temperature": "temperature must be a finite number from 0 through 2.",
+                "top_p": "top_p must be a finite number greater than 0 and at most 1.",
+                "stream": "stream must be a boolean.",
+            }.get(field, "Request body must be an object matching the supported schema.")
+    return _error_response(422, code, message, request_id)
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(body: ChatCompletionRequest, request: Request):
+    request_id = uuid4().hex
+    created = int(time())
+    try:
+        result = await submit_inference(request.app, body)
+    except InferenceUnavailable:
+        return _error_response(503, "not_ready", "Inference is not available.", request_id)
+    except InferenceBusy:
+        return _error_response(
+            429, "server_busy", "Another inference request is running.", request_id
+        )
+    except ContextLimitError as error:
+        # This exception is constructed from token counts, never prompt content.
+        return _error_response(400, "context_length_exceeded", str(error), request_id)
+    except Exception:
+        return _error_response(
+            500, "generation_failed", "The completion could not be generated.", request_id
+        )
+
+    completion_tokens = len(result.generated_ids)
+    return JSONResponse(
+        content={
+            "id": f"chatcmpl-{request_id}",
+            "object": "chat.completion",
+            "created": created,
+            "model": MODEL_ID,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": result.text},
+                    "finish_reason": result.finish_reason,
+                }
+            ],
+            "usage": {
+                "prompt_tokens": result.prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": result.prompt_tokens + completion_tokens,
+            },
+        },
+        headers={"X-Request-ID": request_id},
+    )
 
 
 @app.get("/health")

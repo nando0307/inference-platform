@@ -5,6 +5,7 @@ import unittest
 
 from threading import Event, Timer, get_ident
 from unittest.mock import patch
+from uuid import UUID
 
 import httpx
 from pydantic import ValidationError
@@ -442,6 +443,164 @@ class AdmissionTests(unittest.IsolatedAsyncioTestCase):
         finally:
             release.set()
             loop.set_exception_handler(previous_handler)
+
+
+class CompletionEndpointTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        loader_patch = patch("src.api.load_runtime", return_value=object())
+        loader_patch.start()
+        self.addCleanup(loader_patch.stop)
+        context = app.router.lifespan_context(app)
+        await context.__aenter__()
+        self.addAsyncCleanup(context.__aexit__, None, None, None)
+        self.client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        )
+        self.addAsyncCleanup(self.client.aclose)
+        self.path = "/v1/chat/completions"
+        self.result = GenerationResult("answer", 3, [7, 2], "stop")
+
+    def assert_error(self, response, status, code):
+        self.assertEqual(response.status_code, status)
+        error = response.json()["error"]
+        self.assertEqual(error["code"], code)
+        request_id = response.headers["X-Request-ID"]
+        self.assertEqual(UUID(request_id).hex, request_id)
+        self.assertEqual(error["request_id"], request_id)
+
+    async def test_validation_errors_are_private_and_precede_busy_admission(self):
+        marker = "PRIVATE-INPUT-MARKER"
+        cases = [
+            (b'{"messages": "PRIVATE-INPUT-MARKER",', "invalid_request"),
+            (b"\xff", "invalid_request"),
+            (b"[]", "invalid_request"),
+            ({}, "invalid_request"),
+            (request_data(model=marker), "invalid_request"),
+            (request_data(messages=[]), "invalid_request"),
+            (request_data(messages=[{"role": marker, "content": marker}]), "invalid_request"),
+            (request_data(messages=[{"role": "user", "content": " \t\n"}]), "invalid_request"),
+            (request_data(max_tokens=-1), "invalid_request"),
+            (request_data(max_tokens=marker), "invalid_request"),
+            (request_data(temperature=True), "invalid_request"),
+            (request_data(temperature=float("nan")), "invalid_request"),
+            (request_data(**{marker: marker}), "invalid_request"),
+            (request_data(messages=[{"role": "user", "content": marker, marker: marker}]), "invalid_request"),
+            (request_data(top_p=0.9), "invalid_parameter_combination"),
+            (request_data(stream=True), "unsupported_parameter"),
+        ]
+        app.state.admission_guard.acquire()
+        try:
+            for body, code in cases:
+                with self.subTest(body=body):
+                    response = await self.client.post(
+                        self.path,
+                        content=body if isinstance(body, bytes) else json.dumps(body),
+                        headers={
+                            "Content-Type": "application/json",
+                            "X-Request-ID": marker,
+                        },
+                    )
+                    self.assert_error(response, 422, code)
+                    self.assertNotIn(marker, response.text)
+                    self.assertNotEqual(response.headers["X-Request-ID"], marker)
+            self.assertEqual(app.state.producer_futures, set())
+        finally:
+            app.state.admission_guard.release()
+
+    async def test_unavailable_application_returns_503(self):
+        for initialized, shutting_down in ((False, False), (True, True)):
+            with self.subTest(initialized=initialized, shutting_down=shutting_down):
+                with (
+                    patch.object(app.state, "initialized", initialized),
+                    patch.object(app.state, "shutting_down", shutting_down),
+                ):
+                    response = await self.client.post(self.path, json=request_data())
+                self.assert_error(response, 503, "not_ready")
+                self.assertFalse(app.state.admission_guard.locked())
+
+    async def test_preparation_and_generation_errors_allow_later_success(self):
+        marker = "PRIVATE-INPUT-MARKER"
+        for failure, status, code in (
+            (
+                ContextLimitError(
+                    "Prompt tokens (2000) plus requested output tokens (100) "
+                    "exceed the supported limit (2048)."
+                ),
+                400,
+                "context_length_exceeded",
+            ),
+            (RuntimeError(marker), 500, "generation_failed"),
+        ):
+            with self.subTest(code=code):
+                with patch("src.api.generate", side_effect=[failure, self.result]):
+                    response = await self.client.post(
+                        self.path,
+                        json=request_data(messages=[{"role": "user", "content": marker}]),
+                    )
+                    self.assert_error(response, status, code)
+                    self.assertNotIn(marker, response.text)
+                    self.assertFalse(app.state.admission_guard.locked())
+                    recovered = await self.client.post(self.path, json=request_data())
+                    self.assertEqual(recovered.status_code, 200)
+                ready = await self.client.get("/ready")
+                self.assertEqual(ready.status_code, 200)
+
+    async def test_submission_failure_returns_safe_500_and_releases_slot(self):
+        with patch.object(app.state.executor, "submit", side_effect=RuntimeError("SECRET")):
+            response = await self.client.post(self.path, json=request_data())
+        self.assert_error(response, 500, "generation_failed")
+        self.assertNotIn("SECRET", response.text)
+        self.assertFalse(app.state.admission_guard.locked())
+        with patch("src.api.generate", return_value=self.result):
+            recovered = await self.client.post(self.path, json=request_data())
+        self.assertEqual(recovered.status_code, 200)
+
+    async def test_busy_and_canceled_http_handler_retain_producer_ownership(self):
+        started = Event()
+        release = Event()
+
+        def held_generation(*args, **kwargs):
+            started.set()
+            if not release.wait(5):
+                raise TimeoutError("Test producer was not released.")
+            return self.result
+
+        with patch("src.api.generate", side_effect=held_generation):
+            first = asyncio.create_task(self.client.post(self.path, json=request_data()))
+            producer = None
+            try:
+                self.assertTrue(await asyncio.to_thread(started.wait, 2))
+                producer = next(iter(app.state.producer_futures))
+                health = await self.client.get("/health")
+                ready = await self.client.get("/ready")
+                self.assertEqual(health.status_code, 200)
+                self.assertEqual(ready.status_code, 503)
+                second = await self.client.post(self.path, json=request_data())
+                self.assert_error(second, 429, "server_busy")
+                first.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await first
+                self.assertFalse(producer.done())
+                self.assertTrue(app.state.admission_guard.locked())
+                third = await self.client.post(self.path, json=request_data())
+                self.assert_error(third, 429, "server_busy")
+            finally:
+                release.set()
+                if producer is not None:
+                    await asyncio.wait_for(asyncio.shield(producer), timeout=3)
+                await asyncio.gather(first, return_exceptions=True)
+            recovered = await self.client.post(self.path, json=request_data())
+            self.assertEqual(recovered.status_code, 200)
+            self.assertFalse(app.state.admission_guard.locked())
+
+    async def test_unknown_routes_and_wrong_methods_keep_normal_routing(self):
+        missing = await self.client.post("/not-a-route", json=request_data())
+        wrong_method = await self.client.get(self.path)
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(wrong_method.status_code, 405)
+        self.assertIn("POST", wrong_method.headers["allow"])
+        self.assertNotIn("error", missing.json())
+        self.assertNotIn("error", wrong_method.json())
 
 
 if __name__ == "__main__":

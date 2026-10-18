@@ -477,13 +477,13 @@ one runtime.
   and top-p numbers.
 - [x] Reject tools, image content, `n`, client `top_k`, `stop`, `seed`,
   `stream_options`, and all other unsupported fields.
-- [ ] Until Checkpoint 9, reject `stream=true` with HTTP 422 and code
+- [x] Until Checkpoint 9, reject `stream=true` with HTTP 422 and code
   `unsupported_parameter`; remove this temporary restriction when streaming
   is implemented.
 
-The Python request models and temporary `unsupported_parameter` validation code
-are implemented and verified. HTTP 422 mapping remains pending until the HTTP
-boundary exists; this checklist item is not yet complete end to end.
+The request models and temporary streaming rejection are verified through the
+HTTP endpoint added in Checkpoint 8. `stream=true` returns HTTP 422 with
+`unsupported_parameter` until the streaming checkpoint.
 
 This is a documented chat-completions subset, not full OpenAI API compatibility.
 
@@ -499,7 +499,7 @@ predictable rejection behavior.
 
 - [x] Construct a fresh `GenerationConfig` per request. Never mutate shared
   `model.generation_config`.
-- [ ] Map external `max_tokens` to internal `max_new_tokens`.
+- [x] Map external `max_tokens` to internal `max_new_tokens`.
 - [x] Set `use_cache=True`, `num_beams=1`, `num_return_sequences=1`, and
   `repetition_penalty=1.0`.
 - [x] Preserve the configured EOS IDs from `model.generation_config`, not only
@@ -512,7 +512,7 @@ predictable rejection behavior.
 | `temperature == 0` | `do_sample=False`, `temperature=1.0`, `top_p=1.0`, `top_k=50` |
 | `temperature > 0` | `do_sample=True`, requested temperature/top-p, `top_k=0` |
 
-- [ ] Reject temperature zero with `top_p != 1.0` as HTTP 422
+- [x] Reject temperature zero with `top_p != 1.0` as HTTP 422
   `invalid_parameter_combination`; top-p does not change greedy decoding.
 
 The inspected Qwen snapshot `7ae557604adf67be50417f59c2c2f167def9a775` saves
@@ -533,11 +533,10 @@ greedy/sampling/greedy calls reused one runtime, greedy IDs matched across the
 sampling call, per-call configurations were distinct, and saved model settings
 were unchanged. Both EOS IDs, normal padding, the first-EOS padding fallback,
 and output caps were exercised without Python or Transformers warnings.
-The Python request-to-function exercise passed `request.max_tokens` as
-`max_new_tokens`; production HTTP binding and HTTP 422 mapping remain unchecked
-until the endpoint exists. Invalid combinations already fail in both request
-validation and direct inference before a model call. Detailed evidence is in
-`logs/practice.md`.
+The original Python exercise passed `request.max_tokens` as `max_new_tokens`.
+Checkpoint 8 subsequently verified the production HTTP mapping, greedy/sampling
+requests, and HTTP 422 rejection of invalid combinations. Detailed evidence is
+in `logs/practice.md`.
 
 **Done when:** Every accepted parameter has an explained implementation without
 invalid-generation-flag warnings.
@@ -559,7 +558,7 @@ Count the whole formatted conversation, role markers, template-added system
 text, and assistant generation prefix. The 2048-token limit is local serving
 policy, not a claim about Qwen's architectural maximum.
 
-- [ ] Return HTTP 400 `context_length_exceeded` when the combined budget exceeds
+- [x] Return HTTP 400 `context_length_exceeded` when the combined budget exceeds
   the limit.
 - [x] Include prompt count, requested output count, and supported limit in the
   error, without echoing input.
@@ -577,8 +576,9 @@ Inference-level verification on 2026-10-17: seven offline budget regressions in
 Qwen four-message prompt contained 1943 formatted tokens; an output allowance
 of 105 fit the 2048-token limit, while 106 raised `ContextLimitError` before
 preparation or generation. Rejection also passed with a library streamer
-supplied. No HTTP response or SSE headers were exercised; those checks remain
-pending. The existing production budget code required no changes.
+supplied. Checkpoint 8 later verified ordinary HTTP 400 rejection, including a
+2020-token prompt with output caps 28 (accepted) and 29 (rejected). Pre-SSE-header
+validation remains pending. The production budget code required no changes.
 
 **Done when:** Actual formatted-token counts enforce both boundaries.
 
@@ -626,8 +626,8 @@ shutdown with exit code 0. Import isolation also passed. Six lifecycle tests
 cover reuse/cleanup, model-load failure, executor-creation failure, busy/idle
 readiness, uninitialized state, and shutdown retaining the runtime until held
 worker work exits while the event loop stays responsive. The full suite passed
-24 tests. These controlled transitions are not real HTTP generation evidence;
-two chat-completion requests remain pending until Checkpoint 8.
+24 tests at that checkpoint. Checkpoint 8 subsequently verified repeated real
+HTTP chat completions against the same startup runtime.
 
 **Done when:** Model lifetime matches application lifetime.
 
@@ -638,9 +638,9 @@ two chat-completion requests remain pending until Checkpoint 8.
 Implement this before accepting the first generation request.
 
 - [x] Accept a schema-validated `ChatCompletionRequest` before admission.
-- [ ] Return HTTP 503 `not_ready` if uninitialized or shutting down.
+- [x] Return HTTP 503 `not_ready` if uninitialized or shutting down.
 - [x] Acquire the guard with `acquire(blocking=False)` before submitting work.
-- [ ] Return HTTP 429 `server_busy` immediately if occupied.
+- [x] Return HTTP 429 `server_busy` immediately if occupied.
 - [x] Submit only admitted work to the dedicated executor. Its internal queue
   must not become an application request queue.
 - [x] Run tokenization, context validation, and generation in the producer,
@@ -650,7 +650,7 @@ Implement this before accepting the first generation request.
 - [x] Release admission in the producer's `finally`, after its work exits.
 - [x] If submission fails before the producer starts, release the guard in the
   submitting path and propagate the failure.
-- [ ] Map submission failure to HTTP 500 `generation_failed`.
+- [x] Map submission failure to HTTP 500 `generation_failed`.
 - [ ] Verify ownership when a real HTTP client disconnects.
 - [ ] For streaming, maintain a per-request preparation signal resolved by
   `on_prepared()` or by preparation failure. Never leave it unresolved.
@@ -671,8 +671,9 @@ Five admission regressions and the updated shutdown test passed in the 29-test
 suite. A real-Qwen harness verified live health 200/readiness 503 busy, immediate
 Python busy rejection, retained ownership after consumer cancellation, context
 and controlled-forward-failure recovery, and readiness 200 afterward, with one
-model load. HTTP chat responses, real network disconnects, and the streaming
-preparation signal remain pending; no completion endpoint was added here.
+model load. Checkpoint 8 subsequently verified HTTP completions and error mapping,
+including 429 overlap and failure recovery. Real network disconnects and the
+streaming preparation signal remain pending.
 
 **Done when:** At most one producer uses the model/tokenizer while HTTP remains
 responsive.
@@ -681,9 +682,9 @@ responsive.
 
 **Question:** How does a model result become an HTTP response?
 
-- [ ] Implement async `POST /v1/chat/completions` through the admission/worker
+- [x] Implement async `POST /v1/chat/completions` through the admission/worker
   path, not by calling blocking generation directly.
-- [ ] For `stream=false`, return HTTP 200 with:
+- [x] For `stream=false`, return HTTP 200 with:
   - `id`: `chatcmpl-` followed by UUID hex.
   - `object`: `chat.completion`.
   - `created`: integer Unix timestamp.
@@ -692,10 +693,10 @@ responsive.
     `stop` or `length`.
   - Integer `usage.prompt_tokens`, `usage.completion_tokens`, and
     `usage.total_tokens`.
-- [ ] Compute completion tokens from `len(result.generated_ids)` and total
+- [x] Compute completion tokens from `len(result.generated_ids)` and total
   tokens from prompt plus completion. Do not report the requested cap as actual
   usage when EOS stopped early.
-- [ ] Use this consistent error envelope:
+- [x] Use this consistent error envelope:
 
 ```json
 {
@@ -717,13 +718,23 @@ responsive.
 | 503 | `not_ready`: unavailable or shutting down |
 | 500 | `generation_failed`: unexpected preparation/inference failure |
 
-- [ ] Customize FastAPI validation errors to omit raw inputs and bodies.
+- [x] Customize FastAPI validation errors to omit raw inputs and bodies.
   Locations and constraints may be included, but not private content.
-- [ ] Never expose raw unexpected exception text or tracebacks in responses.
-- [ ] Preserve normal 404/405 routing behavior.
+- [x] Never expose raw unexpected exception text or tracebacks in responses.
+- [x] Preserve normal 404/405 routing behavior.
 
 **Exercises:** Successful curl request, unsupported model, empty messages,
 negative token cap, unknown field, early EOS, and a deliberately small cap.
+
+Verified on 2026-10-18: all 35 tests passed, and a single real-Qwen Uvicorn
+process served curl requests for ordinary/repeated/sampling completions, early
+EOS and output caps, malformed/unsupported input, exact-fit/oversized contexts,
+busy overlap, and recovery after a controlled real forward failure. Health
+remained 200 and readiness returned 503 busy during held generation. Server-side
+UUID request IDs appear in headers and error envelopes. Invalid JSON encoding
+is normalized to 422, while normal 404/405 routing is preserved. Privacy markers
+were absent from returned errors and captured server logs. HTTP streaming and
+real network-disconnect behavior were not exercised.
 
 **Done when:** Ordinary HTTP generation works with truthful usage and finish
 reasons.

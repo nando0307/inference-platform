@@ -50,8 +50,73 @@ waits for executor work off the event loop, then releases the runtime. It does
 not cancel native model computation; a permanently stuck worker can prevent
 graceful shutdown.
 
-Only health/readiness routes are exposed for the local service.
-`POST /v1/chat/completions`, HTTP error mapping, and SSE remain later checkpoints.
+## Request an ordinary chat completion
+
+With the server running, use another terminal:
+
+```bash
+curl -i http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "Qwen/Qwen2.5-0.5B-Instruct",
+    "messages": [
+      {"role": "user", "content": "What is 2 + 2? Reply with only the number."}
+    ],
+    "max_tokens": 16,
+    "temperature": 0,
+    "top_p": 1,
+    "stream": false
+  }'
+```
+
+This is a supported chat-completions subset, not full OpenAI API compatibility.
+
+| Field | Rule | Default |
+|---|---|---|
+| `model` | Exactly `Qwen/Qwen2.5-0.5B-Instruct` | Required |
+| `messages` | Nonempty array; roles `system`, `user`, `assistant`; nonblank string content | Required |
+| `max_tokens` | Integer from 1 through 512, counting new output tokens | 100 |
+| `temperature` | Finite number from 0 through 2; zero selects greedy decoding | 0 |
+| `top_p` | Finite number greater than 0 and at most 1; must be 1 for greedy decoding | 1 |
+| `stream` | Boolean; currently only false is supported | false |
+
+Numeric strings, booleans used as numbers, and unknown request/message fields
+are rejected. Tools, images, `n`, `top_k`, `stop`, `seed`, and `stream_options`
+are unsupported. Valid message text is preserved. The client supplies history
+on every request; the server does not retain conversations.
+
+A successful response is HTTP 200 with `object: "chat.completion"`, an ID
+prefixed with `chatcmpl-`, an integer creation timestamp, the model ID, and one
+choice containing `message.role`, `message.content`, and `finish_reason`.
+The finish reason is `stop` for EOS or `length` for an exhausted output cap.
+`usage` contains actual `prompt_tokens`, `completion_tokens`, and `total_tokens`.
+Completion counts include generated EOS IDs, even when those IDs are invisible
+in the decoded text.
+
+Every handled chat success/error includes a server-generated `X-Request-ID`;
+incoming request identifiers are not trusted. Errors use
+`{"error":{"code":"...","message":"...","request_id":"..."}}`, with the same ID
+as the response header. Validation responses do not echo inputs or arbitrary
+field names; unexpected failures do not expose exception text or tracebacks.
+
+| Status | Error code | Meaning |
+|---|---|---|
+| 422 | `invalid_request` | Invalid JSON, schema, types, ranges, model, or fields |
+| 422 | `invalid_parameter_combination` | Greedy decoding with non-default top-p |
+| 422 | `unsupported_parameter` | `stream=true` before streaming is implemented |
+| 400 | `context_length_exceeded` | Formatted prompt plus requested output exceeds the supported context |
+| 429 | `server_busy` | Another producer owns inference; no waiting queue |
+| 503 | `not_ready` | Application unavailable or shutting down |
+| 500 | `generation_failed` | Submission, preparation, or generation failed unexpectedly |
+
+The combined budget is at most 2048 tokens, further bounded by the model's
+declared context. Exact fits are accepted; excess input is rejected without
+truncation, dropping history, or reducing the requested cap. Normal unknown
+routes and wrong methods retain HTTP 404/405 behavior.
+
+Streaming and explicit network-disconnect handling remain later checkpoints.
+
+### Execution ownership
 
 The internal execution path is `submit_inference(app, validated_request)` in
 `src/api.py`. Call it on the running application's event loop with an already
@@ -64,8 +129,9 @@ generation, releasing the guard only when its work exits. The returned result
 is already shielded: canceling its consumer does not cancel the retained producer
 or free the slot early. Completion callbacks observe errors even when delivery
 is abandoned; they do not log raw exception text. Shutdown drains producer
-completion before clearing the runtime. These are Python execution guarantees,
-not yet HTTP 429/503 responses or verified network-disconnect behavior.
+completion before clearing the runtime. HTTP error mapping now uses this path.
+Handler cancellation ownership is covered by controlled ASGI tests; real
+network-disconnect handling remains to be verified separately.
 
 ## Run behavioral tests
 

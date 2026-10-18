@@ -791,13 +791,92 @@ internally; no completion route, HTTP 429/503/500 error mapping, SSE preparation
 signal, or network-disconnect verification was added. The plan keeps those
 acceptance items pending.
 
-Next task: Checkpoint 8, expose ordinary chat completions through this admission
-path and map results/errors to HTTP. Add streaming preparation and consumption
-when implementing Checkpoint 9; keep the same producer ownership.
+Implemented Checkpoint 8 on 2026-10-18: `POST /v1/chat/completions` in
+`src/api.py` now accepts the validated request model, awaits the existing
+shielded admission path, and returns ordinary JSON with assistant content,
+completion ID, integer creation timestamp, fixed model ID, finish reason, and
+actual token usage. No inference algorithm or dependency changes were needed.
+
+Each handled chat request receives a server-generated UUID in `X-Request-ID`;
+successful completion IDs use the `chatcmpl-` prefix and errors include the same
+request ID as the header. Incoming identifiers are ignored. Structured lifecycle
+logging remains Checkpoint 11; request IDs were needed now for the error contract.
+
+Mapped errors:
+- Schema/JSON failures: 422 `invalid_request`.
+- Greedy/top-p mismatch: 422 `invalid_parameter_combination`.
+- Streaming requested before implementation: 422 `unsupported_parameter`.
+- Context overflow: 400 `context_length_exceeded`, including counts but no input.
+- Occupied producer: 429 `server_busy`.
+- Unavailable lifecycle state: 503 `not_ready`.
+- Submission or unexpected inference failure: 500 `generation_failed`, with no
+  raw exception text or traceback.
+
+Validation messages use fixed, known descriptions rather than serializing raw
+Pydantic inputs, contexts, or unknown field names. A regression initially exposed
+FastAPI returning 400 for malformed JSON encoding; the boundary now normalizes
+that Unicode parsing failure to the documented 422 response. Other framework
+HTTP exceptions retain default handling, including 404/405. One test fixture
+also needed a real whitespace escape instead of literal backslash-n.
+
+Added six endpoint regressions for sanitized validation before busy admission,
+unavailable state, context/generation error recovery, submission failure cleanup,
+busy rejection and canceled HTTP-handler ownership, and preserved routing.
+`.venv/bin/python -m unittest discover -s tests -v` passed all 35 tests after
+those fixes. Handler cancellation was exercised through ASGI, not a real
+network disconnect.
+
+A temporary harness ran the actual Uvicorn app on an ephemeral localhost port,
+loaded Qwen once, and used real curl subprocesses to send HTTP requests.
+The ordinary prompt was `What is 2 + 2? Reply with only the number.`
+
+| Case | HTTP | Prompt / completion / total tokens | Finish |
+|---|---|---|---|
+| Greedy, cap 16 | 200 | 43 / 2 / 45 | `stop` |
+| Repeated greedy, cap 16 | 200 | 43 / 2 / 45 | `stop` |
+| Greedy, cap 1 | 200 | 43 / 1 / 44 | `length` |
+| Sampling, temperature 0.7, top-p 0.9, cap 16 | 200 | 43 / 2 / 45 | `stop` |
+| Exact context fit, cap 28 | 200 | 2020 / 23 / 2043 | `stop` |
+| Post-failure recovery, greedy cap 16 | 200 | 43 / 2 / 45 | `stop` |
+
+The exact-fit request reserved `2020 + 28 = 2048`, then stopped early after
+23 generated IDs; reported usage did not falsely claim the full cap. The same
+prompt with cap 29 returned 400 `context_length_exceeded`. A larger prompt
+returned the same code with counts 5030 + 16 > 2048.
+
+Additional real-HTTP observations:
+- Unsupported model, empty messages, negative cap, unknown private field,
+  nonfinite temperature, malformed JSON, and invalid JSON encoding returned 422.
+- Temperature 0/top-p 0.9 and stream true returned their distinct 422 codes.
+- A controlled gate after a successful Qwen forward call held an active HTTP
+  completion. Health returned 200; readiness returned 503 busy; a second valid
+  completion returned 429. Invalid input still returned 422 while busy.
+- Releasing the gate let the original curl request finish with 200.
+- A controlled exception on the second real forward call returned sanitized
+  HTTP 500. Restoring the method allowed the next real completion to succeed.
+- A temporarily forced shutting-down state returned HTTP 503 `not_ready`; this
+  was controlled state, not a claim about connectivity during real shutdown.
+- GET on the completion route returned 405; an unknown route returned 404.
+- Response IDs were distinct, server-generated, and correlated with error
+  headers. Usage and finish metadata matched the actual inference results.
+- A private marker in invalid values, unknown field names, the incoming request
+  ID, and the injected exception was absent from error responses and captured
+  server logs. This does not constitute the future lifecycle-logging feature.
+- Readiness returned to 200, all producer references drained, and the smoke
+  process shut down with exit code 0. No temporary harness/server remains.
+
+README now documents the ordinary curl request, supported fields, response
+metadata, error codes, and remaining scope. The plan marks previously pending
+HTTP acceptance criteria from Checkpoints 3-7 only where now verified.
+
+Next task: Checkpoint 9, implement incremental SSE using the same producer path.
+Add a per-request preparation signal before committing stream headers, remove
+the temporary stream=true rejection, and preserve actual generated-token usage.
+Real network-disconnect handling and lifecycle logging remain later checkpoints.
 
 Still not established: a formal temperature study, manual top-k/top-p filtering
 (explicitly skipped), repeated statistical benchmarks, total/peak process-memory
-profiling, load/concurrency benchmarks, batching experiments, precision/quantization
-comparisons, or a chat-completion HTTP endpoint. Basic Stage 1 milestones have
-been exercised with the sampling scope decision; the whole roadmap is not complete.
+profiling, load/concurrency benchmarks, batching experiments, and precision/
+quantization comparisons. HTTP streaming, real network-disconnect behavior, and
+structured lifecycle logging remain incomplete; the whole roadmap is not complete.
 
