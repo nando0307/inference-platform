@@ -1,9 +1,14 @@
+import asyncio
 import json
 import unittest
 
+from threading import Event, Timer
+from unittest.mock import patch
+
+import httpx
 from pydantic import ValidationError
 
-from src.api import ChatCompletionRequest
+from src.api import ChatCompletionRequest, app
 from src.inference import MODEL_ID
 
 
@@ -42,7 +47,9 @@ class RequestValidationTests(unittest.TestCase):
         result = ChatCompletionRequest.model_validate_json(
             json.dumps(request_data(messages=messages))
         )
-        self.assertEqual([message.model_dump() for message in result.messages], messages)
+        self.assertEqual(
+            [message.model_dump() for message in result.messages], messages
+        )
 
     def test_valid_numeric_boundaries_and_integer_sampling_values(self):
         for settings in (
@@ -83,7 +90,15 @@ class RequestValidationTests(unittest.TestCase):
                 self.assert_rejected(request_data(messages=messages))
 
     def test_unknown_request_and_message_fields(self):
-        for field in ("tools", "n", "top_k", "stop", "seed", "stream_options", "unknown"):
+        for field in (
+            "tools",
+            "n",
+            "top_k",
+            "stop",
+            "seed",
+            "stream_options",
+            "unknown",
+        ):
             with self.subTest(field=field):
                 self.assert_rejected(request_data(**{field: None}), "extra_forbidden")
         self.assert_rejected(
@@ -131,6 +146,143 @@ class RequestValidationTests(unittest.TestCase):
             with self.subTest(body=body):
                 with self.assertRaises(ValidationError):
                     ChatCompletionRequest.model_validate_json(body)
+
+
+class LifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.runtime = object()
+        loader_patch = patch("src.api.load_runtime", return_value=self.runtime)
+        self.loader = loader_patch.start()
+        self.addCleanup(loader_patch.stop)
+        self.client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        )
+        self.addAsyncCleanup(self.client.aclose)
+
+    async def test_startup_reuses_runtime_and_shutdown_releases_resources(self):
+        async with app.router.lifespan_context(app):
+            executor = app.state.executor
+            for _ in range(2):
+                health = await self.client.get("/health")
+                ready = await self.client.get("/ready")
+                self.assertEqual(health.status_code, 200)
+                self.assertEqual(health.json(), {"status": "alive"})
+                self.assertEqual(ready.status_code, 200)
+                self.assertEqual(ready.json(), {"ready": True, "status": "ready"})
+                self.assertIs(app.state.runtime, self.runtime)
+            self.loader.assert_called_once_with()
+
+        self.assertFalse(app.state.initialized)
+        self.assertTrue(app.state.shutting_down)
+        self.assertIsNone(app.state.runtime)
+        self.assertIsNone(app.state.executor)
+        with self.assertRaises(RuntimeError):
+            executor.submit(lambda: None)
+
+    async def test_loading_failure_prevents_serving(self):
+        self.loader.side_effect = RuntimeError("Controlled loading failure")
+        with self.assertRaises(RuntimeError):
+            async with app.router.lifespan_context(app):
+                self.fail("Startup failure must not enter the serving phase.")
+        self.assertFalse(app.state.initialized)
+        self.assertIsNone(app.state.runtime)
+        self.assertIsNone(app.state.executor)
+        ready = await self.client.get("/ready")
+        self.assertEqual(ready.status_code, 503)
+        self.assertFalse(ready.json()["ready"])
+
+    async def test_executor_creation_failure_releases_loaded_runtime(self):
+        with patch("src.api.ThreadPoolExecutor", side_effect=RuntimeError("No worker")):
+            with self.assertRaises(RuntimeError):
+                async with app.router.lifespan_context(app):
+                    self.fail("Partial startup must not enter the serving phase.")
+        self.assertFalse(app.state.initialized)
+        self.assertIsNone(app.state.runtime)
+        self.assertIsNone(app.state.executor)
+
+    async def test_health_remains_available_when_inference_slot_is_busy(self):
+        async with app.router.lifespan_context(app):
+            app.state.admission_guard.acquire()
+            try:
+                health = await self.client.get("/health")
+                ready = await self.client.get("/ready")
+                self.assertEqual(health.status_code, 200)
+                self.assertEqual(ready.status_code, 503)
+                self.assertEqual(ready.json(), {"ready": False, "status": "busy"})
+            finally:
+                app.state.admission_guard.release()
+            ready = await self.client.get("/ready")
+            self.assertEqual(ready.status_code, 200)
+            self.assertTrue(ready.json()["ready"])
+
+    async def test_uninitialized_application_does_not_claim_readiness(self):
+        with (
+            patch.object(app.state, "initialized", False, create=True),
+            patch.object(app.state, "shutting_down", False, create=True),
+        ):
+            ready = await self.client.get("/ready")
+        self.assertEqual(ready.status_code, 503)
+        self.assertEqual(ready.json(), {"ready": False, "status": "not_ready"})
+
+    async def test_shutdown_waits_for_worker_without_blocking_http_loop(self):
+        context = app.router.lifespan_context(app)
+        await context.__aenter__()
+        started = Event()
+        release = Event()
+        shutdown_started = Event()
+        executor = app.state.executor
+        guard = app.state.admission_guard
+        guard.acquire()
+
+        def held_producer():
+            started.set()
+            try:
+                release.wait()
+                return app.state.runtime
+            finally:
+                guard.release()
+
+        future = executor.submit(held_producer)
+        original_shutdown = executor.shutdown
+
+        def observed_shutdown(*args, **kwargs):
+            shutdown_started.set()
+            return original_shutdown(*args, **kwargs)
+
+        # Release even if a regression blocks the event loop during shutdown.
+        safety_release = Timer(5, release.set)
+        safety_release.start()
+        shutdown_task = None
+        try:
+            self.assertTrue(await asyncio.to_thread(started.wait, 2))
+            with patch.object(executor, "shutdown", side_effect=observed_shutdown):
+                shutdown_task = asyncio.create_task(context.__aexit__(None, None, None))
+                self.assertTrue(await asyncio.to_thread(shutdown_started.wait, 2))
+                self.assertFalse(shutdown_task.done())
+                self.assertFalse(future.done())
+                self.assertIs(app.state.runtime, self.runtime)
+                self.assertFalse(app.state.initialized)
+                health = await self.client.get("/health")
+                ready = await self.client.get("/ready")
+                self.assertEqual(health.status_code, 200)
+                self.assertEqual(ready.status_code, 503)
+                self.assertEqual(
+                    ready.json(), {"ready": False, "status": "shutting_down"}
+                )
+                release.set()
+                await asyncio.wait_for(shutdown_task, timeout=3)
+            self.assertIs(future.result(), self.runtime)
+            self.assertIsNone(app.state.runtime)
+            self.assertIsNone(app.state.executor)
+        finally:
+            release.set()
+            safety_release.cancel()
+            safety_release.join()
+            if shutdown_task is None:
+                await context.__aexit__(None, None, None)
+            else:
+                await shutdown_task
 
 
 if __name__ == "__main__":

@@ -17,8 +17,18 @@ class ContextBudgetTests(unittest.TestCase):
         vocabulary = {
             token: index
             for index, token in enumerate(
-                ["[UNK]", "[PAD]", "[EOS]", "[BOS]", "[system]", "[user]",
-                 "[assistant]", "older", "reply", "latest"]
+                [
+                    "[UNK]",
+                    "[PAD]",
+                    "[EOS]",
+                    "[BOS]",
+                    "[system]",
+                    "[user]",
+                    "[assistant]",
+                    "older",
+                    "reply",
+                    "latest",
+                ]
             )
         }
         backend = Tokenizer(WordLevel(vocabulary, unk_token="[UNK]"))
@@ -40,16 +50,18 @@ class ContextBudgetTests(unittest.TestCase):
         )
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(0)
-            model = GPT2LMHeadModel(GPT2Config(
-                vocab_size=len(vocabulary),
-                n_positions=64,
-                n_embd=8,
-                n_layer=1,
-                n_head=1,
-                bos_token_id=None,
-                eos_token_id=None,
-                pad_token_id=tokenizer.pad_token_id,
-            ))
+            model = GPT2LMHeadModel(
+                GPT2Config(
+                    vocab_size=len(vocabulary),
+                    n_positions=64,
+                    n_embd=8,
+                    n_layer=1,
+                    n_head=1,
+                    bos_token_id=None,
+                    eos_token_id=None,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+            )
         model.eval()
         self.runtime = Runtime(model, tokenizer, set(), context_limit=19)
         self.messages = [
@@ -129,15 +141,22 @@ class RuntimeContextLimitTests(unittest.TestCase):
         model.config = config
         model.generation_config.eos_token_id = [2]
         with (
-            patch("src.inference.AutoModelForCausalLM.from_pretrained", return_value=model),
-            patch("src.inference.AutoTokenizer.from_pretrained", return_value=SimpleNamespace(pad_token_id=1)),
+            patch(
+                "src.inference.AutoModelForCausalLM.from_pretrained", return_value=model
+            ),
+            patch(
+                "src.inference.AutoTokenizer.from_pretrained",
+                return_value=SimpleNamespace(pad_token_id=1),
+            ),
         ):
             return load_runtime()
 
     def test_supported_context_respects_smaller_model_and_local_cap(self):
         for declared, expected in ((1024, 1024), (32768, 2048)):
             with self.subTest(declared=declared):
-                runtime = self.load_with_config(SimpleNamespace(max_position_embeddings=declared))
+                runtime = self.load_with_config(
+                    SimpleNamespace(max_position_embeddings=declared)
+                )
                 self.assertEqual(runtime.context_limit, expected)
 
     def test_absent_or_invalid_declared_context_fails_loading(self):

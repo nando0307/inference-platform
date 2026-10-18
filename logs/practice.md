@@ -664,17 +664,75 @@ returned a token list. Inspection showed the installed Transformers returns a
 then passed. Production already counts tensor input IDs and was unaffected.
 
 HTTP 400 mapping and pre-SSE-header rejection remain unverified because no
-endpoint exists. The plan keeps these items unchecked instead of treating a
-Python exception as an HTTP response.
+chat-completion endpoint exists. The plan keeps these items unchecked instead
+of treating a Python exception as an HTTP response.
 
-Next task: Checkpoint 6, application lifecycle and health/readiness. This is
-where FastAPI/Uvicorn and a lifespan-managed runtime enter the implementation.
-Generation endpoints still require the admission/worker path in Checkpoint 7
-before being exposed. Continue incrementally with the learner.
+Before Checkpoint 6, repaired a user-reported malformed section in
+`tests/test_api.py`: the numeric-range loop was incomplete and the nonfinite,
+streaming, and greedy/top-p test definitions were missing. Restored the earlier
+behavioral cases without changing production validation. Running
+`.venv/bin/python -m unittest discover -s tests -v` afterward passed all 18 tests.
+
+Implemented Checkpoint 6 in `src/api.py`: a FastAPI lifespan owns the runtime,
+single-worker executor, admission guard, and initialized/shutdown flags.
+Successful startup loads Qwen once; loading or executor-creation failure aborts
+startup and cleans up owned references. Shutdown marks unavailable, waits for
+executor work via `asyncio.to_thread`, then clears executor/runtime references.
+The existing inference implementation and request validators are unchanged.
+
+Added FastAPI and Uvicorn to `requirements.txt`, and declared `httpx` for HTTP
+tests (already installed). Installed FastAPI 0.143.3 and Uvicorn 0.54.0.
+Before/after version checks confirmed PyTorch 2.14.1, Transformers 5.18.0, and
+Pydantic 2.14.1 were unchanged.
+
+Six new lifecycle regressions in `tests/test_api.py` verify:
+- Repeated health/readiness requests share one loaded runtime and normal
+  shutdown clears resources and closes the executor.
+- Loading failure prevents entry into the serving phase.
+- Executor-creation failure cleans up the already-loaded runtime.
+- An occupied guard produces 503 busy while health remains 200; releasing it
+  restores readiness.
+- Uninitialized state returns 503 not_ready.
+- Shutdown waits for a deliberately held producer without blocking the HTTP
+  event loop. While waiting, health returns 200, readiness returns 503
+  shutting_down, and the runtime remains referenced through producer exit.
+
+`.venv/bin/python -m unittest discover -s tests -v` passed all 24 tests.
+The lifecycle fixtures do not load Qwen; shutdown-time responses are controlled
+ASGI observations, not claims about reachability during real Uvicorn shutdown.
+A separate fresh-process import smoke blocked both model/tokenizer loading
+entry points and successfully imported `src.api`.
+
+Real localhost smoke used:
+
+```bash
+.venv/bin/python -m uvicorn src.api:app \
+  --host 127.0.0.1 --port 8000 --workers 1
+curl --fail --silent --show-error --include \
+  http://127.0.0.1:8000/health http://127.0.0.1:8000/ready \
+  http://127.0.0.1:8000/health http://127.0.0.1:8000/ready
+```
+
+Observed one Qwen weight-loading progress sequence before application startup
+completed. Both health responses were 200 with `{"status":"alive"}`; both ready
+responses were 200 with `{"ready":true,"status":"ready"}`. No additional loading
+occurred during those requests. Ctrl-C produced application shutdown complete
+and process exit code 0; the smoke server is stopped.
+
+No pre-start HTTP readiness response was collected. No chat-completion route,
+production admission path, generation request IDs, or SSE was added. The busy
+and shutdown states were verified with controlled fixtures, not concurrent
+real-model HTTP generation. README now documents launch, readiness, shutdown,
+and test commands.
+
+Next task: Checkpoint 7, serialized inference and immediate busy admission.
+Use the existing executor/guard and retain producer ownership until actual
+completion, including when the HTTP consumer disappears. Expose generation
+only after this execution path is safe.
 
 Still not established: a formal temperature study, manual top-k/top-p filtering
 (explicitly skipped), repeated statistical benchmarks, total/peak process-memory
 profiling, actual concurrency/batching experiments, precision/quantization
-comparisons, or any HTTP server. Basic Stage 1 milestones have been exercised
-with that sampling scope decision; do not claim the entire roadmap is complete.
+comparisons, or a chat-completion HTTP endpoint. Basic Stage 1 milestones have
+been exercised with the sampling scope decision; the whole roadmap is not complete.
 

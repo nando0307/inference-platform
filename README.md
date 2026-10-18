@@ -9,9 +9,62 @@ my dream is to becoming a llm engineer xD
 ## Current learning checkpoint
 
 Read [the session handoff in logs/practice.md](logs/practice.md) before continuing
-with a new mentor. It records the completed cached/uncached timing experiment,
-measured results, edit-permission requirements, and the next unstarted experiment.
-Use [plan.md](plan.md) for the broader roadmap.
+with a new mentor. It records inference experiments, verified API checkpoints,
+and the next task. Use [plan.md](plan.md) for the broader roadmap.
+
+## Run the local application
+
+From the repository root, using the existing project environment:
+
+```bash
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m uvicorn src.api:app \
+  --host 127.0.0.1 --port 8000 --workers 1
+```
+
+The lifespan loads `Qwen/Qwen2.5-0.5B-Instruct` once per application process on
+CPU in float32. Model files must be cached locally or downloadable. Importing
+`src.api` does not load weights; failed loading aborts startup. Avoid reload
+mode and multiple workers when checking model lifetime.
+
+From another terminal:
+
+```bash
+curl -i http://127.0.0.1:8000/health
+curl -i http://127.0.0.1:8000/ready
+```
+
+| Endpoint/state | Status | Body |
+|---|---|---|
+| `/health`, serving HTTP | 200 | `{"status":"alive"}` |
+| `/ready`, initialized and idle | 200 | `{"ready":true,"status":"ready"}` |
+| `/ready`, admission guard occupied | 503 | `{"ready":false,"status":"busy"}` |
+| `/ready`, uninitialized, if reachable | 503 | `{"ready":false,"status":"not_ready"}` |
+| `/ready`, shutting down, if reachable | 503 | `{"ready":false,"status":"shutting_down"}` |
+
+Readiness is a snapshot, not a reservation. Uvicorn may refuse connections until
+startup completes; connection refusal is not an HTTP 503 response.
+
+Press Ctrl-C to stop normally. Shutdown marks the application unavailable,
+waits for executor work off the event loop, then releases the runtime. It does
+not cancel native model computation; a permanently stuck worker can prevent
+graceful shutdown.
+
+Only health/readiness routes are implemented for the local service.
+`POST /v1/chat/completions`, generation admission, HTTP error mapping, and SSE
+remain later checkpoints. The executor and guard exist, but no HTTP generation
+request can be submitted yet.
+
+## Run behavioral tests
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+The suite covers request validation, context budgets, and lifecycle transitions.
+It uses offline inference fixtures and controlled lifecycle resources; `httpx`
+is the HTTP test client. Real-Qwen smoke evidence is recorded separately in
+`logs/practice.md`.
 
 ## Inspect tokenization and two-token generation
 

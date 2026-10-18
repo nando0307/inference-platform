@@ -586,12 +586,12 @@ pending. The existing production budget code required no changes.
 
 **Question:** When is the process alive, and when can it perform inference?
 
-- [ ] Add `fastapi` and `uvicorn` to `requirements.txt` during implementation.
+- [x] Add `fastapi` and `uvicorn` to `requirements.txt` during implementation.
   Keep the existing `.venv` and its PyTorch/Transformers versions.
-- [ ] Create `app = FastAPI(lifespan=lifespan)` in `src/api.py` using
+- [x] Create `app = FastAPI(lifespan=lifespan)` in `src/api.py` using
   `contextlib.asynccontextmanager`, not import-time loading or deprecated event
   decorators.
-- [ ] Store runtime, worker, admission guard, and shutdown state on `app.state`.
+- [x] Store runtime, worker, admission guard, and shutdown state on `app.state`.
 
 Startup:
 1. Initialize state as unavailable.
@@ -619,6 +619,15 @@ Shutdown:
 
 **Exercise:** Start the service, wait for readiness, send two requests, verify
 one startup load, and stop it normally.
+
+Verified with the real localhost Uvicorn process: one Qwen startup load,
+two `/health` and two `/ready` requests returning 200, and normal Ctrl-C
+shutdown with exit code 0. Import isolation also passed. Six lifecycle tests
+cover reuse/cleanup, model-load failure, executor-creation failure, busy/idle
+readiness, uninitialized state, and shutdown retaining the runtime until held
+worker work exits while the event loop stays responsive. The full suite passed
+24 tests. These controlled transitions are not real HTTP generation evidence;
+two chat-completion requests remain pending until Checkpoint 8.
 
 **Done when:** Model lifetime matches application lifetime.
 

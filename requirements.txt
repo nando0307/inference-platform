@@ -1,5 +1,8 @@
 torch
 transformers
 pydantic>=2,<3
+fastapi
+uvicorn
+httpx
 
 

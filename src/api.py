@@ -1,9 +1,15 @@
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
+from threading import Lock
 from typing import Literal, Self
 
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_core import PydanticCustomError
 
-from .inference import MODEL_ID
+from .inference import MODEL_ID, load_runtime
 
 
 class ChatMessage(BaseModel):
@@ -55,3 +61,54 @@ class ChatCompletionRequest(BaseModel):
                 "Streaming is not supported yet.",
             )
         return self
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    state = app.state
+    state.initialized = False
+    state.shutting_down = False
+    state.runtime = None
+    state.executor = None
+    state.admission_guard = Lock()
+
+    try:
+        # Startup must finish before requests can use the model.
+        state.runtime = load_runtime()
+        state.executor = ThreadPoolExecutor(max_workers=1)
+        state.initialized = True
+        yield
+    finally:
+        state.initialized = False
+        state.shutting_down = True
+        if state.executor is not None:
+            # Retain the runtime until all worker computation has actually ended.
+            await asyncio.to_thread(state.executor.shutdown, wait=True)
+            state.executor = None
+        state.runtime = None
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/health")
+async def health():
+    return {"status": "alive"}
+
+
+@app.get("/ready")
+async def ready(request: Request):
+    state = request.app.state
+    if getattr(state, "shutting_down", False):
+        status = "shutting_down"
+    elif not getattr(state, "initialized", False):
+        status = "not_ready"
+    elif state.admission_guard.locked():
+        status = "busy"
+    else:
+        status = "ready"
+    available = status == "ready"
+    return JSONResponse(
+        status_code=200 if available else 503,
+        content={"ready": available, "status": status},
+    )
