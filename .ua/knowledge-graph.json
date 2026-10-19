@@ -1,0 +1,4526 @@
+{
+  "nodes": [
+    {
+      "id": "file:src/api.py",
+      "type": "file",
+      "name": "api.py",
+      "filePath": "src/api.py",
+      "summary": "FastAPI entry point owning one runtime, one worker, and a nonblocking admission guard for ordinary JSON and SSE chat completions. Strict validation and sanitized errors surround a preparation handshake and disconnect-aware delivery; producer ownership lasts until work exits, with no request queue or cooperative model cancellation.",
+      "tags": [
+        "entry-point",
+        "fastapi",
+        "streaming",
+        "admission-control",
+        "lifecycle",
+        "tested"
+      ],
+      "complexity": "complex"
+    },
+    {
+      "id": "function:src/api.py:submit_inference",
+      "type": "function",
+      "name": "submit_inference",
+      "filePath": "src/api.py",
+      "lineRange": [
+        87,
+        121
+      ],
+      "summary": "Admits only a validated request into the single-worker executor, retains the producer, and returns a shielded result. Rejects unavailable/busy state immediately and releases the guard if submission fails before the producer starts.",
+      "tags": [
+        "admission-control",
+        "executor",
+        "cancellation"
+      ],
+      "complexity": "moderate"
+    },
+    {
+      "id": "function:src/api.py:_run_inference",
+      "type": "function",
+      "name": "_run_inference",
+      "filePath": "src/api.py",
+      "lineRange": [
+        124,
+        150
+      ],
+      "summary": "Runs reusable generation on the worker, maps max_tokens to max_new_tokens, and signals preparation or failure back to the event loop. Its finally block releases admission only after producer work exits.",
+      "tags": [
+        "worker",
+        "ownership",
+        "preparation"
+      ],
+      "complexity": "moderate"
+    },
+    {
+      "id": "function:src/api.py:_resolve_preparation",
+      "type": "function",
+      "name": "_resolve_preparation",
+      "filePath": "src/api.py",
+      "lineRange": [
+        153,
+        159
+      ],
+      "summary": "Resolves an unfinished preparation future with success or an error on the event loop; ignores later signals once it is settled.",
+      "tags": [
+        "future",
+        "preparation",
+        "error-handling"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:src/api.py:_observe_completion",
+      "type": "function",
+      "name": "_observe_completion",
+      "filePath": "src/api.py",
+      "lineRange": [
+        162,
+        166
+      ],
+      "summary": "Removes a completed future from retained producers and retrieves non-canceled exceptions so abandoned work does not create unhandled-future errors. It does not log exception details.",
+      "tags": [
+        "future",
+        "cleanup",
+        "error-observation"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:src/api.py:lifespan",
+      "type": "function",
+      "name": "lifespan",
+      "filePath": "src/api.py",
+      "lineRange": [
+        170,
+        194
+      ],
+      "summary": "Loads the runtime once, creates the single-worker executor and guard, then marks the app initialized. Shutdown rejects new work, waits off-loop for the worker and retained futures, and only then clears runtime references; startup errors propagate.",
+      "tags": [
+        "lifecycle",
+        "context-manager",
+        "resource-ownership"
+      ],
+      "complexity": "moderate"
+    },
+    {
+      "id": "function:src/api.py:_error_payload",
+      "type": "function",
+      "name": "_error_payload",
+      "filePath": "src/api.py",
+      "lineRange": [
+        200,
+        201
+      ],
+      "summary": "Builds the common error envelope with code, safe message, and server-generated request ID for HTTP and SSE failures.",
+      "tags": [
+        "serialization",
+        "error-contract",
+        "request-id"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:src/api.py:_usage",
+      "type": "function",
+      "name": "_usage",
+      "filePath": "src/api.py",
+      "lineRange": [
+        204,
+        210
+      ],
+      "summary": "Counts actual completion IDs, including invisible EOS, and combines that count with formatted prompt tokens; neither text chunks nor the requested cap determine usage.",
+      "tags": [
+        "token-accounting",
+        "usage",
+        "serialization"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:src/api.py:_error_response",
+      "type": "function",
+      "name": "_error_response",
+      "filePath": "src/api.py",
+      "lineRange": [
+        213,
+        220
+      ],
+      "summary": "Wraps the shared error envelope in a JSON response with its HTTP status and matching X-Request-ID header.",
+      "tags": [
+        "http",
+        "errors",
+        "request-id"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:src/api.py:http_error",
+      "type": "function",
+      "name": "http_error",
+      "filePath": "src/api.py",
+      "lineRange": [
+        224,
+        235
+      ],
+      "summary": "Converts invalid JSON encoding on the chat POST route from FastAPI HTTP 400 to safe HTTP 422; delegates unrelated HTTP exceptions to normal framework handling.",
+      "tags": [
+        "validation",
+        "encoding",
+        "http-errors"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:src/api.py:invalid_request",
+      "type": "function",
+      "name": "invalid_request",
+      "filePath": "src/api.py",
+      "lineRange": [
+        239,
+        267
+      ],
+      "summary": "Maps Pydantic and JSON validation errors to fixed safe messages and a fresh request ID. Keeps greedy/top-p mismatch distinct and avoids echoing private inputs, arbitrary field names, or exception contexts.",
+      "tags": [
+        "validation",
+        "privacy",
+        "http-errors"
+      ],
+      "complexity": "moderate"
+    },
+    {
+      "id": "function:src/api.py:_is_disconnected",
+      "type": "function",
+      "name": "_is_disconnected",
+      "filePath": "src/api.py",
+      "lineRange": [
+        277,
+        282
+      ],
+      "summary": "Checks Starlette connection state and re-raises pending task cancellation that the AnyIO disconnect probe might otherwise consume.",
+      "tags": [
+        "disconnects",
+        "asyncio",
+        "cancellation"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:src/api.py:_await_connected",
+      "type": "function",
+      "name": "_await_connected",
+      "filePath": "src/api.py",
+      "lineRange": [
+        285,
+        297
+      ],
+      "summary": "Polls a shielded future without blocking the event loop while checking client disconnects. Delivery cancellation cancels only the shield, not retained producer work.",
+      "tags": [
+        "disconnects",
+        "future",
+        "ownership"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:src/api.py:_next_text",
+      "type": "function",
+      "name": "_next_text",
+      "filePath": "src/api.py",
+      "lineRange": [
+        300,
+        307
+      ],
+      "summary": "Performs one blocking streamer iteration and translates text, queue timeout, or StopIteration into ordinary tagged tuples so iterator exhaustion never crosses an asyncio future.",
+      "tags": [
+        "streamer",
+        "queue",
+        "iterator-adapter"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:src/api.py:_sse",
+      "type": "function",
+      "name": "_sse",
+      "filePath": "src/api.py",
+      "lineRange": [
+        310,
+        311
+      ],
+      "summary": "Serializes a JSON object as one Unicode-preserving data frame followed by the blank line required by SSE.",
+      "tags": [
+        "serialization",
+        "sse",
+        "unicode"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:src/api.py:_stream_completion",
+      "type": "function",
+      "name": "_stream_completion",
+      "filePath": "src/api.py",
+      "lineRange": [
+        314,
+        373
+      ],
+      "summary": "Async generator emitting role and nonempty text chunks, then actual finish/usage and one DONE frame only after producer success. Checks disconnects and producer failures around off-loop queue reads, handles missing/early sentinels, and emits sanitized error frames after headers without fabricated usage.",
+      "tags": [
+        "sse",
+        "async-generator",
+        "error-handling",
+        "ownership"
+      ],
+      "complexity": "complex"
+    },
+    {
+      "id": "function:src/api.py:chat_completions",
+      "type": "function",
+      "name": "chat_completions",
+      "filePath": "src/api.py",
+      "lineRange": [
+        377,
+        437
+      ],
+      "summary": "POST /v1/chat/completions handler selecting ordinary JSON or SSE over the same admitted producer. Streaming waits for preparation before headers; failures map to safe HTTP errors beforehand, and success metadata uses actual generation results and a server UUID.",
+      "tags": [
+        "api-handler",
+        "chat-completions",
+        "streaming",
+        "request-id"
+      ],
+      "complexity": "complex"
+    },
+    {
+      "id": "function:src/api.py:health",
+      "type": "function",
+      "name": "health",
+      "filePath": "src/api.py",
+      "lineRange": [
+        441,
+        442
+      ],
+      "summary": "GET /health liveness handler returning alive whenever HTTP is being served, independently of inference readiness.",
+      "tags": [
+        "api-handler",
+        "liveness",
+        "health"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:src/api.py:ready",
+      "type": "function",
+      "name": "ready",
+      "filePath": "src/api.py",
+      "lineRange": [
+        446,
+        460
+      ],
+      "summary": "GET /ready reports ready only when initialized, not shutting down, and the admission guard is free; otherwise returns HTTP 503 with the current state. This is a snapshot, not a reserved slot.",
+      "tags": [
+        "api-handler",
+        "readiness",
+        "admission-control"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "class:src/api.py:ChatMessage",
+      "type": "class",
+      "name": "ChatMessage",
+      "filePath": "src/api.py",
+      "lineRange": [
+        33,
+        44
+      ],
+      "summary": "Strict Pydantic chat message allowing system, user, or assistant roles and nonblank string content while preserving valid text and rejecting extra fields.",
+      "tags": [
+        "validation",
+        "pydantic",
+        "message-contract"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:src/api.py:ChatMessage.require_nonblank_content",
+      "type": "function",
+      "name": "ChatMessage.require_nonblank_content",
+      "filePath": "src/api.py",
+      "lineRange": [
+        41,
+        44
+      ],
+      "summary": "Rejects whitespace-only message content while returning valid content unchanged rather than stripping it.",
+      "tags": [
+        "validation",
+        "message-content",
+        "privacy"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "class:src/api.py:ChatCompletionRequest",
+      "type": "class",
+      "name": "ChatCompletionRequest",
+      "filePath": "src/api.py",
+      "lineRange": [
+        47,
+        76
+      ],
+      "summary": "Strict request schema for the fixed Qwen model, nonempty history, 1–512 output tokens, finite sampling controls, and boolean streaming. Rejects extras, unsupported models, and greedy decoding with top_p other than 1.",
+      "tags": [
+        "validation",
+        "pydantic",
+        "request-contract"
+      ],
+      "complexity": "moderate"
+    },
+    {
+      "id": "function:src/api.py:ChatCompletionRequest.require_supported_model",
+      "type": "function",
+      "name": "ChatCompletionRequest.require_supported_model",
+      "filePath": "src/api.py",
+      "lineRange": [
+        64,
+        67
+      ],
+      "summary": "Rejects any model string other than the fixed MODEL_ID; clients cannot select arbitrary downloads.",
+      "tags": [
+        "validation",
+        "model-allowlist",
+        "request-contract"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:src/api.py:ChatCompletionRequest.require_supported_settings",
+      "type": "function",
+      "name": "ChatCompletionRequest.require_supported_settings",
+      "filePath": "src/api.py",
+      "lineRange": [
+        70,
+        76
+      ],
+      "summary": "Rejects temperature zero with non-default top_p using the invalid_parameter_combination code because top-p cannot affect greedy selection.",
+      "tags": [
+        "validation",
+        "sampling",
+        "greedy-decoding"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "class:src/api.py:InferenceUnavailable",
+      "type": "class",
+      "name": "InferenceUnavailable",
+      "filePath": "src/api.py",
+      "lineRange": [
+        79,
+        80
+      ],
+      "summary": "Signals that the application is uninitialized or shutting down; the endpoint maps it to HTTP 503 not_ready.",
+      "tags": [
+        "error",
+        "admission-control",
+        "readiness"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "class:src/api.py:InferenceBusy",
+      "type": "class",
+      "name": "InferenceBusy",
+      "filePath": "src/api.py",
+      "lineRange": [
+        83,
+        84
+      ],
+      "summary": "Signals immediate admission rejection while another producer owns inference; the endpoint maps it to HTTP 429 server_busy.",
+      "tags": [
+        "error",
+        "admission-control",
+        "overload"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "class:src/api.py:_DisconnectedResponse",
+      "type": "class",
+      "name": "_DisconnectedResponse",
+      "filePath": "src/api.py",
+      "lineRange": [
+        270,
+        274
+      ],
+      "summary": "Response subclass whose ASGI call sends nothing because the connection is already known closed before response delivery.",
+      "tags": [
+        "disconnects",
+        "asgi",
+        "response"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:src/api.py:_DisconnectedResponse.__call__",
+      "type": "function",
+      "name": "_DisconnectedResponse.__call__",
+      "filePath": "src/api.py",
+      "lineRange": [
+        273,
+        274
+      ],
+      "summary": "Ends an ASGI invocation without calling send on a connection already known disconnected.",
+      "tags": [
+        "asgi",
+        "disconnects",
+        "response"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "file:src/inference.py",
+      "type": "file",
+      "name": "inference.py",
+      "filePath": "src/inference.py",
+      "summary": "HTTP-independent runtime loading and completion generation for Qwen on CPU float32. Formats full message history, enforces the combined context limit, creates explicit per-call generation settings, and returns completion-only text plus generated IDs and EOS-aware finish metadata without loading weights at import.",
+      "tags": [
+        "inference",
+        "runtime",
+        "context-budget",
+        "generation",
+        "tested"
+      ],
+      "complexity": "moderate"
+    },
+    {
+      "id": "function:src/inference.py:load_runtime",
+      "type": "function",
+      "name": "load_runtime",
+      "filePath": "src/inference.py",
+      "lineRange": [
+        29,
+        64
+      ],
+      "summary": "Explicitly loads Qwen tokenizer and CPU float32 evaluation-mode model, normalizes EOS IDs, and validates padding/EOS availability and a positive declared model context. Returns a runtime capped at min(2048, declared limit) without turning the loader into a singleton.",
+      "tags": [
+        "model-loading",
+        "cpu",
+        "context-budget"
+      ],
+      "complexity": "moderate"
+    },
+    {
+      "id": "function:src/inference.py:generate",
+      "type": "function",
+      "name": "generate",
+      "filePath": "src/inference.py",
+      "lineRange": [
+        80,
+        157
+      ],
+      "summary": "Under thread-local inference_mode, formats and tokenizes full history without truncation, checks the combined budget, and builds fresh explicit cached generation settings. Signals preparation before model.generate, slices off the input prefix, decodes consistently with streaming, and counts EOS as a generated ID with stop taking priority at the cap.",
+      "tags": [
+        "inference",
+        "context-budget",
+        "sampling",
+        "token-accounting"
+      ],
+      "complexity": "complex"
+    },
+    {
+      "id": "class:src/inference.py:Runtime",
+      "type": "class",
+      "name": "Runtime",
+      "filePath": "src/inference.py",
+      "lineRange": [
+        19,
+        23
+      ],
+      "summary": "Caller-owned dataclass grouping the loaded model, tokenizer, normalized EOS IDs, and local context limit; it is shared by the application rather than loaded per request.",
+      "tags": [
+        "dataclass",
+        "runtime",
+        "shared-resources"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "class:src/inference.py:GenerationResult",
+      "type": "class",
+      "name": "GenerationResult",
+      "filePath": "src/inference.py",
+      "lineRange": [
+        68,
+        72
+      ],
+      "summary": "Dataclass carrying completion-only text, formatted prompt count, generated token IDs, and stop/length finish reason for either HTTP delivery mode.",
+      "tags": [
+        "dataclass",
+        "generation-result",
+        "token-accounting"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "class:src/inference.py:ContextLimitError",
+      "type": "class",
+      "name": "ContextLimitError",
+      "filePath": "src/inference.py",
+      "lineRange": [
+        75,
+        76
+      ],
+      "summary": "ValueError subtype raised before generation when the formatted prompt plus requested output exceeds the supported context; its message contains only token counts.",
+      "tags": [
+        "error",
+        "context-budget",
+        "privacy"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "file:tests/test_api.py",
+      "type": "file",
+      "name": "test_api.py",
+      "filePath": "tests/test_api.py",
+      "summary": "Offline unittest coverage of strict requests, lifecycle cleanup, immediate busy rejection, cancellation ownership, sanitized HTTP errors, and ordinary completion failure recovery. Held worker fixtures and HTTPX ASGI calls test real control flow without loading Qwen.",
+      "tags": [
+        "test",
+        "unittest",
+        "http-contract",
+        "ownership"
+      ],
+      "complexity": "complex"
+    },
+    {
+      "id": "function:tests/test_api.py:request_data",
+      "type": "function",
+      "name": "request_data",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        23,
+        28
+      ],
+      "summary": "Builds a minimal valid chat request dictionary with keyword overrides for request-contract tests.",
+      "tags": [
+        "test",
+        "fixture",
+        "request-contract"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "class:tests/test_api.py:RequestValidationTests",
+      "type": "class",
+      "name": "RequestValidationTests",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        31,
+        155
+      ],
+      "summary": "Exercises the request schema through Python objects and JSON, covering strict types, numeric bounds, roles, history preservation, forbidden extras, and incompatible decoding settings.",
+      "tags": [
+        "test",
+        "unittest",
+        "behavioral-regression"
+      ],
+      "complexity": "complex"
+    },
+    {
+      "id": "function:tests/test_api.py:RequestValidationTests.assert_rejected",
+      "type": "function",
+      "name": "RequestValidationTests.assert_rejected",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        32,
+        46
+      ],
+      "summary": "Runs both Python and JSON schema validation, asserts rejection, and optionally checks a specific Pydantic error code.",
+      "tags": [
+        "test",
+        "fixture",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_api.py:RequestValidationTests.test_valid_history_preserves_text_and_allows_consecutive_roles",
+      "type": "function",
+      "name": "RequestValidationTests.test_valid_history_preserves_text_and_allows_consecutive_roles",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        48,
+        60
+      ],
+      "summary": "Proves multilingual whitespace-preserving history and consecutive user roles survive request validation unchanged.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_api.py:RequestValidationTests.test_valid_numeric_boundaries_and_integer_sampling_values",
+      "type": "function",
+      "name": "RequestValidationTests.test_valid_numeric_boundaries_and_integer_sampling_values",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        62,
+        74
+      ],
+      "summary": "Accepts output-token and sampling boundaries, including ordinary JSON integers for temperature and top_p.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_api.py:RequestValidationTests.test_required_fields_and_model_identity",
+      "type": "function",
+      "name": "RequestValidationTests.test_required_fields_and_model_identity",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        76,
+        82
+      ],
+      "summary": "Rejects missing model/messages and wrong or nonstring model identifiers.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_api.py:RequestValidationTests.test_invalid_messages_and_content",
+      "type": "function",
+      "name": "RequestValidationTests.test_invalid_messages_and_content",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        84,
+        98
+      ],
+      "summary": "Rejects empty or malformed history, unsupported roles, missing content, blanks, and nontext content.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_api.py:RequestValidationTests.test_unknown_request_and_message_fields",
+      "type": "function",
+      "name": "RequestValidationTests.test_unknown_request_and_message_fields",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        100,
+        115
+      ],
+      "summary": "Rejects extra request/message fields, including tools, n, top_k, stop, seed, and stream_options.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "moderate"
+    },
+    {
+      "id": "function:tests/test_api.py:RequestValidationTests.test_numeric_types_do_not_coerce_strings_or_booleans",
+      "type": "function",
+      "name": "RequestValidationTests.test_numeric_types_do_not_coerce_strings_or_booleans",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        117,
+        122
+      ],
+      "summary": "Proves numeric strings, booleans, nulls, and a floating max_tokens are not silently coerced.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_api.py:RequestValidationTests.test_numeric_ranges",
+      "type": "function",
+      "name": "RequestValidationTests.test_numeric_ranges",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        124,
+        132
+      ],
+      "summary": "Rejects token caps and sampling values outside their supported ranges.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_api.py:RequestValidationTests.test_nonfinite_numbers",
+      "type": "function",
+      "name": "RequestValidationTests.test_nonfinite_numbers",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        134,
+        138
+      ],
+      "summary": "Rejects NaN and positive/negative infinity in every numeric request field.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_api.py:RequestValidationTests.test_stream_requires_boolean",
+      "type": "function",
+      "name": "RequestValidationTests.test_stream_requires_boolean",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        140,
+        143
+      ],
+      "summary": "Rejects string, numeric, and null values for the stream flag.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_api.py:RequestValidationTests.test_greedy_top_p_combination_including_default_temperature",
+      "type": "function",
+      "name": "RequestValidationTests.test_greedy_top_p_combination_including_default_temperature",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        145,
+        149
+      ],
+      "summary": "Requires invalid_parameter_combination for non-default top_p with explicit or default greedy temperature.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_api.py:RequestValidationTests.test_malformed_json_and_nonobject_body",
+      "type": "function",
+      "name": "RequestValidationTests.test_malformed_json_and_nonobject_body",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        151,
+        155
+      ],
+      "summary": "Rejects incomplete JSON and valid JSON values that are not request objects.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "class:tests/test_api.py:LifecycleTests",
+      "type": "class",
+      "name": "LifecycleTests",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        158,
+        297
+      ],
+      "summary": "Exercises one-time runtime loading, startup failure cleanup, health/readiness transitions, and shutdown waiting for held worker completion without blocking the loop.",
+      "tags": [
+        "test",
+        "unittest",
+        "behavioral-regression"
+      ],
+      "complexity": "complex"
+    },
+    {
+      "id": "function:tests/test_api.py:LifecycleTests.asyncSetUp",
+      "type": "function",
+      "name": "LifecycleTests.asyncSetUp",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        159,
+        168
+      ],
+      "summary": "Patches runtime loading and creates an HTTPX ASGI client with cleanup, leaving each lifecycle test to enter startup explicitly.",
+      "tags": [
+        "test",
+        "fixture",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_api.py:LifecycleTests.test_startup_reuses_runtime_and_shutdown_releases_resources",
+      "type": "function",
+      "name": "LifecycleTests.test_startup_reuses_runtime_and_shutdown_releases_resources",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        170,
+        188
+      ],
+      "summary": "Proves repeated probes reuse one runtime load and shutdown clears state and closes the executor.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "moderate"
+    },
+    {
+      "id": "function:tests/test_api.py:LifecycleTests.test_loading_failure_prevents_serving",
+      "type": "function",
+      "name": "LifecycleTests.test_loading_failure_prevents_serving",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        190,
+        200
+      ],
+      "summary": "Proves a model-loading exception aborts startup and leaves readiness unavailable with no runtime or executor.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_api.py:LifecycleTests.test_executor_creation_failure_releases_loaded_runtime",
+      "type": "function",
+      "name": "LifecycleTests.test_executor_creation_failure_releases_loaded_runtime",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        202,
+        209
+      ],
+      "summary": "Proves partial startup clears a loaded runtime if worker creation fails.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_api.py:LifecycleTests.test_health_remains_available_when_inference_slot_is_busy",
+      "type": "function",
+      "name": "LifecycleTests.test_health_remains_available_when_inference_slot_is_busy",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        211,
+        224
+      ],
+      "summary": "Holds admission to verify health 200, readiness 503 busy, and readiness recovery after release.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_api.py:LifecycleTests.test_uninitialized_application_does_not_claim_readiness",
+      "type": "function",
+      "name": "LifecycleTests.test_uninitialized_application_does_not_claim_readiness",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        226,
+        233
+      ],
+      "summary": "Verifies uninitialized state reports HTTP 503 not_ready rather than healthy inference.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_api.py:LifecycleTests.test_shutdown_waits_for_worker_without_blocking_http_loop",
+      "type": "function",
+      "name": "LifecycleTests.test_shutdown_waits_for_worker_without_blocking_http_loop",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        235,
+        297
+      ],
+      "summary": "Holds a submitted producer during shutdown to prove runtime retention, responsive probes, new-admission rejection, and cleanup after release; a safety timer prevents test deadlock.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "complex"
+    },
+    {
+      "id": "class:tests/test_api.py:AdmissionTests",
+      "type": "class",
+      "name": "AdmissionTests",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        300,
+        444
+      ],
+      "summary": "Exercises internal single-producer admission, off-loop execution, shielded consumer cancellation, failed submission cleanup, and abandoned-error observation.",
+      "tags": [
+        "test",
+        "unittest",
+        "behavioral-regression"
+      ],
+      "complexity": "complex"
+    },
+    {
+      "id": "function:tests/test_api.py:AdmissionTests.asyncSetUp",
+      "type": "function",
+      "name": "AdmissionTests.asyncSetUp",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        301,
+        313
+      ],
+      "summary": "Starts a patched runtime lifespan and ASGI client and prepares a validated request plus deterministic generation result.",
+      "tags": [
+        "test",
+        "fixture",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_api.py:AdmissionTests.test_unavailable_state_rejects_before_submitting_work",
+      "type": "function",
+      "name": "AdmissionTests.test_unavailable_state_rejects_before_submitting_work",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        315,
+        325
+      ],
+      "summary": "Verifies uninitialized/shutdown admission raises without taking the guard or retaining a producer.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_api.py:AdmissionTests.test_busy_rejection_and_consumer_cancellation_keep_worker_owned",
+      "type": "function",
+      "name": "AdmissionTests.test_busy_rejection_and_consumer_cancellation_keep_worker_owned",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        327,
+        380
+      ],
+      "summary": "Holds off-loop generation, cancels its consumer, and proves immediate busy rejection persists until the retained producer actually finishes.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "complex"
+    },
+    {
+      "id": "function:tests/test_api.py:AdmissionTests.test_context_and_generation_failures_release_slot_for_recovery",
+      "type": "function",
+      "name": "AdmissionTests.test_context_and_generation_failures_release_slot_for_recovery",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        382,
+        391
+      ],
+      "summary": "Verifies context and unexpected producer errors both release admission and allow a later successful call.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_api.py:AdmissionTests.test_submission_failure_releases_slot_for_recovery",
+      "type": "function",
+      "name": "AdmissionTests.test_submission_failure_releases_slot_for_recovery",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        393,
+        401
+      ],
+      "summary": "Forces executor submission failure and verifies guard cleanup and successful subsequent admission.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_api.py:AdmissionTests.test_abandoned_failure_is_observed_and_does_not_leak_busy_slot",
+      "type": "function",
+      "name": "AdmissionTests.test_abandoned_failure_is_observed_and_does_not_leak_busy_slot",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        403,
+        444
+      ],
+      "summary": "Abandons a shielded result before a held producer fails, then verifies no loop-level unhandled-future error, no leaked guard, and recovery.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "moderate"
+    },
+    {
+      "id": "class:tests/test_api.py:CompletionEndpointTests",
+      "type": "class",
+      "name": "CompletionEndpointTests",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        447,
+        601
+      ],
+      "summary": "Exercises ordinary HTTP validation privacy, request IDs, unavailable/busy errors, failure recovery, canceled-handler ownership, and normal 404/405 routing.",
+      "tags": [
+        "test",
+        "unittest",
+        "behavioral-regression"
+      ],
+      "complexity": "complex"
+    },
+    {
+      "id": "function:tests/test_api.py:CompletionEndpointTests.asyncSetUp",
+      "type": "function",
+      "name": "CompletionEndpointTests.asyncSetUp",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        448,
+        460
+      ],
+      "summary": "Starts a patched application lifespan and HTTPX client with a fixed completion endpoint and EOS-ended result fixture.",
+      "tags": [
+        "test",
+        "fixture",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_api.py:CompletionEndpointTests.assert_error",
+      "type": "function",
+      "name": "CompletionEndpointTests.assert_error",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        462,
+        468
+      ],
+      "summary": "Checks HTTP status and error code plus a valid server UUID matching the X-Request-ID header and error envelope.",
+      "tags": [
+        "test",
+        "fixture",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_api.py:CompletionEndpointTests.test_validation_errors_are_private_and_precede_busy_admission",
+      "type": "function",
+      "name": "CompletionEndpointTests.test_validation_errors_are_private_and_precede_busy_admission",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        470,
+        506
+      ],
+      "summary": "Sends malformed and private-marker inputs while admission is held, proving safe 422 responses precede busy checks and do not trust incoming request IDs.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "moderate"
+    },
+    {
+      "id": "function:tests/test_api.py:CompletionEndpointTests.test_unavailable_application_returns_503",
+      "type": "function",
+      "name": "CompletionEndpointTests.test_unavailable_application_returns_503",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        508,
+        517
+      ],
+      "summary": "Verifies uninitialized or shutting-down HTTP requests return not_ready without taking admission.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_api.py:CompletionEndpointTests.test_preparation_and_generation_errors_allow_later_success",
+      "type": "function",
+      "name": "CompletionEndpointTests.test_preparation_and_generation_errors_allow_later_success",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        519,
+        544
+      ],
+      "summary": "Injects context and private unexpected failures, verifies safe HTTP error mapping and released ownership, then confirms a later request succeeds.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "moderate"
+    },
+    {
+      "id": "function:tests/test_api.py:CompletionEndpointTests.test_submission_failure_returns_safe_500_and_releases_slot",
+      "type": "function",
+      "name": "CompletionEndpointTests.test_submission_failure_returns_safe_500_and_releases_slot",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        546,
+        554
+      ],
+      "summary": "Forces executor failure to prove sanitized HTTP 500, guard release, and subsequent request recovery.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_api.py:CompletionEndpointTests.test_busy_and_canceled_http_handler_retain_producer_ownership",
+      "type": "function",
+      "name": "CompletionEndpointTests.test_busy_and_canceled_http_handler_retain_producer_ownership",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        556,
+        592
+      ],
+      "summary": "Cancels an HTTP handler while its worker is held and proves health responsiveness and HTTP 429 overlap until actual producer completion.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "moderate"
+    },
+    {
+      "id": "function:tests/test_api.py:CompletionEndpointTests.test_unknown_routes_and_wrong_methods_keep_normal_routing",
+      "type": "function",
+      "name": "CompletionEndpointTests.test_unknown_routes_and_wrong_methods_keep_normal_routing",
+      "filePath": "tests/test_api.py",
+      "lineRange": [
+        594,
+        601
+      ],
+      "summary": "Verifies missing routes and wrong methods retain standard 404/405 responses and the POST Allow header.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "file:tests/test_inference.py",
+      "type": "file",
+      "name": "test_inference.py",
+      "filePath": "tests/test_inference.py",
+      "summary": "Offline context-budget and startup-limit regressions using an in-memory tokenizer, tiny GPT-2 model, and mocked pretrained loading. Covers full template/history counts, exact fits, pre-generation rejection, preparation ordering, and invalid declared model limits.",
+      "tags": [
+        "test",
+        "unittest",
+        "context-budget",
+        "offline-model"
+      ],
+      "complexity": "moderate"
+    },
+    {
+      "id": "class:tests/test_inference.py:ContextBudgetTests",
+      "type": "class",
+      "name": "ContextBudgetTests",
+      "filePath": "tests/test_inference.py",
+      "lineRange": [
+        14,
+        134
+      ],
+      "summary": "Uses an offline tiny GPT-2 runtime and chat tokenizer to prove exact-fit generation, full-history counting, rejection before preparation, and valid preparation ordering.",
+      "tags": [
+        "test",
+        "unittest",
+        "behavioral-regression"
+      ],
+      "complexity": "complex"
+    },
+    {
+      "id": "function:tests/test_inference.py:ContextBudgetTests.setUp",
+      "type": "function",
+      "name": "ContextBudgetTests.setUp",
+      "filePath": "tests/test_inference.py",
+      "lineRange": [
+        15,
+        74
+      ],
+      "summary": "Builds an in-memory WordLevel chat tokenizer and seeded tiny GPT-2 with EOS disabled; a 15-token formatted four-turn prompt plus four outputs exactly fills a 19-token limit.",
+      "tags": [
+        "test",
+        "fixture",
+        "unittest"
+      ],
+      "complexity": "complex"
+    },
+    {
+      "id": "function:tests/test_inference.py:ContextBudgetTests.run_generation",
+      "type": "function",
+      "name": "ContextBudgetTests.run_generation",
+      "filePath": "tests/test_inference.py",
+      "lineRange": [
+        76,
+        84
+      ],
+      "summary": "Invokes the real reusable generate function with the offline runtime and explicit greedy settings, allowing per-test history, cap, and callback overrides.",
+      "tags": [
+        "test",
+        "fixture",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_inference.py:ContextBudgetTests.test_exact_fit_keeps_full_history_and_requested_output_budget",
+      "type": "function",
+      "name": "ContextBudgetTests.test_exact_fit_keeps_full_history_and_requested_output_budget",
+      "filePath": "tests/test_inference.py",
+      "lineRange": [
+        86,
+        91
+      ],
+      "summary": "Proves the exact-fit request retains all 15 prompt tokens, generates all four allowed output IDs, and reports length.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_inference.py:ContextBudgetTests.test_one_token_over_rejects_before_preparation_and_generation",
+      "type": "function",
+      "name": "ContextBudgetTests.test_one_token_over_rejects_before_preparation_and_generation",
+      "filePath": "tests/test_inference.py",
+      "lineRange": [
+        93,
+        104
+      ],
+      "summary": "Exceeds the budget by one token and verifies neither preparation nor model.generate runs and only counts, not private input, appear in the error.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_inference.py:ContextBudgetTests.test_oversized_prompt_is_not_silently_truncated",
+      "type": "function",
+      "name": "ContextBudgetTests.test_oversized_prompt_is_not_silently_truncated",
+      "filePath": "tests/test_inference.py",
+      "lineRange": [
+        106,
+        114
+      ],
+      "summary": "Sends a prompt larger than context and verifies rejection instead of truncation, preparation, or model generation.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_inference.py:ContextBudgetTests.test_earlier_turns_cannot_be_discarded_to_fit",
+      "type": "function",
+      "name": "ContextBudgetTests.test_earlier_turns_cannot_be_discarded_to_fit",
+      "filePath": "tests/test_inference.py",
+      "lineRange": [
+        116,
+        122
+      ],
+      "summary": "Shows a latest-turn-only request fits but the full conversation fails, proving earlier history is not silently dropped.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_inference.py:ContextBudgetTests.test_preparation_precedes_model_execution_for_valid_request",
+      "type": "function",
+      "name": "ContextBudgetTests.test_preparation_precedes_model_execution_for_valid_request",
+      "filePath": "tests/test_inference.py",
+      "lineRange": [
+        124,
+        134
+      ],
+      "summary": "Uses a model forward hook to prove the preparation callback fires exactly once before the first forward pass.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "class:tests/test_inference.py:RuntimeContextLimitTests",
+      "type": "class",
+      "name": "RuntimeContextLimitTests",
+      "filePath": "tests/test_inference.py",
+      "lineRange": [
+        137,
+        171
+      ],
+      "summary": "Mocks pretrained loading to prove local context caps respect smaller declared limits and reject absent or invalid limits at startup.",
+      "tags": [
+        "test",
+        "unittest",
+        "behavioral-regression"
+      ],
+      "complexity": "moderate"
+    },
+    {
+      "id": "function:tests/test_inference.py:RuntimeContextLimitTests.load_with_config",
+      "type": "function",
+      "name": "RuntimeContextLimitTests.load_with_config",
+      "filePath": "tests/test_inference.py",
+      "lineRange": [
+        138,
+        152
+      ],
+      "summary": "Patches pretrained model/tokenizer loading with a supplied model config so startup context validation runs without downloading weights.",
+      "tags": [
+        "test",
+        "fixture",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_inference.py:RuntimeContextLimitTests.test_supported_context_respects_smaller_model_and_local_cap",
+      "type": "function",
+      "name": "RuntimeContextLimitTests.test_supported_context_respects_smaller_model_and_local_cap",
+      "filePath": "tests/test_inference.py",
+      "lineRange": [
+        154,
+        160
+      ],
+      "summary": "Verifies declared limits 1024 and 32768 produce effective limits 1024 and 2048 respectively.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_inference.py:RuntimeContextLimitTests.test_absent_or_invalid_declared_context_fails_loading",
+      "type": "function",
+      "name": "RuntimeContextLimitTests.test_absent_or_invalid_declared_context_fails_loading",
+      "filePath": "tests/test_inference.py",
+      "lineRange": [
+        162,
+        171
+      ],
+      "summary": "Rejects missing, null, boolean, nonpositive, floating, and string model context declarations during runtime loading.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "file:tests/test_streaming.py",
+      "type": "file",
+      "name": "test_streaming.py",
+      "filePath": "tests/test_streaming.py",
+      "summary": "Direct ASGI frame tests for progressive SSE, truthful terminal usage, queue timeouts, pre/post-header failures, and disconnect ownership under ASGI 2.3/2.4. Controlled producers exercise streaming state transitions without claiming real-Qwen integration or performance.",
+      "tags": [
+        "test",
+        "unittest",
+        "sse",
+        "disconnects"
+      ],
+      "complexity": "complex"
+    },
+    {
+      "id": "function:tests/test_streaming.py:payload",
+      "type": "function",
+      "name": "payload",
+      "filePath": "tests/test_streaming.py",
+      "lineRange": [
+        14,
+        19
+      ],
+      "summary": "Builds a minimal valid chat request dictionary with a selectable stream flag for ASGI streaming tests.",
+      "tags": [
+        "test",
+        "fixture",
+        "request-contract"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "class:tests/test_streaming.py:Connection",
+      "type": "class",
+      "name": "Connection",
+      "filePath": "tests/test_streaming.py",
+      "lineRange": [
+        22,
+        62
+      ],
+      "summary": "Direct ASGI harness exposing response frames immediately, recording headers/content signals, and injecting disconnect messages without HTTPX stream buffering.",
+      "tags": [
+        "test",
+        "unittest",
+        "behavioral-regression"
+      ],
+      "complexity": "moderate"
+    },
+    {
+      "id": "function:tests/test_streaming.py:Connection.__init__",
+      "type": "function",
+      "name": "Connection.__init__",
+      "filePath": "tests/test_streaming.py",
+      "lineRange": [
+        25,
+        41
+      ],
+      "summary": "Builds an ASGI chat POST scope and incoming body, initializes delivery signals, and starts the real app using selectable streaming and ASGI specification versions.",
+      "tags": [
+        "test",
+        "fixture",
+        "unittest"
+      ],
+      "complexity": "moderate"
+    },
+    {
+      "id": "function:tests/test_streaming.py:Connection.send",
+      "type": "function",
+      "name": "Connection.send",
+      "filePath": "tests/test_streaming.py",
+      "lineRange": [
+        43,
+        50
+      ],
+      "summary": "Records ASGI output and signals response headers or nonempty SSE content immediately for deterministic progress assertions.",
+      "tags": [
+        "test",
+        "fixture",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_streaming.py:Connection.disconnect",
+      "type": "function",
+      "name": "Connection.disconnect",
+      "filePath": "tests/test_streaming.py",
+      "lineRange": [
+        52,
+        53
+      ],
+      "summary": "Injects an http.disconnect message into the ASGI receive queue.",
+      "tags": [
+        "test",
+        "fixture",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_streaming.py:Connection.body",
+      "type": "function",
+      "name": "Connection.body",
+      "filePath": "tests/test_streaming.py",
+      "lineRange": [
+        55,
+        56
+      ],
+      "summary": "Concatenates captured HTTP body fragments without waiting for HTTPX buffering.",
+      "tags": [
+        "test",
+        "fixture",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_streaming.py:Connection.events",
+      "type": "function",
+      "name": "Connection.events",
+      "filePath": "tests/test_streaming.py",
+      "lineRange": [
+        58,
+        62
+      ],
+      "summary": "Splits captured SSE frames and decodes JSON payloads while preserving the DONE marker as a string.",
+      "tags": [
+        "test",
+        "fixture",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "class:tests/test_streaming.py:StreamingTests",
+      "type": "class",
+      "name": "StreamingTests",
+      "filePath": "tests/test_streaming.py",
+      "lineRange": [
+        65,
+        283
+      ],
+      "summary": "Exercises progressive SSE and ownership through held/failing producers, queue timeouts, sentinel races, pre-header errors, and both supported ASGI disconnect mechanisms.",
+      "tags": [
+        "test",
+        "unittest",
+        "behavioral-regression"
+      ],
+      "complexity": "complex"
+    },
+    {
+      "id": "function:tests/test_streaming.py:StreamingTests.asyncSetUp",
+      "type": "function",
+      "name": "StreamingTests.asyncSetUp",
+      "filePath": "tests/test_streaming.py",
+      "lineRange": [
+        66,
+        79
+      ],
+      "summary": "Starts the app with a mocked tokenizer runtime and HTTPX client, preparing multilingual text and an EOS-inclusive generation result.",
+      "tags": [
+        "test",
+        "fixture",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_streaming.py:StreamingTests.test_incremental_content_and_truthful_terminal_usage",
+      "type": "function",
+      "name": "StreamingTests.test_incremental_content_and_truthful_terminal_usage",
+      "filePath": "tests/test_streaming.py",
+      "lineRange": [
+        81,
+        130
+      ],
+      "summary": "Holds generation after first content and verifies early delivery, busy rejection, Unicode text assembly, stable metadata, actual ID-based usage, and exactly one DONE.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "complex"
+    },
+    {
+      "id": "function:tests/test_streaming.py:StreamingTests.test_queue_timeout_is_not_a_generation_failure",
+      "type": "function",
+      "name": "StreamingTests.test_queue_timeout_is_not_a_generation_failure",
+      "filePath": "tests/test_streaming.py",
+      "lineRange": [
+        132,
+        153
+      ],
+      "summary": "Waits through multiple empty streamer polls while a producer is held, proving no false failure and responsive health before normal completion.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "moderate"
+    },
+    {
+      "id": "function:tests/test_streaming.py:StreamingTests.test_preparation_failure_is_json_before_headers_and_recovers",
+      "type": "function",
+      "name": "StreamingTests.test_preparation_failure_is_json_before_headers_and_recovers",
+      "filePath": "tests/test_streaming.py",
+      "lineRange": [
+        155,
+        171
+      ],
+      "summary": "Injects context/unexpected preparation failures to verify ordinary 400/500 JSON before SSE, privacy, released admission, and later success.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "moderate"
+    },
+    {
+      "id": "function:tests/test_streaming.py:StreamingTests.test_stream_submission_failure_does_not_leave_a_preparation_waiter",
+      "type": "function",
+      "name": "StreamingTests.test_stream_submission_failure_does_not_leave_a_preparation_waiter",
+      "filePath": "tests/test_streaming.py",
+      "lineRange": [
+        173,
+        180
+      ],
+      "summary": "Forces executor submission failure and proves streaming returns a safe 500 promptly without leaving the preparation wait unresolved.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "function:tests/test_streaming.py:StreamingTests.test_failure_with_or_without_sentinel_has_no_success_terminal",
+      "type": "function",
+      "name": "StreamingTests.test_failure_with_or_without_sentinel_has_no_success_terminal",
+      "filePath": "tests/test_streaming.py",
+      "lineRange": [
+        182,
+        217
+      ],
+      "summary": "Fails a producer after partial content with and without an early sentinel; verifies error plus one DONE, no successful finish/usage, no privacy leak, and recovery.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "moderate"
+    },
+    {
+      "id": "function:tests/test_streaming.py:StreamingTests.test_disconnect_before_preparation_or_ordinary_result_sends_nothing",
+      "type": "function",
+      "name": "StreamingTests.test_disconnect_before_preparation_or_ordinary_result_sends_nothing",
+      "filePath": "tests/test_streaming.py",
+      "lineRange": [
+        219,
+        249
+      ],
+      "summary": "Disconnects during held preparation or ordinary generation, proving delivery ends without output while the producer retains admission until its observed failure.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "moderate"
+    },
+    {
+      "id": "function:tests/test_streaming.py:StreamingTests.test_disconnect_after_content_keeps_ownership_for_both_asgi_versions",
+      "type": "function",
+      "name": "StreamingTests.test_disconnect_after_content_keeps_ownership_for_both_asgi_versions",
+      "filePath": "tests/test_streaming.py",
+      "lineRange": [
+        251,
+        283
+      ],
+      "summary": "Disconnects after first SSE content under ASGI 2.3 and 2.4, proving no DONE promise, retained busy ownership, and readiness only after producer completion.",
+      "tags": [
+        "test",
+        "regression",
+        "unittest"
+      ],
+      "complexity": "moderate"
+    },
+    {
+      "id": "document:README.md",
+      "type": "document",
+      "name": "README.md",
+      "filePath": "README.md",
+      "summary": "Run guide for the CPU Qwen service, its strict chat-completions subset, SSE protocol, ownership guarantees, tests, and four learning scripts. Also documents the separate Understand Anything graph/viewer workflow with automatic updates disabled.",
+      "tags": [
+        "documentation",
+        "entry-point",
+        "api-contract",
+        "learning"
+      ],
+      "complexity": "complex"
+    },
+    {
+      "id": "document:plan.md",
+      "type": "document",
+      "name": "plan.md",
+      "filePath": "plan.md",
+      "summary": "Ten-stage learning roadmap from tokenization to serving, benchmarking, scheduling, batching, quantization, routing, and deployment. It mixes verified Stage 2 checkpoint notes with future assignments and stale earlier stopping points; consult the latest practice log and actual source for current implementation.",
+      "tags": [
+        "documentation",
+        "roadmap",
+        "acceptance-criteria",
+        "future-work"
+      ],
+      "complexity": "complex"
+    },
+    {
+      "id": "document:requirements.txt",
+      "type": "document",
+      "name": "requirements.txt",
+      "filePath": "requirements.txt",
+      "summary": "Python dependency list for torch, transformers, Pydantic 2, FastAPI, Uvicorn, and HTTPX tests. Only Pydantic has a version range; this is not a reproducible dependency lockfile or a dependency of the separate graph viewer.",
+      "tags": [
+        "dependencies",
+        "python",
+        "environment"
+      ],
+      "complexity": "simple"
+    },
+    {
+      "id": "document:logs/practice.md",
+      "type": "document",
+      "name": "practice.md",
+      "filePath": "logs/practice.md",
+      "summary": "Chronological experiment evidence for logits, cached/uncached generation, KV storage, greedy parity, CPU/MPS observations, and real-Qwen HTTP/SSE smoke runs. The latest handoff records Stage 2 checkpoints 1–10 and identifies private lifecycle logging as next, not implemented; timings are single-run observations, not statistical benchmarks.",
+      "tags": [
+        "documentation",
+        "experiment-evidence",
+        "learning-handoff",
+        "limitations"
+      ],
+      "complexity": "complex"
+    },
+    {
+      "id": "file:src/architecture.py",
+      "type": "file",
+      "name": "architecture.py",
+      "filePath": "src/architecture.py",
+      "summary": "Executable Qwen inspection script tracing embeddings through first-layer normalization and Q/K/V projections. It prints pre-head-reshape tensor shapes, not full attention scores or a KV cache, and loads weights when executed or imported.",
+      "tags": [
+        "learning",
+        "embeddings",
+        "attention-projections",
+        "tensor-shapes"
+      ],
+      "complexity": "moderate"
+    },
+    {
+      "id": "file:src/cached_generation.py",
+      "type": "file",
+      "name": "cached_generation.py",
+      "filePath": "src/cached_generation.py",
+      "summary": "Manual greedy prefill/decode loop reusing past_key_values, inspecting logical KV tensor bytes and timing prompt versus subsequent generation. The saved device is CPU float32, optional MPS timing is synchronized, and a matching cached library generate call asserts token-ID parity.",
+      "tags": [
+        "learning",
+        "kv-cache",
+        "prefill-decode",
+        "parity-check"
+      ],
+      "complexity": "moderate"
+    },
+    {
+      "id": "file:src/main.py",
+      "type": "file",
+      "name": "main.py",
+      "filePath": "src/main.py",
+      "summary": "Executable learning script inspecting raw/chat tokenization, embeddings, model dimensions, next-position logits, softmax, and top-five candidates before selecting two uncached greedy tokens. It loads weights at module execution and is not the FastAPI entry point.",
+      "tags": [
+        "entry-point",
+        "tokenization",
+        "logits",
+        "greedy-decoding"
+      ],
+      "complexity": "moderate"
+    },
+    {
+      "id": "file:src/uncached_generation.py",
+      "type": "file",
+      "name": "uncached_generation.py",
+      "filePath": "src/uncached_generation.py",
+      "summary": "Manual full-prefix generation with greedy or temperature-0.7 multinomial sampling, EOS/cap stopping, warm-up, and separate prompt/subsequent timings. The appended library comparison always uses greedy decoding, so its equality assertion is meaningful for menu option 1, not guaranteed for sampling option 2.",
+      "tags": [
+        "learning",
+        "uncached-decoding",
+        "sampling",
+        "parity-check"
+      ],
+      "complexity": "moderate"
+    }
+  ],
+  "edges": [
+    {
+      "source": "file:src/api.py",
+      "target": "file:src/inference.py",
+      "type": "imports",
+      "direction": "forward",
+      "weight": 0.7
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:submit_inference",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:_run_inference",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:_resolve_preparation",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:_observe_completion",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:lifespan",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:_error_payload",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:_usage",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:_error_response",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:http_error",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:invalid_request",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:_is_disconnected",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:_await_connected",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:_next_text",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:_sse",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:_stream_completion",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:chat_completions",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:health",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:ready",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "class:src/api.py:ChatMessage",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:ChatMessage.require_nonblank_content",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:src/api.py:ChatMessage",
+      "target": "function:src/api.py:ChatMessage.require_nonblank_content",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "class:src/api.py:ChatCompletionRequest",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:ChatCompletionRequest.require_supported_model",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:src/api.py:ChatCompletionRequest",
+      "target": "function:src/api.py:ChatCompletionRequest.require_supported_model",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:ChatCompletionRequest.require_supported_settings",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:src/api.py:ChatCompletionRequest",
+      "target": "function:src/api.py:ChatCompletionRequest.require_supported_settings",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "class:src/api.py:InferenceUnavailable",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "class:src/api.py:InferenceBusy",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "class:src/api.py:_DisconnectedResponse",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:_DisconnectedResponse.__call__",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:src/api.py:_DisconnectedResponse",
+      "target": "function:src/api.py:_DisconnectedResponse.__call__",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "class:src/api.py:ChatMessage",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "class:src/api.py:ChatCompletionRequest",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "class:src/api.py:InferenceUnavailable",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "class:src/api.py:InferenceBusy",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:submit_inference",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:_run_inference",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:_resolve_preparation",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:_observe_completion",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:lifespan",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:_error_payload",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:_usage",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:_error_response",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:http_error",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:invalid_request",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "class:src/api.py:_DisconnectedResponse",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:_is_disconnected",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:_await_connected",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:_next_text",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:_sse",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:_stream_completion",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:chat_completions",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:health",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "function:src/api.py:ready",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/inference.py",
+      "target": "function:src/inference.py:load_runtime",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:src/inference.py",
+      "target": "function:src/inference.py:generate",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:src/inference.py",
+      "target": "class:src/inference.py:Runtime",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:src/inference.py",
+      "target": "class:src/inference.py:GenerationResult",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:src/inference.py",
+      "target": "class:src/inference.py:ContextLimitError",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:src/inference.py",
+      "target": "class:src/inference.py:Runtime",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/inference.py",
+      "target": "function:src/inference.py:load_runtime",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/inference.py",
+      "target": "class:src/inference.py:GenerationResult",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/inference.py",
+      "target": "class:src/inference.py:ContextLimitError",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:src/inference.py",
+      "target": "function:src/inference.py:generate",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:src/api.py:submit_inference",
+      "target": "class:src/api.py:InferenceUnavailable",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:src/api.py:submit_inference",
+      "target": "class:src/api.py:InferenceBusy",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:src/api.py:submit_inference",
+      "target": "function:src/api.py:_observe_completion",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:src/api.py:submit_inference",
+      "target": "function:src/api.py:_resolve_preparation",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:src/api.py:_run_inference",
+      "target": "function:src/inference.py:generate",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:src/api.py:lifespan",
+      "target": "function:src/inference.py:load_runtime",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:src/api.py:_error_response",
+      "target": "function:src/api.py:_error_payload",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:src/api.py:http_error",
+      "target": "function:src/api.py:_error_response",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:src/api.py:invalid_request",
+      "target": "function:src/api.py:_error_response",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:src/api.py:_await_connected",
+      "target": "function:src/api.py:_is_disconnected",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:src/api.py:_stream_completion",
+      "target": "function:src/api.py:_is_disconnected",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:src/api.py:_stream_completion",
+      "target": "function:src/api.py:_await_connected",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:src/api.py:_stream_completion",
+      "target": "function:src/api.py:_usage",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:src/api.py:_stream_completion",
+      "target": "function:src/api.py:_sse",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:src/api.py:_stream_completion",
+      "target": "function:src/api.py:_error_payload",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:src/api.py:chat_completions",
+      "target": "class:src/api.py:InferenceUnavailable",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:src/api.py:chat_completions",
+      "target": "function:src/api.py:submit_inference",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:src/api.py:chat_completions",
+      "target": "function:src/api.py:_await_connected",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:src/api.py:chat_completions",
+      "target": "function:src/api.py:_stream_completion",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:src/api.py:chat_completions",
+      "target": "class:src/api.py:_DisconnectedResponse",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:src/api.py:chat_completions",
+      "target": "function:src/api.py:_error_response",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:src/api.py:chat_completions",
+      "target": "function:src/api.py:_usage",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:src/inference.py:load_runtime",
+      "target": "class:src/inference.py:Runtime",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:src/inference.py:generate",
+      "target": "class:src/inference.py:ContextLimitError",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:src/inference.py:generate",
+      "target": "class:src/inference.py:GenerationResult",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:src/api.py:submit_inference",
+      "target": "function:src/api.py:_run_inference",
+      "type": "depends_on",
+      "direction": "forward",
+      "weight": 0.6,
+      "description": "Schedules this callable on the dedicated executor."
+    },
+    {
+      "source": "function:src/api.py:submit_inference",
+      "target": "function:src/api.py:_observe_completion",
+      "type": "depends_on",
+      "direction": "forward",
+      "weight": 0.6,
+      "description": "Registers completion callbacks on producer and shielded futures."
+    },
+    {
+      "source": "function:src/api.py:_run_inference",
+      "target": "function:src/api.py:_resolve_preparation",
+      "type": "depends_on",
+      "direction": "forward",
+      "weight": 0.6,
+      "description": "Schedules preparation signaling thread-safely on the event loop."
+    },
+    {
+      "source": "function:src/api.py:_stream_completion",
+      "target": "function:src/api.py:_next_text",
+      "type": "depends_on",
+      "direction": "forward",
+      "weight": 0.6,
+      "description": "Dispatches blocking streamer iteration through asyncio.to_thread."
+    },
+    {
+      "source": "function:src/api.py:chat_completions",
+      "target": "class:src/api.py:ChatCompletionRequest",
+      "type": "depends_on",
+      "direction": "forward",
+      "weight": 0.6,
+      "description": "FastAPI validates this body model before entering the route."
+    },
+    {
+      "source": "class:src/api.py:ChatCompletionRequest",
+      "target": "class:src/api.py:ChatMessage",
+      "type": "depends_on",
+      "direction": "forward",
+      "weight": 0.6,
+      "description": "Each history element is validated as a ChatMessage."
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "file:tests/test_api.py",
+      "type": "tested_by",
+      "direction": "forward",
+      "weight": 0.5
+    },
+    {
+      "source": "file:src/inference.py",
+      "target": "file:tests/test_api.py",
+      "type": "tested_by",
+      "direction": "forward",
+      "weight": 0.5
+    },
+    {
+      "source": "file:src/inference.py",
+      "target": "file:tests/test_inference.py",
+      "type": "tested_by",
+      "direction": "forward",
+      "weight": 0.5
+    },
+    {
+      "source": "file:src/api.py",
+      "target": "file:tests/test_streaming.py",
+      "type": "tested_by",
+      "direction": "forward",
+      "weight": 0.5
+    },
+    {
+      "source": "file:src/inference.py",
+      "target": "file:tests/test_streaming.py",
+      "type": "tested_by",
+      "direction": "forward",
+      "weight": 0.5
+    },
+    {
+      "source": "file:src/inference.py",
+      "target": "file:src/cached_generation.py",
+      "type": "related",
+      "direction": "forward",
+      "weight": 0.5,
+      "description": "The service reuses the same inference concepts via library generate, not by importing an executable experiment."
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "file:src/api.py",
+      "type": "imports",
+      "direction": "forward",
+      "weight": 0.7
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "file:src/inference.py",
+      "type": "imports",
+      "direction": "forward",
+      "weight": 0.7
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:request_data",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "class:tests/test_api.py:RequestValidationTests",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:RequestValidationTests.assert_rejected",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_api.py:RequestValidationTests",
+      "target": "function:tests/test_api.py:RequestValidationTests.assert_rejected",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:RequestValidationTests.test_valid_history_preserves_text_and_allows_consecutive_roles",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_api.py:RequestValidationTests",
+      "target": "function:tests/test_api.py:RequestValidationTests.test_valid_history_preserves_text_and_allows_consecutive_roles",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:RequestValidationTests.test_valid_numeric_boundaries_and_integer_sampling_values",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_api.py:RequestValidationTests",
+      "target": "function:tests/test_api.py:RequestValidationTests.test_valid_numeric_boundaries_and_integer_sampling_values",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:RequestValidationTests.test_required_fields_and_model_identity",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_api.py:RequestValidationTests",
+      "target": "function:tests/test_api.py:RequestValidationTests.test_required_fields_and_model_identity",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:RequestValidationTests.test_invalid_messages_and_content",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_api.py:RequestValidationTests",
+      "target": "function:tests/test_api.py:RequestValidationTests.test_invalid_messages_and_content",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:RequestValidationTests.test_unknown_request_and_message_fields",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_api.py:RequestValidationTests",
+      "target": "function:tests/test_api.py:RequestValidationTests.test_unknown_request_and_message_fields",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:RequestValidationTests.test_numeric_types_do_not_coerce_strings_or_booleans",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_api.py:RequestValidationTests",
+      "target": "function:tests/test_api.py:RequestValidationTests.test_numeric_types_do_not_coerce_strings_or_booleans",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:RequestValidationTests.test_numeric_ranges",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_api.py:RequestValidationTests",
+      "target": "function:tests/test_api.py:RequestValidationTests.test_numeric_ranges",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:RequestValidationTests.test_nonfinite_numbers",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_api.py:RequestValidationTests",
+      "target": "function:tests/test_api.py:RequestValidationTests.test_nonfinite_numbers",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:RequestValidationTests.test_stream_requires_boolean",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_api.py:RequestValidationTests",
+      "target": "function:tests/test_api.py:RequestValidationTests.test_stream_requires_boolean",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:RequestValidationTests.test_greedy_top_p_combination_including_default_temperature",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_api.py:RequestValidationTests",
+      "target": "function:tests/test_api.py:RequestValidationTests.test_greedy_top_p_combination_including_default_temperature",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:RequestValidationTests.test_malformed_json_and_nonobject_body",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_api.py:RequestValidationTests",
+      "target": "function:tests/test_api.py:RequestValidationTests.test_malformed_json_and_nonobject_body",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "class:tests/test_api.py:LifecycleTests",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:LifecycleTests.asyncSetUp",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_api.py:LifecycleTests",
+      "target": "function:tests/test_api.py:LifecycleTests.asyncSetUp",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:LifecycleTests.test_startup_reuses_runtime_and_shutdown_releases_resources",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_api.py:LifecycleTests",
+      "target": "function:tests/test_api.py:LifecycleTests.test_startup_reuses_runtime_and_shutdown_releases_resources",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:LifecycleTests.test_loading_failure_prevents_serving",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_api.py:LifecycleTests",
+      "target": "function:tests/test_api.py:LifecycleTests.test_loading_failure_prevents_serving",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:LifecycleTests.test_executor_creation_failure_releases_loaded_runtime",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_api.py:LifecycleTests",
+      "target": "function:tests/test_api.py:LifecycleTests.test_executor_creation_failure_releases_loaded_runtime",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:LifecycleTests.test_health_remains_available_when_inference_slot_is_busy",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_api.py:LifecycleTests",
+      "target": "function:tests/test_api.py:LifecycleTests.test_health_remains_available_when_inference_slot_is_busy",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:LifecycleTests.test_uninitialized_application_does_not_claim_readiness",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_api.py:LifecycleTests",
+      "target": "function:tests/test_api.py:LifecycleTests.test_uninitialized_application_does_not_claim_readiness",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:LifecycleTests.test_shutdown_waits_for_worker_without_blocking_http_loop",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_api.py:LifecycleTests",
+      "target": "function:tests/test_api.py:LifecycleTests.test_shutdown_waits_for_worker_without_blocking_http_loop",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "class:tests/test_api.py:AdmissionTests",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:AdmissionTests.asyncSetUp",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_api.py:AdmissionTests",
+      "target": "function:tests/test_api.py:AdmissionTests.asyncSetUp",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:AdmissionTests.test_unavailable_state_rejects_before_submitting_work",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_api.py:AdmissionTests",
+      "target": "function:tests/test_api.py:AdmissionTests.test_unavailable_state_rejects_before_submitting_work",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:AdmissionTests.test_busy_rejection_and_consumer_cancellation_keep_worker_owned",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_api.py:AdmissionTests",
+      "target": "function:tests/test_api.py:AdmissionTests.test_busy_rejection_and_consumer_cancellation_keep_worker_owned",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:AdmissionTests.test_context_and_generation_failures_release_slot_for_recovery",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_api.py:AdmissionTests",
+      "target": "function:tests/test_api.py:AdmissionTests.test_context_and_generation_failures_release_slot_for_recovery",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:AdmissionTests.test_submission_failure_releases_slot_for_recovery",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_api.py:AdmissionTests",
+      "target": "function:tests/test_api.py:AdmissionTests.test_submission_failure_releases_slot_for_recovery",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:AdmissionTests.test_abandoned_failure_is_observed_and_does_not_leak_busy_slot",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_api.py:AdmissionTests",
+      "target": "function:tests/test_api.py:AdmissionTests.test_abandoned_failure_is_observed_and_does_not_leak_busy_slot",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "class:tests/test_api.py:CompletionEndpointTests",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:CompletionEndpointTests.asyncSetUp",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_api.py:CompletionEndpointTests",
+      "target": "function:tests/test_api.py:CompletionEndpointTests.asyncSetUp",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:CompletionEndpointTests.assert_error",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_api.py:CompletionEndpointTests",
+      "target": "function:tests/test_api.py:CompletionEndpointTests.assert_error",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:CompletionEndpointTests.test_validation_errors_are_private_and_precede_busy_admission",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_api.py:CompletionEndpointTests",
+      "target": "function:tests/test_api.py:CompletionEndpointTests.test_validation_errors_are_private_and_precede_busy_admission",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:CompletionEndpointTests.test_unavailable_application_returns_503",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_api.py:CompletionEndpointTests",
+      "target": "function:tests/test_api.py:CompletionEndpointTests.test_unavailable_application_returns_503",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:CompletionEndpointTests.test_preparation_and_generation_errors_allow_later_success",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_api.py:CompletionEndpointTests",
+      "target": "function:tests/test_api.py:CompletionEndpointTests.test_preparation_and_generation_errors_allow_later_success",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:CompletionEndpointTests.test_submission_failure_returns_safe_500_and_releases_slot",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_api.py:CompletionEndpointTests",
+      "target": "function:tests/test_api.py:CompletionEndpointTests.test_submission_failure_returns_safe_500_and_releases_slot",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:CompletionEndpointTests.test_busy_and_canceled_http_handler_retain_producer_ownership",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_api.py:CompletionEndpointTests",
+      "target": "function:tests/test_api.py:CompletionEndpointTests.test_busy_and_canceled_http_handler_retain_producer_ownership",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:CompletionEndpointTests.test_unknown_routes_and_wrong_methods_keep_normal_routing",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_api.py:CompletionEndpointTests",
+      "target": "function:tests/test_api.py:CompletionEndpointTests.test_unknown_routes_and_wrong_methods_keep_normal_routing",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "function:tests/test_api.py:request_data",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "class:tests/test_api.py:RequestValidationTests",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "class:tests/test_api.py:LifecycleTests",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "class:tests/test_api.py:AdmissionTests",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:tests/test_api.py",
+      "target": "class:tests/test_api.py:CompletionEndpointTests",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:tests/test_inference.py",
+      "target": "file:src/inference.py",
+      "type": "imports",
+      "direction": "forward",
+      "weight": 0.7
+    },
+    {
+      "source": "file:tests/test_inference.py",
+      "target": "class:tests/test_inference.py:ContextBudgetTests",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_inference.py",
+      "target": "function:tests/test_inference.py:ContextBudgetTests.setUp",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_inference.py:ContextBudgetTests",
+      "target": "function:tests/test_inference.py:ContextBudgetTests.setUp",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_inference.py",
+      "target": "function:tests/test_inference.py:ContextBudgetTests.run_generation",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_inference.py:ContextBudgetTests",
+      "target": "function:tests/test_inference.py:ContextBudgetTests.run_generation",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_inference.py",
+      "target": "function:tests/test_inference.py:ContextBudgetTests.test_exact_fit_keeps_full_history_and_requested_output_budget",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_inference.py:ContextBudgetTests",
+      "target": "function:tests/test_inference.py:ContextBudgetTests.test_exact_fit_keeps_full_history_and_requested_output_budget",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_inference.py",
+      "target": "function:tests/test_inference.py:ContextBudgetTests.test_one_token_over_rejects_before_preparation_and_generation",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_inference.py:ContextBudgetTests",
+      "target": "function:tests/test_inference.py:ContextBudgetTests.test_one_token_over_rejects_before_preparation_and_generation",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_inference.py",
+      "target": "function:tests/test_inference.py:ContextBudgetTests.test_oversized_prompt_is_not_silently_truncated",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_inference.py:ContextBudgetTests",
+      "target": "function:tests/test_inference.py:ContextBudgetTests.test_oversized_prompt_is_not_silently_truncated",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_inference.py",
+      "target": "function:tests/test_inference.py:ContextBudgetTests.test_earlier_turns_cannot_be_discarded_to_fit",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_inference.py:ContextBudgetTests",
+      "target": "function:tests/test_inference.py:ContextBudgetTests.test_earlier_turns_cannot_be_discarded_to_fit",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_inference.py",
+      "target": "function:tests/test_inference.py:ContextBudgetTests.test_preparation_precedes_model_execution_for_valid_request",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_inference.py:ContextBudgetTests",
+      "target": "function:tests/test_inference.py:ContextBudgetTests.test_preparation_precedes_model_execution_for_valid_request",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_inference.py",
+      "target": "class:tests/test_inference.py:RuntimeContextLimitTests",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_inference.py",
+      "target": "function:tests/test_inference.py:RuntimeContextLimitTests.load_with_config",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_inference.py:RuntimeContextLimitTests",
+      "target": "function:tests/test_inference.py:RuntimeContextLimitTests.load_with_config",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_inference.py",
+      "target": "function:tests/test_inference.py:RuntimeContextLimitTests.test_supported_context_respects_smaller_model_and_local_cap",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_inference.py:RuntimeContextLimitTests",
+      "target": "function:tests/test_inference.py:RuntimeContextLimitTests.test_supported_context_respects_smaller_model_and_local_cap",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_inference.py",
+      "target": "function:tests/test_inference.py:RuntimeContextLimitTests.test_absent_or_invalid_declared_context_fails_loading",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_inference.py:RuntimeContextLimitTests",
+      "target": "function:tests/test_inference.py:RuntimeContextLimitTests.test_absent_or_invalid_declared_context_fails_loading",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_inference.py",
+      "target": "class:tests/test_inference.py:ContextBudgetTests",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:tests/test_inference.py",
+      "target": "class:tests/test_inference.py:RuntimeContextLimitTests",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:RequestValidationTests.test_valid_history_preserves_text_and_allows_consecutive_roles",
+      "target": "function:tests/test_api.py:request_data",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:RequestValidationTests.test_valid_numeric_boundaries_and_integer_sampling_values",
+      "target": "function:tests/test_api.py:request_data",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:RequestValidationTests.test_required_fields_and_model_identity",
+      "target": "function:tests/test_api.py:request_data",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:RequestValidationTests.test_required_fields_and_model_identity",
+      "target": "function:tests/test_api.py:RequestValidationTests.assert_rejected",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:RequestValidationTests.test_invalid_messages_and_content",
+      "target": "function:tests/test_api.py:RequestValidationTests.assert_rejected",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:RequestValidationTests.test_invalid_messages_and_content",
+      "target": "function:tests/test_api.py:request_data",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:RequestValidationTests.test_unknown_request_and_message_fields",
+      "target": "function:tests/test_api.py:RequestValidationTests.assert_rejected",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:RequestValidationTests.test_unknown_request_and_message_fields",
+      "target": "function:tests/test_api.py:request_data",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:RequestValidationTests.test_numeric_types_do_not_coerce_strings_or_booleans",
+      "target": "function:tests/test_api.py:RequestValidationTests.assert_rejected",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:RequestValidationTests.test_numeric_types_do_not_coerce_strings_or_booleans",
+      "target": "function:tests/test_api.py:request_data",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:RequestValidationTests.test_numeric_ranges",
+      "target": "function:tests/test_api.py:RequestValidationTests.assert_rejected",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:RequestValidationTests.test_numeric_ranges",
+      "target": "function:tests/test_api.py:request_data",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:RequestValidationTests.test_nonfinite_numbers",
+      "target": "function:tests/test_api.py:RequestValidationTests.assert_rejected",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:RequestValidationTests.test_nonfinite_numbers",
+      "target": "function:tests/test_api.py:request_data",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:RequestValidationTests.test_stream_requires_boolean",
+      "target": "function:tests/test_api.py:RequestValidationTests.assert_rejected",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:RequestValidationTests.test_stream_requires_boolean",
+      "target": "function:tests/test_api.py:request_data",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:RequestValidationTests.test_greedy_top_p_combination_including_default_temperature",
+      "target": "function:tests/test_api.py:RequestValidationTests.assert_rejected",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:RequestValidationTests.test_greedy_top_p_combination_including_default_temperature",
+      "target": "function:tests/test_api.py:request_data",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:LifecycleTests.test_shutdown_waits_for_worker_without_blocking_http_loop",
+      "target": "function:src/api.py:submit_inference",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:LifecycleTests.test_shutdown_waits_for_worker_without_blocking_http_loop",
+      "target": "function:tests/test_api.py:request_data",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:AdmissionTests.asyncSetUp",
+      "target": "function:tests/test_api.py:request_data",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:AdmissionTests.asyncSetUp",
+      "target": "class:src/inference.py:GenerationResult",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:AdmissionTests.test_unavailable_state_rejects_before_submitting_work",
+      "target": "function:src/api.py:submit_inference",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:AdmissionTests.test_busy_rejection_and_consumer_cancellation_keep_worker_owned",
+      "target": "function:src/api.py:submit_inference",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:AdmissionTests.test_context_and_generation_failures_release_slot_for_recovery",
+      "target": "class:src/inference.py:ContextLimitError",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:AdmissionTests.test_context_and_generation_failures_release_slot_for_recovery",
+      "target": "function:src/api.py:submit_inference",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:AdmissionTests.test_submission_failure_releases_slot_for_recovery",
+      "target": "function:src/api.py:submit_inference",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:AdmissionTests.test_abandoned_failure_is_observed_and_does_not_leak_busy_slot",
+      "target": "function:src/api.py:submit_inference",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:CompletionEndpointTests.asyncSetUp",
+      "target": "class:src/inference.py:GenerationResult",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:CompletionEndpointTests.test_validation_errors_are_private_and_precede_busy_admission",
+      "target": "function:tests/test_api.py:request_data",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:CompletionEndpointTests.test_validation_errors_are_private_and_precede_busy_admission",
+      "target": "function:tests/test_api.py:CompletionEndpointTests.assert_error",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:CompletionEndpointTests.test_unavailable_application_returns_503",
+      "target": "function:tests/test_api.py:request_data",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:CompletionEndpointTests.test_unavailable_application_returns_503",
+      "target": "function:tests/test_api.py:CompletionEndpointTests.assert_error",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:CompletionEndpointTests.test_preparation_and_generation_errors_allow_later_success",
+      "target": "class:src/inference.py:ContextLimitError",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:CompletionEndpointTests.test_preparation_and_generation_errors_allow_later_success",
+      "target": "function:tests/test_api.py:request_data",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:CompletionEndpointTests.test_preparation_and_generation_errors_allow_later_success",
+      "target": "function:tests/test_api.py:CompletionEndpointTests.assert_error",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:CompletionEndpointTests.test_submission_failure_returns_safe_500_and_releases_slot",
+      "target": "function:tests/test_api.py:request_data",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:CompletionEndpointTests.test_submission_failure_returns_safe_500_and_releases_slot",
+      "target": "function:tests/test_api.py:CompletionEndpointTests.assert_error",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:CompletionEndpointTests.test_busy_and_canceled_http_handler_retain_producer_ownership",
+      "target": "function:tests/test_api.py:request_data",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:CompletionEndpointTests.test_busy_and_canceled_http_handler_retain_producer_ownership",
+      "target": "function:tests/test_api.py:CompletionEndpointTests.assert_error",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_api.py:CompletionEndpointTests.test_unknown_routes_and_wrong_methods_keep_normal_routing",
+      "target": "function:tests/test_api.py:request_data",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_inference.py:ContextBudgetTests.setUp",
+      "target": "class:src/inference.py:Runtime",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_inference.py:ContextBudgetTests.run_generation",
+      "target": "function:src/inference.py:generate",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_inference.py:ContextBudgetTests.test_exact_fit_keeps_full_history_and_requested_output_budget",
+      "target": "function:tests/test_inference.py:ContextBudgetTests.run_generation",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_inference.py:ContextBudgetTests.test_one_token_over_rejects_before_preparation_and_generation",
+      "target": "function:tests/test_inference.py:ContextBudgetTests.run_generation",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_inference.py:ContextBudgetTests.test_oversized_prompt_is_not_silently_truncated",
+      "target": "function:tests/test_inference.py:ContextBudgetTests.run_generation",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_inference.py:ContextBudgetTests.test_earlier_turns_cannot_be_discarded_to_fit",
+      "target": "function:tests/test_inference.py:ContextBudgetTests.run_generation",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_inference.py:ContextBudgetTests.test_preparation_precedes_model_execution_for_valid_request",
+      "target": "function:tests/test_inference.py:ContextBudgetTests.run_generation",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_inference.py:RuntimeContextLimitTests.load_with_config",
+      "target": "function:src/inference.py:load_runtime",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_inference.py:RuntimeContextLimitTests.test_supported_context_respects_smaller_model_and_local_cap",
+      "target": "function:tests/test_inference.py:RuntimeContextLimitTests.load_with_config",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_inference.py:RuntimeContextLimitTests.test_absent_or_invalid_declared_context_fails_loading",
+      "target": "function:tests/test_inference.py:RuntimeContextLimitTests.load_with_config",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:tests/test_streaming.py",
+      "target": "file:src/api.py",
+      "type": "imports",
+      "direction": "forward",
+      "weight": 0.7
+    },
+    {
+      "source": "file:tests/test_streaming.py",
+      "target": "file:src/inference.py",
+      "type": "imports",
+      "direction": "forward",
+      "weight": 0.7
+    },
+    {
+      "source": "file:tests/test_streaming.py",
+      "target": "function:tests/test_streaming.py:payload",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_streaming.py",
+      "target": "class:tests/test_streaming.py:Connection",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_streaming.py",
+      "target": "function:tests/test_streaming.py:Connection.__init__",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_streaming.py:Connection",
+      "target": "function:tests/test_streaming.py:Connection.__init__",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_streaming.py",
+      "target": "function:tests/test_streaming.py:Connection.send",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_streaming.py:Connection",
+      "target": "function:tests/test_streaming.py:Connection.send",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_streaming.py",
+      "target": "function:tests/test_streaming.py:Connection.disconnect",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_streaming.py:Connection",
+      "target": "function:tests/test_streaming.py:Connection.disconnect",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_streaming.py",
+      "target": "function:tests/test_streaming.py:Connection.body",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_streaming.py:Connection",
+      "target": "function:tests/test_streaming.py:Connection.body",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_streaming.py",
+      "target": "function:tests/test_streaming.py:Connection.events",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_streaming.py:Connection",
+      "target": "function:tests/test_streaming.py:Connection.events",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_streaming.py",
+      "target": "class:tests/test_streaming.py:StreamingTests",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_streaming.py",
+      "target": "function:tests/test_streaming.py:StreamingTests.asyncSetUp",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_streaming.py:StreamingTests",
+      "target": "function:tests/test_streaming.py:StreamingTests.asyncSetUp",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_streaming.py",
+      "target": "function:tests/test_streaming.py:StreamingTests.test_incremental_content_and_truthful_terminal_usage",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_streaming.py:StreamingTests",
+      "target": "function:tests/test_streaming.py:StreamingTests.test_incremental_content_and_truthful_terminal_usage",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_streaming.py",
+      "target": "function:tests/test_streaming.py:StreamingTests.test_queue_timeout_is_not_a_generation_failure",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_streaming.py:StreamingTests",
+      "target": "function:tests/test_streaming.py:StreamingTests.test_queue_timeout_is_not_a_generation_failure",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_streaming.py",
+      "target": "function:tests/test_streaming.py:StreamingTests.test_preparation_failure_is_json_before_headers_and_recovers",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_streaming.py:StreamingTests",
+      "target": "function:tests/test_streaming.py:StreamingTests.test_preparation_failure_is_json_before_headers_and_recovers",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_streaming.py",
+      "target": "function:tests/test_streaming.py:StreamingTests.test_stream_submission_failure_does_not_leave_a_preparation_waiter",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_streaming.py:StreamingTests",
+      "target": "function:tests/test_streaming.py:StreamingTests.test_stream_submission_failure_does_not_leave_a_preparation_waiter",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_streaming.py",
+      "target": "function:tests/test_streaming.py:StreamingTests.test_failure_with_or_without_sentinel_has_no_success_terminal",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_streaming.py:StreamingTests",
+      "target": "function:tests/test_streaming.py:StreamingTests.test_failure_with_or_without_sentinel_has_no_success_terminal",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_streaming.py",
+      "target": "function:tests/test_streaming.py:StreamingTests.test_disconnect_before_preparation_or_ordinary_result_sends_nothing",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_streaming.py:StreamingTests",
+      "target": "function:tests/test_streaming.py:StreamingTests.test_disconnect_before_preparation_or_ordinary_result_sends_nothing",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_streaming.py",
+      "target": "function:tests/test_streaming.py:StreamingTests.test_disconnect_after_content_keeps_ownership_for_both_asgi_versions",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "class:tests/test_streaming.py:StreamingTests",
+      "target": "function:tests/test_streaming.py:StreamingTests.test_disconnect_after_content_keeps_ownership_for_both_asgi_versions",
+      "type": "contains",
+      "direction": "forward",
+      "weight": 1.0
+    },
+    {
+      "source": "file:tests/test_streaming.py",
+      "target": "function:tests/test_streaming.py:payload",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:tests/test_streaming.py",
+      "target": "class:tests/test_streaming.py:Connection",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "file:tests/test_streaming.py",
+      "target": "class:tests/test_streaming.py:StreamingTests",
+      "type": "exports",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_streaming.py:Connection.__init__",
+      "target": "function:tests/test_streaming.py:payload",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_streaming.py:Connection.events",
+      "target": "function:tests/test_streaming.py:Connection.body",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_streaming.py:StreamingTests.asyncSetUp",
+      "target": "class:src/inference.py:GenerationResult",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_streaming.py:StreamingTests.test_incremental_content_and_truthful_terminal_usage",
+      "target": "class:tests/test_streaming.py:Connection",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_streaming.py:StreamingTests.test_incremental_content_and_truthful_terminal_usage",
+      "target": "function:tests/test_streaming.py:payload",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_streaming.py:StreamingTests.test_queue_timeout_is_not_a_generation_failure",
+      "target": "class:tests/test_streaming.py:Connection",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_streaming.py:StreamingTests.test_preparation_failure_is_json_before_headers_and_recovers",
+      "target": "class:src/inference.py:ContextLimitError",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_streaming.py:StreamingTests.test_preparation_failure_is_json_before_headers_and_recovers",
+      "target": "function:tests/test_streaming.py:payload",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_streaming.py:StreamingTests.test_stream_submission_failure_does_not_leave_a_preparation_waiter",
+      "target": "function:tests/test_streaming.py:payload",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_streaming.py:StreamingTests.test_failure_with_or_without_sentinel_has_no_success_terminal",
+      "target": "class:tests/test_streaming.py:Connection",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_streaming.py:StreamingTests.test_failure_with_or_without_sentinel_has_no_success_terminal",
+      "target": "function:tests/test_streaming.py:payload",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_streaming.py:StreamingTests.test_disconnect_before_preparation_or_ordinary_result_sends_nothing",
+      "target": "class:tests/test_streaming.py:Connection",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_streaming.py:StreamingTests.test_disconnect_before_preparation_or_ordinary_result_sends_nothing",
+      "target": "function:tests/test_streaming.py:payload",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_streaming.py:StreamingTests.test_disconnect_after_content_keeps_ownership_for_both_asgi_versions",
+      "target": "class:tests/test_streaming.py:Connection",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "function:tests/test_streaming.py:StreamingTests.test_disconnect_after_content_keeps_ownership_for_both_asgi_versions",
+      "target": "function:tests/test_streaming.py:payload",
+      "type": "calls",
+      "direction": "forward",
+      "weight": 0.8
+    },
+    {
+      "source": "document:README.md",
+      "target": "file:src/api.py",
+      "type": "documents",
+      "direction": "forward",
+      "weight": 0.5
+    },
+    {
+      "source": "document:README.md",
+      "target": "file:src/architecture.py",
+      "type": "documents",
+      "direction": "forward",
+      "weight": 0.5
+    },
+    {
+      "source": "document:README.md",
+      "target": "file:src/cached_generation.py",
+      "type": "documents",
+      "direction": "forward",
+      "weight": 0.5
+    },
+    {
+      "source": "document:README.md",
+      "target": "file:src/inference.py",
+      "type": "documents",
+      "direction": "forward",
+      "weight": 0.5
+    },
+    {
+      "source": "document:README.md",
+      "target": "file:src/main.py",
+      "type": "documents",
+      "direction": "forward",
+      "weight": 0.5
+    },
+    {
+      "source": "document:README.md",
+      "target": "file:src/uncached_generation.py",
+      "type": "documents",
+      "direction": "forward",
+      "weight": 0.5
+    },
+    {
+      "source": "document:README.md",
+      "target": "file:tests/test_api.py",
+      "type": "documents",
+      "direction": "forward",
+      "weight": 0.5
+    },
+    {
+      "source": "document:README.md",
+      "target": "file:tests/test_inference.py",
+      "type": "documents",
+      "direction": "forward",
+      "weight": 0.5
+    },
+    {
+      "source": "document:README.md",
+      "target": "file:tests/test_streaming.py",
+      "type": "documents",
+      "direction": "forward",
+      "weight": 0.5
+    },
+    {
+      "source": "document:README.md",
+      "target": "document:logs/practice.md",
+      "type": "related",
+      "direction": "forward",
+      "weight": 0.5
+    },
+    {
+      "source": "document:README.md",
+      "target": "document:plan.md",
+      "type": "related",
+      "direction": "forward",
+      "weight": 0.5
+    },
+    {
+      "source": "document:README.md",
+      "target": "document:requirements.txt",
+      "type": "documents",
+      "direction": "forward",
+      "weight": 0.5
+    },
+    {
+      "source": "document:plan.md",
+      "target": "file:src/api.py",
+      "type": "documents",
+      "direction": "forward",
+      "weight": 0.5,
+      "description": "Describes current code and verification evidence; future roadmap assignments are not implementation claims."
+    },
+    {
+      "source": "document:plan.md",
+      "target": "file:src/cached_generation.py",
+      "type": "documents",
+      "direction": "forward",
+      "weight": 0.5,
+      "description": "Describes current code and verification evidence; future roadmap assignments are not implementation claims."
+    },
+    {
+      "source": "document:plan.md",
+      "target": "file:src/inference.py",
+      "type": "documents",
+      "direction": "forward",
+      "weight": 0.5,
+      "description": "Describes current code and verification evidence; future roadmap assignments are not implementation claims."
+    },
+    {
+      "source": "document:plan.md",
+      "target": "file:src/main.py",
+      "type": "documents",
+      "direction": "forward",
+      "weight": 0.5,
+      "description": "Describes current code and verification evidence; future roadmap assignments are not implementation claims."
+    },
+    {
+      "source": "document:plan.md",
+      "target": "file:src/uncached_generation.py",
+      "type": "documents",
+      "direction": "forward",
+      "weight": 0.5,
+      "description": "Describes current code and verification evidence; future roadmap assignments are not implementation claims."
+    },
+    {
+      "source": "document:plan.md",
+      "target": "file:tests/test_api.py",
+      "type": "documents",
+      "direction": "forward",
+      "weight": 0.5,
+      "description": "Describes current code and verification evidence; future roadmap assignments are not implementation claims."
+    },
+    {
+      "source": "document:plan.md",
+      "target": "file:tests/test_inference.py",
+      "type": "documents",
+      "direction": "forward",
+      "weight": 0.5,
+      "description": "Describes current code and verification evidence; future roadmap assignments are not implementation claims."
+    },
+    {
+      "source": "document:plan.md",
+      "target": "document:README.md",
+      "type": "related",
+      "direction": "forward",
+      "weight": 0.5
+    },
+    {
+      "source": "document:plan.md",
+      "target": "document:logs/practice.md",
+      "type": "related",
+      "direction": "forward",
+      "weight": 0.5
+    },
+    {
+      "source": "document:plan.md",
+      "target": "document:requirements.txt",
+      "type": "documents",
+      "direction": "forward",
+      "weight": 0.5
+    },
+    {
+      "source": "document:requirements.txt",
+      "target": "file:src/api.py",
+      "type": "configures",
+      "direction": "forward",
+      "weight": 0.6,
+      "description": "Declares Python libraries used by this file; scanner categorizes .txt as documentation."
+    },
+    {
+      "source": "document:requirements.txt",
+      "target": "file:src/inference.py",
+      "type": "configures",
+      "direction": "forward",
+      "weight": 0.6,
+      "description": "Declares Python libraries used by this file; scanner categorizes .txt as documentation."
+    },
+    {
+      "source": "document:requirements.txt",
+      "target": "file:src/main.py",
+      "type": "configures",
+      "direction": "forward",
+      "weight": 0.6,
+      "description": "Declares Python libraries used by this file; scanner categorizes .txt as documentation."
+    },
+    {
+      "source": "document:requirements.txt",
+      "target": "file:src/architecture.py",
+      "type": "configures",
+      "direction": "forward",
+      "weight": 0.6,
+      "description": "Declares Python libraries used by this file; scanner categorizes .txt as documentation."
+    },
+    {
+      "source": "document:requirements.txt",
+      "target": "file:src/cached_generation.py",
+      "type": "configures",
+      "direction": "forward",
+      "weight": 0.6,
+      "description": "Declares Python libraries used by this file; scanner categorizes .txt as documentation."
+    },
+    {
+      "source": "document:requirements.txt",
+      "target": "file:src/uncached_generation.py",
+      "type": "configures",
+      "direction": "forward",
+      "weight": 0.6,
+      "description": "Declares Python libraries used by this file; scanner categorizes .txt as documentation."
+    },
+    {
+      "source": "document:requirements.txt",
+      "target": "file:tests/test_api.py",
+      "type": "configures",
+      "direction": "forward",
+      "weight": 0.6,
+      "description": "Declares Python libraries used by this file; scanner categorizes .txt as documentation."
+    },
+    {
+      "source": "document:requirements.txt",
+      "target": "file:tests/test_inference.py",
+      "type": "configures",
+      "direction": "forward",
+      "weight": 0.6,
+      "description": "Declares Python libraries used by this file; scanner categorizes .txt as documentation."
+    },
+    {
+      "source": "document:requirements.txt",
+      "target": "file:tests/test_streaming.py",
+      "type": "configures",
+      "direction": "forward",
+      "weight": 0.6,
+      "description": "Declares Python libraries used by this file; scanner categorizes .txt as documentation."
+    },
+    {
+      "source": "file:src/cached_generation.py",
+      "target": "file:src/uncached_generation.py",
+      "type": "related",
+      "direction": "forward",
+      "weight": 0.5,
+      "description": "Controlled cached versus full-prefix generation comparison; no import relationship."
+    },
+    {
+      "source": "file:src/main.py",
+      "target": "file:src/architecture.py",
+      "type": "related",
+      "direction": "forward",
+      "weight": 0.5,
+      "description": "Both inspect token embeddings and Qwen dimensions; architecture.py continues into Q/K/V projections."
+    },
+    {
+      "source": "document:logs/practice.md",
+      "target": "file:src/api.py",
+      "type": "documents",
+      "direction": "forward",
+      "weight": 0.5
+    },
+    {
+      "source": "document:logs/practice.md",
+      "target": "file:src/architecture.py",
+      "type": "documents",
+      "direction": "forward",
+      "weight": 0.5
+    },
+    {
+      "source": "document:logs/practice.md",
+      "target": "file:src/cached_generation.py",
+      "type": "documents",
+      "direction": "forward",
+      "weight": 0.5
+    },
+    {
+      "source": "document:logs/practice.md",
+      "target": "file:src/inference.py",
+      "type": "documents",
+      "direction": "forward",
+      "weight": 0.5
+    },
+    {
+      "source": "document:logs/practice.md",
+      "target": "file:src/main.py",
+      "type": "documents",
+      "direction": "forward",
+      "weight": 0.5
+    },
+    {
+      "source": "document:logs/practice.md",
+      "target": "file:src/uncached_generation.py",
+      "type": "documents",
+      "direction": "forward",
+      "weight": 0.5
+    },
+    {
+      "source": "document:logs/practice.md",
+      "target": "file:tests/test_api.py",
+      "type": "documents",
+      "direction": "forward",
+      "weight": 0.5
+    },
+    {
+      "source": "document:logs/practice.md",
+      "target": "file:tests/test_inference.py",
+      "type": "documents",
+      "direction": "forward",
+      "weight": 0.5
+    },
+    {
+      "source": "document:logs/practice.md",
+      "target": "file:tests/test_streaming.py",
+      "type": "documents",
+      "direction": "forward",
+      "weight": 0.5
+    },
+    {
+      "source": "document:logs/practice.md",
+      "target": "document:README.md",
+      "type": "related",
+      "direction": "forward",
+      "weight": 0.5
+    },
+    {
+      "source": "document:logs/practice.md",
+      "target": "document:plan.md",
+      "type": "related",
+      "direction": "forward",
+      "weight": 0.5
+    },
+    {
+      "source": "document:logs/practice.md",
+      "target": "document:requirements.txt",
+      "type": "documents",
+      "direction": "forward",
+      "weight": 0.5
+    }
+  ],
+  "version": "1.0.0",
+  "project": {
+    "name": "inference-platform",
+    "description": "A learning-focused Qwen inference project with tokenization, manual cached and uncached generation experiments, and a local FastAPI chat-completions service supporting serialized ordinary and streaming responses.",
+    "languages": [
+      "markdown",
+      "python",
+      "txt"
+    ],
+    "frameworks": [
+      "PyTorch",
+      "Transformers",
+      "FastAPI",
+      "Pydantic",
+      "Uvicorn"
+    ],
+    "analyzedAt": "2026-10-19T18:16:23.472252Z",
+    "gitCommitHash": "d6d61edd1decc99c81402e4309cddc1d86d2d7d2"
+  },
+  "layers": [
+    {
+      "id": "layer:learning-experiments",
+      "name": "Inference Learning Experiments",
+      "description": "Four independent executable Qwen scripts expose tokenization, embeddings, attention projections, uncached sampling, and cached greedy generation without being imported by the service.",
+      "nodeIds": [
+        "file:src/main.py",
+        "file:src/architecture.py",
+        "file:src/uncached_generation.py",
+        "file:src/cached_generation.py"
+      ]
+    },
+    {
+      "id": "layer:inference-runtime",
+      "name": "Reusable Inference Runtime",
+      "description": "HTTP-independent CPU model loading and cached library generation enforce full-context budgets and return completion text, generated IDs, and finish metadata.",
+      "nodeIds": [
+        "file:src/inference.py"
+      ]
+    },
+    {
+      "id": "layer:http-serving",
+      "name": "HTTP Serving and Ownership",
+      "description": "FastAPI combines strict request validation, application lifetime, immediate single-producer admission, sanitized responses, and disconnect-aware JSON/SSE delivery.",
+      "nodeIds": [
+        "file:src/api.py"
+      ]
+    },
+    {
+      "id": "layer:behavioral-verification",
+      "name": "Behavioral Verification",
+      "description": "Offline unittest suites exercise context limits, lifecycle and admission invariants, HTTP errors, progressive streaming, and producer ownership after consumer cancellation or disconnect.",
+      "nodeIds": [
+        "file:tests/test_api.py",
+        "file:tests/test_inference.py",
+        "file:tests/test_streaming.py"
+      ]
+    },
+    {
+      "id": "layer:project-guidance",
+      "name": "Learning Guides and Environment",
+      "description": "The run guide, stable roadmap, chronological evidence log, and Python dependency list explain how to run and study the implemented project while keeping future assignments separate.",
+      "nodeIds": [
+        "document:README.md",
+        "document:plan.md",
+        "document:logs/practice.md",
+        "document:requirements.txt"
+      ]
+    }
+  ],
+  "tour": [
+    {
+      "order": 1,
+      "title": "Orient Yourself First",
+      "description": "Start with the README's local Qwen service contract and the latest practice-log handoff, not the roadmap's older unchecked boxes. This repository combines executable learning experiments with a working CPU FastAPI service; Understand Anything is a separate developer tool, not part of inference. The dependency list is mostly unpinned, so historical environment versions are evidence rather than a guaranteed fresh-install lock.",
+      "nodeIds": [
+        "document:README.md",
+        "document:logs/practice.md",
+        "document:requirements.txt",
+        "document:plan.md"
+      ]
+    },
+    {
+      "order": 2,
+      "title": "From Text to Logits",
+      "description": "Read src/main.py to follow raw tokenization, chat formatting, embedding lookup, a forward pass, and selection of two new tokens. Focus on final-position logits versus softmax probabilities: the top-five display is inspection, not top-k sampling. This script runs at module execution and loads its own model; it is not the web-server entry point.",
+      "nodeIds": [
+        "file:src/main.py"
+      ],
+      "languageLesson": "torch.inference_mode() disables autograd work inside its context, while model.eval() changes model training behavior; they serve different purposes. Tensor slicing selects the final input position before argmax chooses a vocabulary ID."
+    },
+    {
+      "order": 3,
+      "title": "Inspect Attention Inputs",
+      "description": "Building on embeddings, architecture.py applies the first layer's normalization and learned query, key, and value projections. Compare the printed dimensions with Qwen's query-head and KV-head counts to understand grouped-query attention. These are projections before head reshaping and rotary embeddings, not full attention scores or cached tensors.",
+      "nodeIds": [
+        "file:src/architecture.py",
+        "document:logs/practice.md"
+      ]
+    },
+    {
+      "order": 4,
+      "title": "Repeat Without a Cache",
+      "description": "The uncached script turns next-token selection into a loop, appending IDs and extending the attention mask before recomputing the entire prefix. Choose option 1 when studying its greedy library-parity assertion: option 2 samples at temperature 0.7, but the appended reference remains greedy and equality is not guaranteed. Stop at configured EOS or the 100-token cap, and distinguish prompt-forward timing from complete request latency.",
+      "nodeIds": [
+        "file:src/uncached_generation.py"
+      ]
+    },
+    {
+      "order": 5,
+      "title": "Reuse Keys and Values",
+      "description": "Compare cached_generation.py with the previous full-prefix loop: prefill processes the prompt once, then each decode call supplies one new token with past_key_values and a growing attention mask. Inspect logical KV storage and explain why the final selected token is not processed after stopping, leaving cache length equal to prompt length plus generated count minus one. The matched greedy generate assertion checks mechanics, while the practice log keeps single-run CPU/MPS timing observations separate from benchmark claims.",
+      "nodeIds": [
+        "file:src/cached_generation.py",
+        "file:src/uncached_generation.py",
+        "document:logs/practice.md"
+      ]
+    },
+    {
+      "order": 6,
+      "title": "Extract Reusable Inference",
+      "description": "The service does not import those executable experiments: inference.py exposes load_runtime and generate instead, with small Runtime and GenerationResult dataclasses. Trace formatting and full-history token counting before the combined prompt-plus-output budget, then fresh generation settings and completion-only output slicing. The context tests prove exact fits and rejection before generation without downloading Qwen; EOS IDs count toward usage even when their text is invisible.",
+      "nodeIds": [
+        "file:src/inference.py",
+        "file:tests/test_inference.py"
+      ],
+      "languageLesson": "Dataclasses group explicit runtime/result fields without an extra service abstraction. The inference_mode decorator executes inside the worker thread where generate runs, which matters because the mode is thread-local."
+    },
+    {
+      "order": 7,
+      "title": "Define the Service Contract",
+      "description": "Now enter src/api.py, the actual src.api:app Uvicorn target, and inspect ChatMessage and ChatCompletionRequest before any generation code. Strict Pydantic validation rejects coercions, unknown fields, unsupported models, and greedy temperature with non-default top-p while preserving valid message text. Compare the README's supported subset and the validation tests instead of assuming full OpenAI compatibility.",
+      "nodeIds": [
+        "file:src/api.py",
+        "file:tests/test_api.py",
+        "document:README.md"
+      ],
+      "languageLesson": "FastAPI validates the annotated body model before calling the async route. Field and model validators enforce individual values and cross-field combinations; accepting a field would promise actual behavior."
+    },
+    {
+      "order": 8,
+      "title": "Own Runtime and Admission",
+      "description": "Follow lifespan from explicit one-time loading through single-worker executor creation to shutdown that waits before dropping the runtime. Then trace submit_inference and _run_inference: a nonblocking guard rejects overlap immediately, the worker performs tokenization and generation, and its finally block alone releases ownership after work exits. Health means HTTP is alive, whereas readiness is an idle-state snapshot; async def alone does not move model computation off the loop.",
+      "nodeIds": [
+        "file:src/api.py",
+        "file:tests/test_api.py"
+      ],
+      "languageLesson": "asynccontextmanager defines startup and cleanup around yield. asyncio.shield protects retained producer work from consumer cancellation; the dedicated executor and threading.Lock are distinct from the event loop."
+    },
+    {
+      "order": 9,
+      "title": "Return Truthful HTTP Results",
+      "description": "Trace the ordinary branch of chat_completions from a validated request through admission to GenerationResult serialization. _usage counts actual generated IDs, while fixed error messages distinguish context overflow, busy state, unavailability, and unexpected failure without echoing private inputs. Server-generated UUIDs correlate response headers and error envelopes, but structured lifecycle logging is still future work.",
+      "nodeIds": [
+        "file:src/api.py",
+        "file:src/inference.py",
+        "file:tests/test_api.py"
+      ]
+    },
+    {
+      "order": 10,
+      "title": "Stream Text Before Completion",
+      "description": "The streaming branch passes one TextIteratorStreamer into the same admitted producer and waits for preparation before committing SSE headers. _next_text runs queue reads off-loop; _stream_completion emits role and nonempty text events, then actual finish/usage and one DONE only after producer success. Queue timeouts are not failures, text chunks are not token counts, and the direct ASGI test harness proves nonempty content arrives while generation is still held.",
+      "nodeIds": [
+        "file:src/api.py",
+        "file:tests/test_streaming.py",
+        "document:README.md"
+      ],
+      "languageLesson": "An async generator yields response frames incrementally. StopIteration must be translated before crossing an asyncio future; a streamer end sentinel also does not prove the producer succeeded."
+    },
+    {
+      "order": 11,
+      "title": "Survive Failures and Disconnects",
+      "description": "Follow _await_connected, _is_disconnected, and _observe_completion to separate delivery lifetime from producer lifetime. Before headers errors are ordinary JSON; after headers connected clients receive sanitized error SSE without invented successful usage, and disconnected clients are not promised DONE. Held-producer tests prove that a vanished consumer cannot admit a second model call; generation is finite but not cooperatively canceled, and a stuck native worker requires process restart.",
+      "nodeIds": [
+        "file:src/api.py",
+        "file:tests/test_streaming.py",
+        "file:tests/test_api.py"
+      ]
+    },
+    {
+      "order": 12,
+      "title": "Read Evidence Before Expanding",
+      "description": "Finish with the latest practice-log entry, which separates offline behavioral tests from recorded real-Qwen HTTP, multilingual SSE, disconnect, and failure-recovery smoke runs. The next assignment is private lifecycle logging; bounded request queues, cooperative stopping, slow-consumer backpressure, batching, repeated benchmarks, quantization, and multi-model routing are not implemented here. Use the roadmap to choose one bounded learning question, not to infer nonexistent architecture from future plans.",
+      "nodeIds": [
+        "document:logs/practice.md",
+        "document:plan.md",
+        "file:tests/test_api.py",
+        "file:tests/test_inference.py",
+        "file:tests/test_streaming.py"
+      ]
+    }
+  ]
+}

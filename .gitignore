@@ -22,3 +22,9 @@ venv/
 *.bin
 *.safetensors
 *.gguf
+
+# Understand Anything local scratch and access-token logs
+.ua/intermediate/
+.ua/tmp/
+.ua/.trash-*/
+.ua/diff-overlay.json

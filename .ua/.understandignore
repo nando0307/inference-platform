@@ -1,0 +1,18 @@
+# Keep source, tests, and Markdown learning notes in the graph.
+# Exclude local environments, secrets, model weights, and generated tool state.
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+.DS_Store
+/models/
+/logs/*
+!/logs/*.md
+*.bin
+*.safetensors
+*.gguf
+.pi/
+.ua/

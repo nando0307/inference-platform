@@ -1,0 +1,1046 @@
+{
+  "version": "1.0.0",
+  "gitCommitHash": "d6d61edd1decc99c81402e4309cddc1d86d2d7d2",
+  "generatedAt": "2026-10-19T18:20:01.207Z",
+  "files": {
+    "README.md": {
+      "filePath": "README.md",
+      "contentHash": "ca5708c62019430cc577b5478fae5ce4d61bd4afd62e0c8d5b32fe85b8590236",
+      "functions": [],
+      "classes": [],
+      "imports": [],
+      "exports": [],
+      "totalLines": 343,
+      "hasStructuralAnalysis": false
+    },
+    "logs/practice.md": {
+      "filePath": "logs/practice.md",
+      "contentHash": "a2852e6354a10cdb03e79c4fee34fac98449495619ead0c87d6bdbadea420b43",
+      "functions": [],
+      "classes": [],
+      "imports": [],
+      "exports": [],
+      "totalLines": 973,
+      "hasStructuralAnalysis": false
+    },
+    "plan.md": {
+      "filePath": "plan.md",
+      "contentHash": "57394f15512a88a2506355d6bc3506704f3477ce69397ac5eb9fc595a3c670f8",
+      "functions": [],
+      "classes": [],
+      "imports": [],
+      "exports": [],
+      "totalLines": 1883,
+      "hasStructuralAnalysis": false
+    },
+    "requirements.txt": {
+      "filePath": "requirements.txt",
+      "contentHash": "e34772084edd3fe1dadc5bda601b7de7684cb36b44790762e243e89d3dab0405",
+      "functions": [],
+      "classes": [],
+      "imports": [],
+      "exports": [],
+      "totalLines": 9,
+      "hasStructuralAnalysis": false
+    },
+    "src/api.py": {
+      "filePath": "src/api.py",
+      "contentHash": "e1711aacf6334a71a18518b18e9ed6fb7856f6e650f53ff2d938644a0c84b2cd",
+      "functions": [
+        {
+          "name": "submit_inference",
+          "params": [
+            "app",
+            "request",
+            "streamer",
+            "prepared"
+          ],
+          "returnType": "asyncio.Future[GenerationResult]",
+          "exported": true,
+          "lineCount": 35
+        },
+        {
+          "name": "_run_inference",
+          "params": [
+            "runtime",
+            "request",
+            "guard",
+            "loop",
+            "streamer",
+            "prepared"
+          ],
+          "returnType": "GenerationResult",
+          "exported": true,
+          "lineCount": 27
+        },
+        {
+          "name": "_resolve_preparation",
+          "params": [
+            "future",
+            "error"
+          ],
+          "exported": true,
+          "lineCount": 7
+        },
+        {
+          "name": "_observe_completion",
+          "params": [
+            "app",
+            "future"
+          ],
+          "returnType": "None",
+          "exported": true,
+          "lineCount": 5
+        },
+        {
+          "name": "lifespan",
+          "params": [
+            "app"
+          ],
+          "exported": true,
+          "lineCount": 25
+        },
+        {
+          "name": "_error_payload",
+          "params": [
+            "code",
+            "message",
+            "request_id"
+          ],
+          "returnType": "dict",
+          "exported": true,
+          "lineCount": 2
+        },
+        {
+          "name": "_usage",
+          "params": [
+            "result"
+          ],
+          "returnType": "dict[str, int]",
+          "exported": true,
+          "lineCount": 7
+        },
+        {
+          "name": "_error_response",
+          "params": [
+            "status_code",
+            "code",
+            "message",
+            "request_id"
+          ],
+          "returnType": "JSONResponse",
+          "exported": true,
+          "lineCount": 8
+        },
+        {
+          "name": "http_error",
+          "params": [
+            "request",
+            "error"
+          ],
+          "exported": true,
+          "lineCount": 12
+        },
+        {
+          "name": "invalid_request",
+          "params": [
+            "request",
+            "error"
+          ],
+          "exported": true,
+          "lineCount": 29
+        },
+        {
+          "name": "_is_disconnected",
+          "params": [
+            "request"
+          ],
+          "returnType": "bool",
+          "exported": true,
+          "lineCount": 6
+        },
+        {
+          "name": "_await_connected",
+          "params": [
+            "request",
+            "future"
+          ],
+          "exported": true,
+          "lineCount": 13
+        },
+        {
+          "name": "_next_text",
+          "params": [
+            "streamer"
+          ],
+          "returnType": "tuple[str, str]",
+          "exported": true,
+          "lineCount": 8
+        },
+        {
+          "name": "_sse",
+          "params": [
+            "data"
+          ],
+          "returnType": "str",
+          "exported": true,
+          "lineCount": 2
+        },
+        {
+          "name": "_stream_completion",
+          "params": [
+            "request",
+            "streamer",
+            "future",
+            "request_id",
+            "created"
+          ],
+          "exported": true,
+          "lineCount": 60
+        },
+        {
+          "name": "chat_completions",
+          "params": [
+            "body",
+            "request"
+          ],
+          "exported": true,
+          "lineCount": 61
+        },
+        {
+          "name": "health",
+          "params": [],
+          "exported": true,
+          "lineCount": 2
+        },
+        {
+          "name": "ready",
+          "params": [
+            "request"
+          ],
+          "exported": true,
+          "lineCount": 15
+        }
+      ],
+      "classes": [
+        {
+          "name": "ChatMessage",
+          "methods": [
+            "require_nonblank_content"
+          ],
+          "properties": [
+            "role",
+            "content"
+          ],
+          "exported": true,
+          "lineCount": 12
+        },
+        {
+          "name": "ChatCompletionRequest",
+          "methods": [
+            "require_supported_model",
+            "require_supported_settings"
+          ],
+          "properties": [
+            "model",
+            "messages",
+            "max_tokens",
+            "temperature",
+            "top_p",
+            "stream"
+          ],
+          "exported": true,
+          "lineCount": 30
+        },
+        {
+          "name": "InferenceUnavailable",
+          "methods": [],
+          "properties": [],
+          "exported": true,
+          "lineCount": 2
+        },
+        {
+          "name": "InferenceBusy",
+          "methods": [],
+          "properties": [],
+          "exported": true,
+          "lineCount": 2
+        },
+        {
+          "name": "_DisconnectedResponse",
+          "methods": [
+            "__call__"
+          ],
+          "properties": [],
+          "exported": true,
+          "lineCount": 5
+        }
+      ],
+      "imports": [
+        {
+          "source": "asyncio",
+          "specifiers": [
+            "asyncio"
+          ]
+        },
+        {
+          "source": "json",
+          "specifiers": [
+            "json"
+          ]
+        },
+        {
+          "source": "_thread",
+          "specifiers": [
+            "LockType"
+          ]
+        },
+        {
+          "source": "concurrent.futures",
+          "specifiers": [
+            "ThreadPoolExecutor"
+          ]
+        },
+        {
+          "source": "contextlib",
+          "specifiers": [
+            "asynccontextmanager"
+          ]
+        },
+        {
+          "source": "queue",
+          "specifiers": [
+            "Empty"
+          ]
+        },
+        {
+          "source": "threading",
+          "specifiers": [
+            "Lock"
+          ]
+        },
+        {
+          "source": "time",
+          "specifiers": [
+            "time"
+          ]
+        },
+        {
+          "source": "typing",
+          "specifiers": [
+            "Literal",
+            "Self"
+          ]
+        },
+        {
+          "source": "uuid",
+          "specifiers": [
+            "uuid4"
+          ]
+        },
+        {
+          "source": "fastapi",
+          "specifiers": [
+            "FastAPI",
+            "Request"
+          ]
+        },
+        {
+          "source": "fastapi.exception_handlers",
+          "specifiers": [
+            "http_exception_handler"
+          ]
+        },
+        {
+          "source": "fastapi.exceptions",
+          "specifiers": [
+            "RequestValidationError"
+          ]
+        },
+        {
+          "source": "fastapi.responses",
+          "specifiers": [
+            "JSONResponse",
+            "Response",
+            "StreamingResponse"
+          ]
+        },
+        {
+          "source": "pydantic",
+          "specifiers": [
+            "BaseModel",
+            "ConfigDict",
+            "Field",
+            "field_validator",
+            "model_validator"
+          ]
+        },
+        {
+          "source": "pydantic_core",
+          "specifiers": [
+            "PydanticCustomError"
+          ]
+        },
+        {
+          "source": "starlette.exceptions",
+          "specifiers": [
+            "StarletteHTTPException"
+          ]
+        },
+        {
+          "source": "starlette.requests",
+          "specifiers": [
+            "ClientDisconnect"
+          ]
+        },
+        {
+          "source": "starlette.types",
+          "specifiers": [
+            "Receive",
+            "Scope",
+            "Send"
+          ]
+        },
+        {
+          "source": "transformers",
+          "specifiers": [
+            "TextIteratorStreamer"
+          ]
+        },
+        {
+          "source": ".inference",
+          "specifiers": [
+            "MODEL_ID",
+            "ContextLimitError",
+            "GenerationResult",
+            "Runtime",
+            "generate",
+            "load_runtime"
+          ]
+        }
+      ],
+      "exports": [
+        "ChatMessage",
+        "ChatCompletionRequest",
+        "InferenceUnavailable",
+        "InferenceBusy",
+        "submit_inference",
+        "_run_inference",
+        "_resolve_preparation",
+        "_observe_completion",
+        "lifespan",
+        "_error_payload",
+        "_usage",
+        "_error_response",
+        "http_error",
+        "invalid_request",
+        "_DisconnectedResponse",
+        "_is_disconnected",
+        "_await_connected",
+        "_next_text",
+        "_sse",
+        "_stream_completion",
+        "chat_completions",
+        "health",
+        "ready"
+      ],
+      "totalLines": 461,
+      "hasStructuralAnalysis": true
+    },
+    "src/architecture.py": {
+      "filePath": "src/architecture.py",
+      "contentHash": "a026cd966c9df37517340bb318747a297c1bf5164362651126962fe0ee4145f1",
+      "functions": [],
+      "classes": [],
+      "imports": [
+        {
+          "source": "torch",
+          "specifiers": [
+            "torch"
+          ]
+        },
+        {
+          "source": "transformers",
+          "specifiers": [
+            "AutoModelForCausalLM",
+            "AutoTokenizer"
+          ]
+        }
+      ],
+      "exports": [],
+      "totalLines": 72,
+      "hasStructuralAnalysis": true
+    },
+    "src/cached_generation.py": {
+      "filePath": "src/cached_generation.py",
+      "contentHash": "fffc6ee59b067f05e042d97bed58c2bc4492e06b2dcd4510993bb78145326509",
+      "functions": [],
+      "classes": [],
+      "imports": [
+        {
+          "source": "torch",
+          "specifiers": [
+            "torch"
+          ]
+        },
+        {
+          "source": "transformers",
+          "specifiers": [
+            "AutoModelForCausalLM",
+            "AutoTokenizer",
+            "GenerationConfig"
+          ]
+        },
+        {
+          "source": "time",
+          "specifiers": [
+            "perf_counter"
+          ]
+        }
+      ],
+      "exports": [],
+      "totalLines": 186,
+      "hasStructuralAnalysis": true
+    },
+    "src/inference.py": {
+      "filePath": "src/inference.py",
+      "contentHash": "8418f113c76f03cd3bf8918d0157e2fb73ffa10d075224d91a4304570ce4cfde",
+      "functions": [
+        {
+          "name": "load_runtime",
+          "params": [],
+          "returnType": "Runtime",
+          "exported": true,
+          "lineCount": 36
+        },
+        {
+          "name": "generate",
+          "params": [
+            "runtime",
+            "messages",
+            "max_new_tokens",
+            "temperature",
+            "top_p",
+            "streamer",
+            "on_prepared"
+          ],
+          "returnType": "GenerationResult",
+          "exported": true,
+          "lineCount": 78
+        }
+      ],
+      "classes": [
+        {
+          "name": "Runtime",
+          "methods": [],
+          "properties": [
+            "model",
+            "tokenizer",
+            "eos_token_ids",
+            "context_limit"
+          ],
+          "exported": true,
+          "lineCount": 5
+        },
+        {
+          "name": "GenerationResult",
+          "methods": [],
+          "properties": [
+            "text",
+            "prompt_tokens",
+            "generated_ids",
+            "finish_reason"
+          ],
+          "exported": true,
+          "lineCount": 5
+        },
+        {
+          "name": "ContextLimitError",
+          "methods": [],
+          "properties": [],
+          "exported": true,
+          "lineCount": 2
+        }
+      ],
+      "imports": [
+        {
+          "source": "collections.abc",
+          "specifiers": [
+            "Callable"
+          ]
+        },
+        {
+          "source": "dataclasses",
+          "specifiers": [
+            "dataclass"
+          ]
+        },
+        {
+          "source": "typing",
+          "specifiers": [
+            "Literal"
+          ]
+        },
+        {
+          "source": "torch",
+          "specifiers": [
+            "torch"
+          ]
+        },
+        {
+          "source": "transformers",
+          "specifiers": [
+            "AutoModelForCausalLM",
+            "AutoTokenizer",
+            "GenerationConfig",
+            "PreTrainedModel",
+            "PreTrainedTokenizerBase",
+            "TextIteratorStreamer"
+          ]
+        }
+      ],
+      "exports": [
+        "Runtime",
+        "load_runtime",
+        "GenerationResult",
+        "ContextLimitError",
+        "generate"
+      ],
+      "totalLines": 158,
+      "hasStructuralAnalysis": true
+    },
+    "src/main.py": {
+      "filePath": "src/main.py",
+      "contentHash": "6e3c84e3c77c1ae36c0f0225c3e05183f7f90e3a69969af75e63b98097a43fc0",
+      "functions": [],
+      "classes": [],
+      "imports": [
+        {
+          "source": "torch",
+          "specifiers": [
+            "torch"
+          ]
+        },
+        {
+          "source": "transformers",
+          "specifiers": [
+            "AutoModelForCausalLM",
+            "AutoTokenizer"
+          ]
+        }
+      ],
+      "exports": [],
+      "totalLines": 123,
+      "hasStructuralAnalysis": true
+    },
+    "src/uncached_generation.py": {
+      "filePath": "src/uncached_generation.py",
+      "contentHash": "93535e7679f1296041bc1782f401cda316684803895c59b0014157cea375e74a",
+      "functions": [],
+      "classes": [],
+      "imports": [
+        {
+          "source": "time",
+          "specifiers": [
+            "perf_counter"
+          ]
+        },
+        {
+          "source": "torch",
+          "specifiers": [
+            "torch"
+          ]
+        },
+        {
+          "source": "transformers",
+          "specifiers": [
+            "AutoModelForCausalLM",
+            "AutoTokenizer",
+            "GenerationConfig"
+          ]
+        }
+      ],
+      "exports": [],
+      "totalLines": 179,
+      "hasStructuralAnalysis": true
+    },
+    "tests/test_api.py": {
+      "filePath": "tests/test_api.py",
+      "contentHash": "7baece381943a388e44c71dbc4f6cd009b882acca58299491cde40ab6596a901",
+      "functions": [
+        {
+          "name": "request_data",
+          "params": [
+            "**changes"
+          ],
+          "exported": true,
+          "lineCount": 6
+        }
+      ],
+      "classes": [
+        {
+          "name": "RequestValidationTests",
+          "methods": [
+            "assert_rejected",
+            "test_valid_history_preserves_text_and_allows_consecutive_roles",
+            "test_valid_numeric_boundaries_and_integer_sampling_values",
+            "test_required_fields_and_model_identity",
+            "test_invalid_messages_and_content",
+            "test_unknown_request_and_message_fields",
+            "test_numeric_types_do_not_coerce_strings_or_booleans",
+            "test_numeric_ranges",
+            "test_nonfinite_numbers",
+            "test_stream_requires_boolean",
+            "test_greedy_top_p_combination_including_default_temperature",
+            "test_malformed_json_and_nonobject_body"
+          ],
+          "properties": [],
+          "exported": true,
+          "lineCount": 125
+        },
+        {
+          "name": "LifecycleTests",
+          "methods": [
+            "asyncSetUp",
+            "test_startup_reuses_runtime_and_shutdown_releases_resources",
+            "test_loading_failure_prevents_serving",
+            "test_executor_creation_failure_releases_loaded_runtime",
+            "test_health_remains_available_when_inference_slot_is_busy",
+            "test_uninitialized_application_does_not_claim_readiness",
+            "test_shutdown_waits_for_worker_without_blocking_http_loop"
+          ],
+          "properties": [],
+          "exported": true,
+          "lineCount": 140
+        },
+        {
+          "name": "AdmissionTests",
+          "methods": [
+            "asyncSetUp",
+            "test_unavailable_state_rejects_before_submitting_work",
+            "test_busy_rejection_and_consumer_cancellation_keep_worker_owned",
+            "test_context_and_generation_failures_release_slot_for_recovery",
+            "test_submission_failure_releases_slot_for_recovery",
+            "test_abandoned_failure_is_observed_and_does_not_leak_busy_slot"
+          ],
+          "properties": [],
+          "exported": true,
+          "lineCount": 145
+        },
+        {
+          "name": "CompletionEndpointTests",
+          "methods": [
+            "asyncSetUp",
+            "assert_error",
+            "test_validation_errors_are_private_and_precede_busy_admission",
+            "test_unavailable_application_returns_503",
+            "test_preparation_and_generation_errors_allow_later_success",
+            "test_submission_failure_returns_safe_500_and_releases_slot",
+            "test_busy_and_canceled_http_handler_retain_producer_ownership",
+            "test_unknown_routes_and_wrong_methods_keep_normal_routing"
+          ],
+          "properties": [],
+          "exported": true,
+          "lineCount": 155
+        }
+      ],
+      "imports": [
+        {
+          "source": "asyncio",
+          "specifiers": [
+            "asyncio"
+          ]
+        },
+        {
+          "source": "gc",
+          "specifiers": [
+            "gc"
+          ]
+        },
+        {
+          "source": "json",
+          "specifiers": [
+            "json"
+          ]
+        },
+        {
+          "source": "unittest",
+          "specifiers": [
+            "unittest"
+          ]
+        },
+        {
+          "source": "threading",
+          "specifiers": [
+            "Event",
+            "Timer",
+            "get_ident"
+          ]
+        },
+        {
+          "source": "unittest.mock",
+          "specifiers": [
+            "patch"
+          ]
+        },
+        {
+          "source": "uuid",
+          "specifiers": [
+            "UUID"
+          ]
+        },
+        {
+          "source": "httpx",
+          "specifiers": [
+            "httpx"
+          ]
+        },
+        {
+          "source": "pydantic",
+          "specifiers": [
+            "ValidationError"
+          ]
+        },
+        {
+          "source": "src.api",
+          "specifiers": [
+            "ChatCompletionRequest",
+            "InferenceBusy",
+            "InferenceUnavailable",
+            "app",
+            "submit_inference"
+          ]
+        },
+        {
+          "source": "src.inference",
+          "specifiers": [
+            "ContextLimitError",
+            "GenerationResult",
+            "MODEL_ID"
+          ]
+        }
+      ],
+      "exports": [
+        "request_data",
+        "RequestValidationTests",
+        "LifecycleTests",
+        "AdmissionTests",
+        "CompletionEndpointTests"
+      ],
+      "totalLines": 606,
+      "hasStructuralAnalysis": true
+    },
+    "tests/test_inference.py": {
+      "filePath": "tests/test_inference.py",
+      "contentHash": "e48a3e2c2cab60712231910f16bcfd9e444bbc544e47319e41510fcbcebd37bc",
+      "functions": [],
+      "classes": [
+        {
+          "name": "ContextBudgetTests",
+          "methods": [
+            "setUp",
+            "run_generation",
+            "test_exact_fit_keeps_full_history_and_requested_output_budget",
+            "test_one_token_over_rejects_before_preparation_and_generation",
+            "test_oversized_prompt_is_not_silently_truncated",
+            "test_earlier_turns_cannot_be_discarded_to_fit",
+            "test_preparation_precedes_model_execution_for_valid_request"
+          ],
+          "properties": [],
+          "exported": true,
+          "lineCount": 121
+        },
+        {
+          "name": "RuntimeContextLimitTests",
+          "methods": [
+            "load_with_config",
+            "test_supported_context_respects_smaller_model_and_local_cap",
+            "test_absent_or_invalid_declared_context_fails_loading"
+          ],
+          "properties": [],
+          "exported": true,
+          "lineCount": 35
+        }
+      ],
+      "imports": [
+        {
+          "source": "unittest",
+          "specifiers": [
+            "unittest"
+          ]
+        },
+        {
+          "source": "types",
+          "specifiers": [
+            "SimpleNamespace"
+          ]
+        },
+        {
+          "source": "unittest.mock",
+          "specifiers": [
+            "Mock",
+            "patch"
+          ]
+        },
+        {
+          "source": "torch",
+          "specifiers": [
+            "torch"
+          ]
+        },
+        {
+          "source": "tokenizers",
+          "specifiers": [
+            "Tokenizer"
+          ]
+        },
+        {
+          "source": "tokenizers.models",
+          "specifiers": [
+            "WordLevel"
+          ]
+        },
+        {
+          "source": "tokenizers.pre_tokenizers",
+          "specifiers": [
+            "WhitespaceSplit"
+          ]
+        },
+        {
+          "source": "transformers",
+          "specifiers": [
+            "GPT2Config",
+            "GPT2LMHeadModel",
+            "PreTrainedTokenizerFast"
+          ]
+        },
+        {
+          "source": "src.inference",
+          "specifiers": [
+            "ContextLimitError",
+            "Runtime",
+            "generate",
+            "load_runtime"
+          ]
+        }
+      ],
+      "exports": [
+        "ContextBudgetTests",
+        "RuntimeContextLimitTests"
+      ],
+      "totalLines": 176,
+      "hasStructuralAnalysis": true
+    },
+    "tests/test_streaming.py": {
+      "filePath": "tests/test_streaming.py",
+      "contentHash": "3a8acaffe5ada6404a70953f7f3fe72178514c76f6dd08aedecedc7874ed7a3c",
+      "functions": [
+        {
+          "name": "payload",
+          "params": [
+            "stream"
+          ],
+          "exported": true,
+          "lineCount": 6
+        }
+      ],
+      "classes": [
+        {
+          "name": "Connection",
+          "methods": [
+            "__init__",
+            "send",
+            "disconnect",
+            "body",
+            "events"
+          ],
+          "properties": [],
+          "exported": true,
+          "lineCount": 41
+        },
+        {
+          "name": "StreamingTests",
+          "methods": [
+            "asyncSetUp",
+            "test_incremental_content_and_truthful_terminal_usage",
+            "test_queue_timeout_is_not_a_generation_failure",
+            "test_preparation_failure_is_json_before_headers_and_recovers",
+            "test_stream_submission_failure_does_not_leave_a_preparation_waiter",
+            "test_failure_with_or_without_sentinel_has_no_success_terminal",
+            "test_disconnect_before_preparation_or_ordinary_result_sends_nothing",
+            "test_disconnect_after_content_keeps_ownership_for_both_asgi_versions"
+          ],
+          "properties": [],
+          "exported": true,
+          "lineCount": 219
+        }
+      ],
+      "imports": [
+        {
+          "source": "asyncio",
+          "specifiers": [
+            "asyncio"
+          ]
+        },
+        {
+          "source": "json",
+          "specifiers": [
+            "json"
+          ]
+        },
+        {
+          "source": "unittest",
+          "specifiers": [
+            "unittest"
+          ]
+        },
+        {
+          "source": "threading",
+          "specifiers": [
+            "Event"
+          ]
+        },
+        {
+          "source": "types",
+          "specifiers": [
+            "SimpleNamespace"
+          ]
+        },
+        {
+          "source": "unittest.mock",
+          "specifiers": [
+            "Mock",
+            "patch"
+          ]
+        },
+        {
+          "source": "httpx",
+          "specifiers": [
+            "httpx"
+          ]
+        },
+        {
+          "source": "src.api",
+          "specifiers": [
+            "app"
+          ]
+        },
+        {
+          "source": "src.inference",
+          "specifiers": [
+            "ContextLimitError",
+            "GenerationResult",
+            "MODEL_ID"
+          ]
+        }
+      ],
+      "exports": [
+        "payload",
+        "Connection",
+        "StreamingTests"
+      ],
+      "totalLines": 288,
+      "hasStructuralAnalysis": true
+    }
+  }
+}

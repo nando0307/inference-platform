@@ -12,6 +12,61 @@ Read [the session handoff in logs/practice.md](logs/practice.md) before continui
 with a new mentor. It records inference experiments, verified API checkpoints,
 and the next task. Use [plan.md](plan.md) for the broader roadmap.
 
+## Explore the codebase with Understand Anything
+
+[Understand Anything](https://github.com/Egonex-AI/Understand-Anything) is a
+separate developer tool, not part of the inference API or Python dependencies.
+The project graph lives in `.ua/knowledge-graph.json`, with architectural layers
+and a guided tour covering source, tests, and learning documentation.
+`.ua/.understandignore` excludes secrets, environments, model weights, and scratch files.
+
+### In Pi
+
+The official installer downloads the tool to `~/.understand-anything/repo` and
+links its skills into `~/.agents/skills` (available across projects). On a new
+machine, install Node.js 22+ and pnpm 10+, then:
+
+```bash
+git clone https://github.com/Egonex-AI/Understand-Anything.git ~/.understand-anything/repo
+bash ~/.understand-anything/repo/install.sh pi
+```
+
+Restart Pi in this repository, then use:
+
+```text
+/skill:understand
+/skill:understand-dashboard
+/skill:understand-chat Explain the streaming request lifecycle
+```
+
+Analysis uses your coding agent/model; it does not call this project's Qwen API.
+Re-run `/skill:understand` after code changes; use `/skill:understand --full` to
+force a rebuild, including uncommitted edits at the same Git commit. Automatic
+updates are disabled; no Git hooks are installed.
+
+### Dashboard without an agent
+
+The v2.9.7 release viewer download was unavailable, so this installation uses
+the locally built viewer. On a new machine, build it once after installation:
+
+```bash
+cd ~/.understand-anything/repo
+npx --yes pnpm@10.6.2 install --frozen-lockfile
+npx --yes pnpm@10.6.2 --filter understand-anything-viewer build
+```
+
+Then, from this project's repository root:
+
+```bash
+node "$HOME/.understand-anything-plugin/packages/viewer/bin/viewer.mjs" "$PWD"
+```
+
+Open the full localhost URL printed by the viewer, including `?token=...`.
+The viewer is local and read-only; no LLM/API key is needed. Stop it with Ctrl-C.
+Commit the graph, config, metadata, fingerprints, and ignore rules in `.ua/` to
+share the analysis; scratch output is ignored by Git. Review generated summaries
+before sharing them outside the project.
+
 ## Run the local application
 
 From the repository root, using the existing project environment:
