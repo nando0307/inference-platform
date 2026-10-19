@@ -477,13 +477,11 @@ one runtime.
   and top-p numbers.
 - [x] Reject tools, image content, `n`, client `top_k`, `stop`, `seed`,
   `stream_options`, and all other unsupported fields.
-- [x] Until Checkpoint 9, reject `stream=true` with HTTP 422 and code
-  `unsupported_parameter`; remove this temporary restriction when streaming
-  is implemented.
+- [x] Remove the temporary `stream=true` rejection once Checkpoint 9 implements
+  streaming.
 
-The request models and temporary streaming rejection are verified through the
-HTTP endpoint added in Checkpoint 8. `stream=true` returns HTTP 422 with
-`unsupported_parameter` until the streaming checkpoint.
+The HTTP endpoint verifies these request models. Checkpoint 9 now supports
+`stream=true`; the temporary `unsupported_parameter` error has been removed.
 
 This is a documented chat-completions subset, not full OpenAI API compatibility.
 
@@ -565,7 +563,7 @@ policy, not a claim about Qwen's architectural maximum.
 - [x] Do not truncate messages, discard history, or reduce the output cap.
 - [x] Accept exact fits and reject one token over.
 - [x] Validate before `model.generate()` and the preparation callback.
-- [ ] Validate before SSE headers are committed when the HTTP stream exists.
+- [x] Validate before SSE headers are committed when the HTTP stream exists.
 
 **Exercise:** Use the actual tokenizer to find a near-boundary prompt. Test an
 output cap that exactly fits, then increase it by one. Repeat for streaming
@@ -577,8 +575,10 @@ Qwen four-message prompt contained 1943 formatted tokens; an output allowance
 of 105 fit the 2048-token limit, while 106 raised `ContextLimitError` before
 preparation or generation. Rejection also passed with a library streamer
 supplied. Checkpoint 8 later verified ordinary HTTP 400 rejection, including a
-2020-token prompt with output caps 28 (accepted) and 29 (rejected). Pre-SSE-header
-validation remains pending. The production budget code required no changes.
+2020-token prompt with output caps 28 (accepted) and 29 (rejected). Checkpoint 9
+repeated these boundaries over streaming HTTP: exact-fit success reported 23
+actual completion tokens; one-token-over and oversized input returned ordinary
+HTTP 400 JSON before SSE headers. The production budget code required no changes.
 
 **Done when:** Actual formatted-token counts enforce both boundaries.
 
@@ -651,10 +651,10 @@ Implement this before accepting the first generation request.
 - [x] If submission fails before the producer starts, release the guard in the
   submitting path and propagate the failure.
 - [x] Map submission failure to HTTP 500 `generation_failed`.
-- [ ] Verify ownership when a real HTTP client disconnects.
-- [ ] For streaming, maintain a per-request preparation signal resolved by
+- [x] Verify ownership when a real HTTP client disconnects.
+- [x] For streaming, maintain a per-request preparation signal resolved by
   `on_prepared()` or by preparation failure. Never leave it unresolved.
-- [ ] Await preparation before returning `StreamingResponse`.
+- [x] Await preparation before returning `StreamingResponse`.
 
 Do not call blocking generation, queue reads, or thread joins on the event loop.
 Do not use an `asyncio.Lock` that makes excess requests wait.
@@ -672,8 +672,8 @@ suite. A real-Qwen harness verified live health 200/readiness 503 busy, immediat
 Python busy rejection, retained ownership after consumer cancellation, context
 and controlled-forward-failure recovery, and readiness 200 afterward, with one
 model load. Checkpoint 8 subsequently verified HTTP completions and error mapping,
-including 429 overlap and failure recovery. Real network disconnects and the
-streaming preparation signal remain pending.
+including 429 overlap and failure recovery. Checkpoints 9-10 subsequently verified
+the preparation signal and real TCP disconnect ownership for both response modes.
 
 **Done when:** At most one producer uses the model/tokenizer while HTTP remains
 responsive.
@@ -712,7 +712,6 @@ responsive.
 |---|---|
 | 422 | `invalid_request`: malformed JSON, missing/unknown fields, invalid types/ranges, unsupported model or roles |
 | 422 | `invalid_parameter_combination`: incompatible supported settings |
-| 422 | `unsupported_parameter`: streaming before Checkpoint 9 |
 | 400 | `context_length_exceeded`: combined token budget exceeded |
 | 429 | `server_busy`: an admitted producer owns inference |
 | 503 | `not_ready`: unavailable or shutting down |
@@ -743,23 +742,23 @@ reasons.
 
 **Question:** Are you streaming tokens, text, or HTTP events?
 
-- [ ] Remove the temporary rejection of `stream=true`.
-- [ ] Reread the installed `TextIteratorStreamer` implementation before building
+- [x] Remove the temporary rejection of `stream=true`.
+- [x] Reread the installed `TextIteratorStreamer` implementation before building
   the consumer.
-- [ ] Create one streamer per request with `skip_prompt=True`,
+- [x] Create one streamer per request with `skip_prompt=True`,
   `skip_special_tokens=True`, `clean_up_tokenization_spaces=False`, and
   `timeout=0.1`.
-- [ ] Pass it into the same admitted producer and reusable `generate()`.
+- [x] Pass it into the same admitted producer and reusable `generate()`.
   Do not introduce a second model-execution thread or generation algorithm.
-- [ ] Read its blocking queue off the event loop.
-- [ ] Translate iterator outcomes into plain text/timeout/end values; do not
+- [x] Read its blocking queue off the event loop.
+- [x] Translate iterator outcomes into plain text/timeout/end values; do not
   propagate `StopIteration` through an asyncio future.
-- [ ] On timeout, recheck producer completion/error and client connectivity.
+- [x] On timeout, recheck producer completion/error and client connectivity.
   Timeout alone is not failure.
-- [ ] End promptly on producer failure, even without a streamer sentinel.
-- [ ] If the sentinel arrives first, await the producer result before declaring
+- [x] End promptly on producer failure, even without a streamer sentinel.
+- [x] If the sentinel arrives first, await the producer result before declaring
   successful termination.
-- [ ] Skip empty text chunks and count tokens from producer-generated IDs.
+- [x] Skip empty text chunks and count tokens from producer-generated IDs.
   Do not re-tokenize streamed text or independently decode each token.
 
 Use `Content-Type: text/event-stream`, `Cache-Control: no-cache`, and frames
@@ -787,6 +786,14 @@ an explicitly documented local extension; `stream_options` remains unsupported.
 - Inspect chunk boundaries: chunks are not token counts, and some tokens do not
   immediately produce printable text.
 
+Verified with real Qwen and `curl -N`: Chinese text/punctuation, Portuguese
+diacritics/punctuation, and an English token-cap response each delivered nonempty
+content before producer completion and matched ordinary greedy output exactly.
+Counts came from actual IDs: 5 tokens in 3 content chunks for Chinese, 18 in 5
+chunks for Portuguese, and 24 in 17 chunks for the capped English response.
+EOS cases ended with `stop`, the capped case with `length`, and every connected
+success ended with truthful terminal usage and exactly one `[DONE]`.
+
 **Done when:** Incremental content arrives before completion and ends with
 truthful metadata and one `[DONE]`.
 
@@ -794,18 +801,18 @@ truthful metadata and one `[DONE]`.
 
 **Question:** Who owns inference after a client disappears?
 
-- [ ] Before headers, return ordinary HTTP errors using Checkpoint 8.
-- [ ] After headers, do not attempt to rewrite HTTP status. On producer failure,
+- [x] Before headers, return ordinary HTTP errors using Checkpoint 8.
+- [x] After headers, do not attempt to rewrite HTTP status. On producer failure,
   emit the same error envelope as SSE with code `generation_failed`, if still
   connected, followed by `[DONE]`.
-- [ ] Do not emit a successful terminal finish reason or fabricated usage for
+- [x] Do not emit a successful terminal finish reason or fabricated usage for
   incomplete generation.
-- [ ] On disconnect, stop delivering output but retain admission until the
+- [x] On disconnect, stop delivering output but retain admission until the
   producer actually exits.
-- [ ] Let finite generation finish under existing caps, discard undelivered
+- [x] Let finite generation finish under existing caps, discard undelivered
   output, reclaim request state, and observe any producer exception.
-- [ ] Do not spawn another model call because the HTTP coroutine was canceled.
-- [ ] Verify a later request succeeds after a failed producer exits.
+- [x] Do not spawn another model call because the HTTP coroutine was canceled.
+- [x] Verify a later request succeeds after a failed producer exits.
 
 The library queue is not intrinsically bounded, but this stage admits only one
 producer with at most 512 generated tokens. Explicit slow-consumer backpressure
@@ -820,6 +827,22 @@ while inference remains active and success afterward. Inject a controlled
 generation failure; confirm stream termination without a missing-sentinel hang,
 then successful recovery. Use a deterministic held producer in regression tests
 to prove ownership rather than relying on a race with natural completion.
+
+Verified with actual TCP sockets and a real Qwen runtime: ordinary and streaming
+handlers exited after client disconnect while the held worker still owned
+admission. Health stayed 200, readiness was 503 busy, and overlapping completion
+requests returned 429. An ordinary disconnected producer then failed; a streaming
+disconnected producer finished its 24-token cap. Both drained and recovered.
+A connected stream failed after its fourth successful forward call and emitted
+sanitized SSE error plus `[DONE]`, without success metadata or a sentinel hang.
+Each case returned to readiness 200 and served a later real completion.
+
+The full suite has 42 passing tests, including deterministic held-producer
+regressions for both ASGI disconnect mechanisms, pre-header failure, missing
+sentinel, sentinel-before-producer-result, timeout, and truthful terminal usage.
+The suite also exposed a disconnect-probe cancellation race; cancellation now
+propagates without releasing the producer's slot. Smoke processes shut down with
+no retained producers, unhandled loop failures, or remaining runtime/executor.
 
 **Done when:** Neither failures nor disconnects leak ownership or release it
 before model work ends.

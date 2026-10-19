@@ -137,11 +137,10 @@ class RequestValidationTests(unittest.TestCase):
                 with self.subTest(field=field, value=value):
                     self.assert_rejected(request_data(**{field: value}))
 
-    def test_stream_requires_boolean_and_rejects_unsupported_streaming(self):
+    def test_stream_requires_boolean(self):
         for value in ("false", "true", 0, 1, None):
             with self.subTest(value=value):
                 self.assert_rejected(request_data(stream=value), "bool_type")
-        self.assert_rejected(request_data(stream=True), "unsupported_parameter")
 
     def test_greedy_top_p_combination_including_default_temperature(self):
         self.assert_rejected(request_data(top_p=0.9), "invalid_parameter_combination")
@@ -486,7 +485,6 @@ class CompletionEndpointTests(unittest.IsolatedAsyncioTestCase):
             (request_data(**{marker: marker}), "invalid_request"),
             (request_data(messages=[{"role": "user", "content": marker, marker: marker}]), "invalid_request"),
             (request_data(top_p=0.9), "invalid_parameter_combination"),
-            (request_data(stream=True), "unsupported_parameter"),
         ]
         app.state.admission_guard.acquire()
         try:

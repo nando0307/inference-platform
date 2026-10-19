@@ -1,7 +1,9 @@
 import asyncio
+import json
 from _thread import LockType
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from queue import Empty
 from threading import Lock
 from time import time
 from typing import Literal, Self
@@ -10,10 +12,13 @@ from uuid import uuid4
 from fastapi import FastAPI, Request
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_core import PydanticCustomError
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.requests import ClientDisconnect
+from starlette.types import Receive, Scope, Send
+from transformers import TextIteratorStreamer
 
 from .inference import (
     MODEL_ID,
@@ -68,11 +73,6 @@ class ChatCompletionRequest(BaseModel):
                 "invalid_parameter_combination",
                 "Greedy decoding requires top_p=1.0.",
             )
-        if self.stream:
-            raise PydanticCustomError(
-                "unsupported_parameter",
-                "Streaming is not supported yet.",
-            )
         return self
 
 
@@ -85,7 +85,11 @@ class InferenceBusy(RuntimeError):
 
 
 def submit_inference(
-    app: FastAPI, request: ChatCompletionRequest
+    app: FastAPI,
+    request: ChatCompletionRequest,
+    *,
+    streamer: TextIteratorStreamer | None = None,
+    prepared: asyncio.Future[None] | None = None,
 ) -> asyncio.Future[GenerationResult]:
     """Admit a validated request on the event loop and return a protected result."""
     loop = asyncio.get_running_loop()
@@ -94,13 +98,18 @@ def submit_inference(
         raise InferenceUnavailable("Inference is not available.")
     if not state.admission_guard.acquire(blocking=False):
         raise InferenceBusy("Another inference request is running.")
+    if prepared is not None:
+        prepared.add_done_callback(lambda future: _observe_completion(app, future))
 
     try:
         producer = loop.run_in_executor(
-            state.executor, _run_inference, state.runtime, request, state.admission_guard
+            state.executor, _run_inference, state.runtime, request, state.admission_guard,
+            loop, streamer, prepared,
         )
-    except Exception:
+    except Exception as error:
         state.admission_guard.release()
+        if prepared is not None:
+            _resolve_preparation(prepared, error)
         raise
 
     state.producer_futures.add(producer)
@@ -113,8 +122,16 @@ def submit_inference(
 
 
 def _run_inference(
-    runtime: Runtime, request: ChatCompletionRequest, guard: LockType
+    runtime: Runtime,
+    request: ChatCompletionRequest,
+    guard: LockType,
+    loop: asyncio.AbstractEventLoop,
+    streamer: TextIteratorStreamer | None,
+    prepared: asyncio.Future[None] | None,
 ) -> GenerationResult:
+    def on_prepared():
+        loop.call_soon_threadsafe(_resolve_preparation, prepared, None)
+
     try:
         return generate(
             runtime,
@@ -122,12 +139,27 @@ def _run_inference(
             max_new_tokens=request.max_tokens,
             temperature=request.temperature,
             top_p=request.top_p,
+            streamer=streamer,
+            on_prepared=on_prepared if prepared is not None else None,
         )
+    except BaseException as error:
+        if prepared is not None:
+            loop.call_soon_threadsafe(_resolve_preparation, prepared, error)
+        raise
     finally:
         guard.release()
 
 
-def _observe_completion(app: FastAPI, future: asyncio.Future[GenerationResult]) -> None:
+def _resolve_preparation(future: asyncio.Future[None], error: BaseException | None):
+    # Runs on the event loop; failure may follow an already-signaled preparation.
+    if not future.done():
+        if error is None:
+            future.set_result(None)
+        else:
+            future.set_exception(error)
+
+
+def _observe_completion(app: FastAPI, future: asyncio.Future) -> None:
     app.state.producer_futures.discard(future)
     if not future.cancelled():
         # Observing does not consume the exception for other awaiters.
@@ -165,14 +197,25 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
+def _error_payload(code: str, message: str, request_id: str) -> dict:
+    return {"error": {"code": code, "message": message, "request_id": request_id}}
+
+
+def _usage(result: GenerationResult) -> dict[str, int]:
+    completion_tokens = len(result.generated_ids)
+    return {
+        "prompt_tokens": result.prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": result.prompt_tokens + completion_tokens,
+    }
+
+
 def _error_response(
     status_code: int, code: str, message: str, request_id: str
 ) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
-        content={
-            "error": {"code": code, "message": message, "request_id": request_id}
-        },
+        content=_error_payload(code, message, request_id),
         headers={"X-Request-ID": request_id},
     )
 
@@ -200,9 +243,6 @@ async def invalid_request(request: Request, error: RequestValidationError):
     if error_type == "invalid_parameter_combination":
         code = error_type
         message = "Greedy decoding requires top_p=1.0."
-    elif error_type == "unsupported_parameter":
-        code = error_type
-        message = "Streaming is not supported yet."
     else:
         code = "invalid_request"
         # Never serialize raw validation inputs, contexts, messages, or field names.
@@ -227,12 +267,143 @@ async def invalid_request(request: Request, error: RequestValidationError):
     return _error_response(422, code, message, request_id)
 
 
+class _DisconnectedResponse(Response):
+    """Finish the ASGI call without sending to a connection already known closed."""
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        return
+
+
+async def _is_disconnected(request: Request) -> bool:
+    disconnected = await request.is_disconnected()
+    # Starlette's AnyIO probe can consume a concurrent Task.cancel(). Preserve it.
+    if asyncio.current_task().cancelling():
+        raise asyncio.CancelledError()
+    return disconnected
+
+
+async def _await_connected(request: Request, future: asyncio.Future):
+    try:
+        while not future.done():
+            if await _is_disconnected(request):
+                raise ClientDisconnect()
+            await asyncio.wait({future}, timeout=0.1)
+        if await _is_disconnected(request):
+            raise ClientDisconnect()
+        return future.result()
+    except (ClientDisconnect, asyncio.CancelledError):
+        # All result futures passed here are shielded; producer ownership stays intact.
+        future.cancel()
+        raise
+
+
+def _next_text(streamer: TextIteratorStreamer) -> tuple[str, str]:
+    # StopIteration must not cross an asyncio Future boundary.
+    try:
+        return "text", next(streamer)
+    except Empty:
+        return "timeout", ""
+    except StopIteration:
+        return "end", ""
+
+
+def _sse(data: dict) -> str:
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+async def _stream_completion(
+    request: Request,
+    streamer: TextIteratorStreamer,
+    future: asyncio.Future[GenerationResult],
+    request_id: str,
+    created: int,
+):
+    base = {
+        "id": f"chatcmpl-{request_id}",
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": MODEL_ID,
+    }
+
+    def chunk(delta, finish_reason=None, usage=None):
+        data = {
+            **base,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
+        if usage is not None:
+            data["usage"] = usage
+        return _sse(data)
+
+    try:
+        if await _is_disconnected(request):
+            return
+        yield chunk({"role": "assistant"})
+        while True:
+            if await _is_disconnected(request):
+                return
+            producer_done = future.done()
+            if producer_done:
+                future.result()  # Detect failure even without a streamer sentinel.
+            outcome, text = await asyncio.to_thread(_next_text, streamer)
+            if await _is_disconnected(request):
+                return
+            if outcome == "text":
+                if text:
+                    yield chunk({"content": text})
+            elif outcome == "end":
+                result = await _await_connected(request, future)
+                break
+            elif producer_done:
+                # Work was complete before the empty queue read, so no text is lost.
+                result = future.result()
+                break
+        yield chunk({}, result.finish_reason, _usage(result))
+        yield "data: [DONE]\n\n"
+    except ClientDisconnect:
+        return
+    except Exception:
+        if await _is_disconnected(request):
+            return
+        yield _sse(_error_payload(
+            "generation_failed", "The completion could not be generated.", request_id
+        ))
+        yield "data: [DONE]\n\n"
+    finally:
+        # This is the shielded delivery future, never the retained producer.
+        future.cancel()
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(body: ChatCompletionRequest, request: Request):
     request_id = uuid4().hex
     created = int(time())
     try:
-        result = await submit_inference(request.app, body)
+        if body.stream:
+            state = request.app.state
+            if not getattr(state, "initialized", False) or state.shutting_down:
+                raise InferenceUnavailable("Inference is not available.")
+            streamer = TextIteratorStreamer(
+                state.runtime.tokenizer,
+                skip_prompt=True,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+                timeout=0.1,
+            )
+            prepared = asyncio.get_running_loop().create_future()
+            future = submit_inference(
+                request.app, body, streamer=streamer, prepared=prepared
+            )
+            await _await_connected(request, asyncio.shield(prepared))
+            if future.done():
+                future.result()  # A failure already known before headers is still HTTP.
+            return StreamingResponse(
+                _stream_completion(request, streamer, future, request_id, created),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Request-ID": request_id},
+            )
+        result = await _await_connected(request, submit_inference(request.app, body))
+    except ClientDisconnect:
+        return _DisconnectedResponse()
     except InferenceUnavailable:
         return _error_response(503, "not_ready", "Inference is not available.", request_id)
     except InferenceBusy:
@@ -247,7 +418,6 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             500, "generation_failed", "The completion could not be generated.", request_id
         )
 
-    completion_tokens = len(result.generated_ids)
     return JSONResponse(
         content={
             "id": f"chatcmpl-{request_id}",
@@ -261,11 +431,7 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
                     "finish_reason": result.finish_reason,
                 }
             ],
-            "usage": {
-                "prompt_tokens": result.prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": result.prompt_tokens + completion_tokens,
-            },
+            "usage": _usage(result),
         },
         headers={"X-Request-ID": request_id},
     )

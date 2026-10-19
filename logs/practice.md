@@ -14,12 +14,12 @@ prompt timing comparisons, KV tensor storage inspection, token-ID comparisons
 against Hugging Face `generate()` for token-limit and EOS stopping, and an
 initial synchronized CPU/MPS float32 comparison. Do not restart the basics.
 
-The next milestone discussed is a minimal single-worker HTTP server using
-Transformers `generate()`, retaining the manual scripts as learning references.
-Manual top-k/top-p lessons were explicitly skipped, not completed. No server
-has been implemented or authorized by this documentation update.
-The stable roadmap is [plan.md](../plan.md); its checkboxes are not a live
-completion ledger. Use this handoff and the actual code for the current state.
+Current API state: Stage 2 Checkpoints 1-10 are implemented and verified, including
+ordinary HTTP completions, incremental SSE, and disconnect ownership. The next
+task is Checkpoint 11, private lifecycle logging. See the latest checkpoint
+entry at the end of this file; earlier entries describe the state at that time.
+Manual top-k/top-p lessons were explicitly skipped, not completed. Use the
+stable roadmap [plan.md](../plan.md), this evidence log, and actual code together.
 
 ## Mentoring and edit permissions
 
@@ -869,14 +869,104 @@ README now documents the ordinary curl request, supported fields, response
 metadata, error codes, and remaining scope. The plan marks previously pending
 HTTP acceptance criteria from Checkpoints 3-7 only where now verified.
 
-Next task: Checkpoint 9, implement incremental SSE using the same producer path.
-Add a per-request preparation signal before committing stream headers, remove
-the temporary stream=true rejection, and preserve actual generated-token usage.
-Real network-disconnect handling and lifecycle logging remain later checkpoints.
+## Checkpoints 9 and 10: streaming and disconnect ownership
+
+The learner explicitly selected implementing Checkpoints 9 and 10 together.
+`src/api.py` now accepts `stream=true` and passes a per-request
+`TextIteratorStreamer` through the existing single admitted producer. Its
+configuration skips prompt/special tokens, preserves decode spacing, and uses a
+0.1-second queue timeout. No inference algorithm or dependency changes were needed.
+
+A preparation future resolves after formatting, tokenization, context validation,
+and generation configuration, or with preparation failure. The endpoint waits
+before returning SSE. Queue reads run off the event loop and translate text,
+timeout, and sentinel into ordinary values. A timeout is not failure; producer
+failure terminates delivery even without a sentinel. A sentinel alone is not
+success: the consumer waits for the producer result.
+
+Successful SSE sends an assistant-role chunk, nonempty content chunks, an empty
+terminal delta with actual finish reason and usage, then exactly one `[DONE]`.
+ID, model, and creation time stay consistent. Terminal usage is a documented
+local extension; `stream_options` remains unsupported. Counts use generated
+IDs, including invisible EOS, rather than chunk count or re-tokenized text.
+Known pre-header failures use ordinary HTTP errors. Post-header producer failure
+sends sanitized `generation_failed` SSE and `[DONE]` if connected, with no
+successful terminal finish reason or fabricated usage.
+
+Both ordinary and streaming handlers now stop delivery after detected disconnect,
+while the retained producer alone owns admission until actual exit. A closed
+pre-header connection receives no fabricated HTTP response. Abandoned producer
+errors remain observed. Finite generation runs under the existing cap rather
+than pretending a canceled coroutine stops native model computation.
+
+Seven new streaming/ownership regressions cover:
+- Incremental content before producer completion and token-based terminal usage.
+- Empty queue timeouts without false failure.
+- Preparation failure before headers and later recovery.
+- Submission failure without an unresolved preparation waiter.
+- Failure both without a sentinel and after a sentinel precedes the result.
+- Ordinary/preparation disconnects without sending a response or freeing admission.
+- Post-content disconnect ownership under ASGI 2.3 and 2.4 response mechanisms.
+
+The first full run exposed a real cancellation race in the existing ordinary
+HTTP test: Starlette's AnyIO disconnect probe could consume concurrent task
+cancellation. The probe wrapper now preserves pending `Task.cancel()` state.
+After the fix, `.venv/bin/python -m unittest discover -s tests -v` passed all
+42 tests. The obsolete streaming-rejection expectations were removed.
+
+Real-Qwen Uvicorn smoke runs used temporary in-memory harnesses, ephemeral
+localhost ports, actual `curl -N` subprocesses, HTTPX, and TCP connections.
+Each process loaded one CPU float32 runtime. Greedy SSE and ordinary output
+matched byte-for-byte for these observed cases:
+
+| Case | Prompt / completion / total tokens | Content chunks | Finish |
+|---|---|---|---|
+| Chinese text and punctuation | 47 / 5 / 52 | 3 | `stop` |
+| Portuguese diacritics and punctuation | 54 / 18 / 72 | 5 | `stop` |
+| English list capped at 24 tokens | 43 / 24 / 67 | 17 | `length` |
+
+Every case delivered nonempty content before producer completion. Both EOS
+cases ended with token ID 151645, included in usage. The Portuguese response was
+`Olá, café! (ação) 1,23? (ação)`; generation parity does not imply perfect
+instruction following. The Chinese response was `你好，世界！`. These are
+correctness observations, not latency benchmarks.
+
+Streaming context boundaries were also exercised with the real tokenizer:
+a 2020-token formatted prompt plus cap 28 exactly fit 2048 and returned
+23 actual completion tokens. Cap 29 and oversized input returned HTTP 400 JSON
+`context_length_exceeded` before SSE headers.
+
+Real disconnect/failure evidence used controlled gates around actual Qwen
+forward calls, without adding a public failure-injection endpoint:
+- Ordinary TCP client closed while the producer was held after one successful
+  forward call. The HTTP handler exited while admission stayed occupied.
+  Releasing the gate raised a controlled model failure, which was observed.
+- Streaming TCP client closed after receiving nonempty content. Its handler
+  exited while the worker retained admission, then the worker finished its
+  24-token cap after release.
+- A connected stream failed after its fourth successful forward call. It kept
+  HTTP 200, emitted sanitized error SSE plus exactly one `[DONE]`, and emitted
+  neither successful terminal metadata nor fabricated usage. No streamer
+  sentinel was needed to end the failed response.
+- During every held call, health returned 200, readiness returned 503 busy, and
+  another valid completion returned 429. After worker exit, readiness returned
+  200 and a real recovery request returned `4`.
+- All smoke processes exited with code 0 and released runtime, executor, and
+  retained producers. The ownership harness observed no unhandled loop failures.
+  No temporary scripts, server processes, or failure hooks remain.
+
+README now documents streaming curl usage, frame semantics, the local usage
+extension, error boundaries, and disconnect ownership. The plan marks completed
+Checkpoints 9-10 and their previously deferred context/admission criteria.
+
+Next task: Checkpoint 11, standard-library JSON lifecycle logging with private
+request metadata and outcomes. Server-generated request IDs already exist;
+structured lifecycle logging is not implemented. Cooperative model stopping,
+bounded slow-consumer backpressure, and native-call recovery are not claimed.
+A permanently stuck producer requires process restart.
 
 Still not established: a formal temperature study, manual top-k/top-p filtering
 (explicitly skipped), repeated statistical benchmarks, total/peak process-memory
 profiling, load/concurrency benchmarks, batching experiments, and precision/
-quantization comparisons. HTTP streaming, real network-disconnect behavior, and
-structured lifecycle logging remain incomplete; the whole roadmap is not complete.
+quantization comparisons. The whole roadmap is not complete.
 

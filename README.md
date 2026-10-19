@@ -78,7 +78,7 @@ This is a supported chat-completions subset, not full OpenAI API compatibility.
 | `max_tokens` | Integer from 1 through 512, counting new output tokens | 100 |
 | `temperature` | Finite number from 0 through 2; zero selects greedy decoding | 0 |
 | `top_p` | Finite number greater than 0 and at most 1; must be 1 for greedy decoding | 1 |
-| `stream` | Boolean; currently only false is supported | false |
+| `stream` | Boolean; true selects incremental SSE, false selects ordinary JSON | false |
 
 Numeric strings, booleans used as numbers, and unknown request/message fields
 are rejected. Tools, images, `n`, `top_k`, `stop`, `seed`, and `stream_options`
@@ -103,7 +103,6 @@ field names; unexpected failures do not expose exception text or tracebacks.
 |---|---|---|
 | 422 | `invalid_request` | Invalid JSON, schema, types, ranges, model, or fields |
 | 422 | `invalid_parameter_combination` | Greedy decoding with non-default top-p |
-| 422 | `unsupported_parameter` | `stream=true` before streaming is implemented |
 | 400 | `context_length_exceeded` | Formatted prompt plus requested output exceeds the supported context |
 | 429 | `server_busy` | Another producer owns inference; no waiting queue |
 | 503 | `not_ready` | Application unavailable or shutting down |
@@ -114,7 +113,38 @@ declared context. Exact fits are accepted; excess input is rejected without
 truncation, dropping history, or reducing the requested cap. Normal unknown
 routes and wrong methods retain HTTP 404/405 behavior.
 
-Streaming and explicit network-disconnect handling remain later checkpoints.
+## Stream a chat completion
+
+```bash
+curl -N http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "Qwen/Qwen2.5-0.5B-Instruct",
+    "messages": [{"role": "user", "content": "List five animals."}],
+    "max_tokens": 64,
+    "stream": true
+  }'
+```
+
+The response uses `Content-Type: text/event-stream`, `Cache-Control: no-cache`,
+and `data: <JSON>\n\n` frames. Each completion chunk has the same ID, model,
+creation timestamp, and `object: "chat.completion.chunk"`:
+
+1. Initial chunk: `choices[0].delta` is `{"role":"assistant"}`.
+2. Nonempty content chunks: newly decoded text in `choices[0].delta.content`.
+3. Successful terminal chunk: empty delta, actual `finish_reason`, and top-level
+   `usage`. Earlier chunks have a null finish reason and no usage.
+4. Exactly one `data: [DONE]\n\n` frame ends a connected successful stream.
+
+Terminal usage is a **local extension**; `stream_options` remains unsupported.
+Text chunks are not tokens. Counts come from generated IDs, including EOS,
+using the same generation path and decode settings as ordinary responses.
+
+Formatting, tokenization, and context validation finish before SSE headers.
+Failures known before the response starts use the ordinary HTTP error table.
+After headers, a producer failure retains HTTP 200 and sends the error envelope
+as SSE with code `generation_failed`, followed by `[DONE]`, if still connected.
+It does not send a successful finish reason or fabricated usage.
 
 ### Execution ownership
 
@@ -129,9 +159,20 @@ generation, releasing the guard only when its work exits. The returned result
 is already shielded: canceling its consumer does not cancel the retained producer
 or free the slot early. Completion callbacks observe errors even when delivery
 is abandoned; they do not log raw exception text. Shutdown drains producer
-completion before clearing the runtime. HTTP error mapping now uses this path.
-Handler cancellation ownership is covered by controlled ASGI tests; real
-network-disconnect handling remains to be verified separately.
+completion before clearing the runtime.
+
+For both response modes, a detected disconnect ends delivery, not inference.
+The finite producer keeps running under the requested cap, and new requests
+still receive 429 until it exits. Undelivered output is discarded. A disconnected
+client is not promised a terminal event or `[DONE]`. Canceling a Python future
+cannot safely kill a stuck native call: inference remains occupied, and process
+restart is required rather than launching a replacement over the same model.
+
+The library streamer queue is not intrinsically bounded. This stage permits
+only one producer and at most 512 generated tokens; explicit slow-consumer
+backpressure and cooperative stopping remain later work. Real TCP disconnects
+and controlled forward failures have been verified with Qwen, alongside
+deterministic ASGI ownership regressions.
 
 ## Run behavioral tests
 
@@ -140,9 +181,11 @@ network-disconnect handling remains to be verified separately.
 ```
 
 The suite covers request validation, context budgets, lifecycle transitions,
-busy admission, consumer cancellation, and failure recovery. It uses offline
-inference fixtures and controlled worker resources; `httpx` is the HTTP test
-client. Real-Qwen smoke evidence is recorded separately in `logs/practice.md`.
+busy admission, consumer cancellation, SSE progress and terminal metadata,
+preparation/producer failures, and disconnect ownership. It uses offline
+inference fixtures and controlled worker resources. HTTPX covers ordinary
+requests; direct ASGI connections expose streaming frames without buffering.
+Real-Qwen HTTP smoke evidence is recorded separately in `logs/practice.md`.
 
 ## Inspect tokenization and two-token generation
 
