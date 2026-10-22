@@ -851,19 +851,19 @@ before model work ends.
 
 **Question:** How do you diagnose failures without saving conversations?
 
-- [ ] Use standard Python logging with JSON records.
-- [ ] Generate a server-side UUID per chat request; do not trust an arbitrary
+- [x] Use standard Python logging with JSON records.
+- [x] Generate a server-side UUID per chat request; do not trust an arbitrary
   incoming identifier.
-- [ ] Return `X-Request-ID` and include the ID in errors and lifecycle logs.
-- [ ] Record acceptance/rejection and final outcome.
-- [ ] Record model, stream mode, known HTTP status, monotonic duration in
+- [x] Return `X-Request-ID` and include the ID in errors and lifecycle logs.
+- [x] Record acceptance/rejection and final outcome.
+- [x] Record model, stream mode, known HTTP status, monotonic duration in
   milliseconds, and outcome: `completed`, `rejected`, `failed`, or `disconnected`.
-- [ ] Record actual prompt/output counts when available; never fabricate them.
-- [ ] Start timing before validation/admission and finish successful delivery
+- [x] Record actual prompt/output counts when available; never fabricate them.
+- [x] Start timing before validation/admission and finish successful delivery
   timing after the ordinary body or final SSE event is sent.
-- [ ] Distinguish HTTP disconnect time from eventual producer completion.
+- [x] Distinguish HTTP disconnect time from eventual producer completion.
   Measure any generation-duration field separately around the producer.
-- [ ] For unexpected failures, record exception class and sanitized error code,
+- [x] For unexpected failures, record exception class and sanitized error code,
   not arbitrary exception text.
 
 Never log messages, rendered prompts, generated text, token IDs, raw bodies,
@@ -873,6 +873,30 @@ measurements, not Stage 3 TTFT/TPOT benchmarks.
 **Exercise:** Send an unmistakable private marker in valid and invalid requests.
 Inspect logs for request correlation and status while confirming the marker and
 generated content are absent.
+
+Verified on 2026-10-21: `src/api.py` emits `request_accepted`, `request_finished`,
+and `producer_finished` JSON records via the standard-library logger
+`inference.lifecycle`. A pure ASGI middleware assigns correlation before body
+validation, observes the final send and disconnect, and never buffers bodies.
+Worker duration is measured independently; only safe scalar metadata crosses
+back to the event loop. Unknown token counts are omitted.
+
+Ten logging regressions passed alongside the existing suite: 52 tests total.
+Held-body/final-send tests prove timing boundaries, and held-producer tests
+distinguish delivery disconnect/cancellation from later successful or failed
+worker exit. Privacy, HTTP-200 stream failure, submission failure, request-ID
+isolation, and ordinary response failure handling are covered.
+
+A real-Qwen Uvicorn process emitted 36 lifecycle records across 18 chat requests.
+Actual curl ordinary/SSE completions matched and logged 49 prompt tokens and
+14 completion tokens. Five invalid requests returned correlated 422 rejections.
+Context overflow returned 400, controlled unavailable state 503, and each held
+worker rejected overlap with 429. Real ordinary/streaming TCP disconnects logged
+delivery ending before worker exit; a post-header forward failure logged HTTP
+200 with outcome `failed`. Three recovery requests succeeded afterward.
+Private input/header/exception markers were absent from captured server logs,
+and generated output was absent from lifecycle records. Resources drained and
+the process exited with code 0. These are correctness checks, not benchmarks.
 
 **Done when:** Requests are diagnosable without exposing conversation content.
 

@@ -14,10 +14,10 @@ prompt timing comparisons, KV tensor storage inspection, token-ID comparisons
 against Hugging Face `generate()` for token-limit and EOS stopping, and an
 initial synchronized CPU/MPS float32 comparison. Do not restart the basics.
 
-Current API state: Stage 2 Checkpoints 1-10 are implemented and verified, including
-ordinary HTTP completions, incremental SSE, and disconnect ownership. The next
-task is Checkpoint 11, private lifecycle logging. See the latest checkpoint
-entry at the end of this file; earlier entries describe the state at that time.
+Current API state: Stage 2 Checkpoints 1-11 are implemented and verified, including
+ordinary HTTP completions, incremental SSE, disconnect ownership, and private
+lifecycle logging. Next is Checkpoint 12, consolidated end-to-end verification
+and learning checks. Earlier entries describe the state at that time.
 Manual top-k/top-p lessons were explicitly skipped, not completed. Use the
 stable roadmap [plan.md](../plan.md), this evidence log, and actual code together.
 
@@ -959,14 +959,96 @@ README now documents streaming curl usage, frame semantics, the local usage
 extension, error boundaries, and disconnect ownership. The plan marks completed
 Checkpoints 9-10 and their previously deferred context/admission criteria.
 
-Next task: Checkpoint 11, standard-library JSON lifecycle logging with private
-request metadata and outcomes. Server-generated request IDs already exist;
-structured lifecycle logging is not implemented. Cooperative model stopping,
-bounded slow-consumer backpressure, and native-call recovery are not claimed.
-A permanently stuck producer requires process restart.
+At the end of Checkpoints 9-10, private lifecycle logging was the next task.
+Cooperative model stopping, bounded slow-consumer backpressure, and native-call
+recovery remain outside this stage. A permanently stuck producer requires restart.
 
 Still not established: a formal temperature study, manual top-k/top-p filtering
 (explicitly skipped), repeated statistical benchmarks, total/peak process-memory
 profiling, load/concurrency benchmarks, batching experiments, and precision/
 quantization comparisons. The whole roadmap is not complete.
+
+## Checkpoint 11: private correlated lifecycle logging
+
+Implemented on 2026-10-21 with the learner's approval. Changes are in
+`src/api.py` and new `tests/test_logging.py`; inference algorithms and dependencies
+are unchanged. No staging, commits, or pushes were performed for this checkpoint.
+
+The standard-library `inference.lifecycle` logger emits JSON lines to stderr:
+- `request_accepted` after successful admission and worker submission.
+- Exactly one `request_finished` at final ASGI send completion, detected
+  disconnect/cancellation, or terminal failure.
+- `producer_finished` separately when admitted worker computation exits,
+  even after the HTTP handler has ended.
+
+Pure ASGI middleware assigns the server-generated UUID and starts monotonic
+timing before body validation. It observes send/receive boundaries without
+buffering bodies and returns the same ID in headers, completion IDs, and errors.
+Handlers no longer independently generate request IDs.
+
+Records include only selected metadata: request ID, configured model ID, valid
+stream mode, known HTTP status, outcome, duration, actual available token counts,
+sanitized error code, and unexpected exception class. Unknown stream/status is
+null; unavailable counts are omitted. Arbitrary invalid values, private headers,
+messages, outputs, token IDs, and raw exception text are excluded. Unexpected
+response errors before headers receive a sanitized HTTP 500; errors escaping
+after headers are sanitized before propagation to the server logger.
+
+`duration_ms` belongs to request delivery. `producer_duration_ms` measures the
+worker from preparation through generation/output extraction, not network
+delivery or executor handoff. A request can end as disconnected while its worker
+later reports completed or failed. A failed stream can retain HTTP 200 while its
+logged outcome is failed. Successful ASGI send completion is not proof of receipt
+by the remote client.
+
+Ten permanent regressions cover:
+- Correlation and actual counts without prompt/output/token-ID/header leakage.
+- Timing before body validation and after the final ordinary or streaming send.
+- Private malformed/schema input and unique correlated rejection records.
+- Busy and unavailable rejection without nonexistent producer events.
+- Context/generation failures and recovery without stale request metadata.
+- Submission failure without false acceptance.
+- Post-header failure logged as failed despite HTTP 200.
+- Real ASGI disconnect mechanisms and task cancellation before worker exit,
+  with distinct delivery/producer timing and outcomes.
+- Failed send recorded once as disconnected, not successful.
+- Unexpected ordinary response failure sanitized at the application boundary.
+
+`.venv/bin/python -m unittest discover -s tests -v` passed all 52 tests.
+
+A temporary in-memory harness then served the actual Uvicorn application over
+an ephemeral localhost port with one CPU float32 Qwen load. Actual curl requests,
+HTTPX, and TCP sockets exercised 18 chat requests and produced 36 JSON lifecycle
+records. The default logger remained active; captured stdout/stderr included
+normal Uvicorn logs and the application's JSON lines.
+
+| Case | Observed behavior |
+|---|---|
+| Ordinary and SSE success | HTTP 200; matching greedy output; both logged 49 prompt and 14 completion tokens |
+| Five private invalid requests | HTTP 422; one correlated rejected event each; no acceptance or producer event |
+| Streaming context overflow | HTTP 400 before SSE; producer and request outcomes rejected |
+| Controlled unavailable state | HTTP 503; rejected without a producer event |
+| Ordinary TCP disconnect | Request ended before headers; held worker later failed with safe `RuntimeError` metadata |
+| Streaming TCP disconnect | Request ended after content; held worker later completed 24 tokens from a 40-token prompt |
+| Connected forward failure | HTTP 200 stream ended with error SSE and `[DONE]`; request and producer outcomes failed |
+| Overlapping requests | HTTP 429 during each held worker; health 200 and readiness 503 busy |
+| Three recovery requests | HTTP 200 afterward; 43 prompt and 2 completion tokens; no stale error fields |
+
+The streaming disconnect recorded delivery duration about 331.23 ms, then later
+recorded a separate producer duration about 1855.49 ms. These intervals have
+different starting boundaries and are single-run correctness observations,
+not speed comparisons or TTFT/TPOT measurements.
+
+The private marker supplied in prompt, invalid values/field names, incoming
+request ID, authorization header, and injected exception was absent from complete
+captured server stdout/stderr. Generated output was absent from lifecycle
+records. Every chat request had one delivery terminal event. The ownership
+harness observed no unhandled loop failures, retained producers, or leaked
+runtime/executor after shutdown; process exit code was 0. Temporary forward
+wrappers were restored, and no smoke files or server processes remain.
+
+README documents event semantics, null/omitted fields, privacy, and timing.
+Checkpoint 11 is complete. Next: Checkpoint 12, consolidate the final service
+acceptance checks and answer the learning questions. Do not mark the entire
+phase complete solely from this logging checkpoint.
 

@@ -229,6 +229,63 @@ backpressure and cooperative stopping remain later work. Real TCP disconnects
 and controlled forward failures have been verified with Qwen, alongside
 deterministic ASGI ownership regressions.
 
+## Private request lifecycle logs
+
+The normal Uvicorn command also emits one JSON line per lifecycle event through
+Python's `inference.lifecycle` logger at INFO level, to stderr. No log files or
+external telemetry service are created. Uvicorn's own startup/access logs remain
+separate and may be plain text.
+
+Logging covers `POST /v1/chat/completions`. A server-generated UUID is assigned
+before body parsing and validation and reused in `X-Request-ID`, completion IDs,
+error envelopes, and every lifecycle event. Incoming identifiers are ignored.
+
+| Event | Meaning |
+|---|---|
+| `request_accepted` | The guard was acquired and producer submission succeeded; generation has not necessarily succeeded |
+| `request_finished` | Delivery completed, was rejected/failed, or ended on a detected disconnect/cancellation |
+| `producer_finished` | Admitted worker computation exited, even if its client already disconnected |
+
+Each event includes `request_id`, the configured `model`, `stream`, and
+`http_status`. Unknown stream mode or HTTP status is `null`, not guessed.
+Invalid client-supplied model names are never logged. Terminal events include
+an `outcome`: `completed`, `rejected`, `failed`, or `disconnected` for delivery;
+the producer independently reports `completed`, `rejected`, or `failed`.
+
+Validation, busy, and availability rejections have a `request_finished` event
+without admission/producer events. A context rejection occurs inside an admitted
+worker, so it also has acceptance and producer events. Submission failure is
+`failed` without a producer event. A stream can have `http_status: 200` and
+`outcome: "failed"` because its headers were sent before generation failed.
+
+Timing fields use a monotonic clock:
+- `request_finished.duration_ms` starts before validation/admission and ends after
+  the final ASGI body send completes, or when disconnect/cancellation is observed.
+  Successful send completion does not prove receipt by the remote client.
+- `producer_finished.producer_duration_ms` measures the worker separately,
+  including formatting, tokenization, context validation, generation, and output
+  extraction. It excludes request-body reading and executor handoff.
+
+On disconnect, the delivery event is not changed into success when inference
+later finishes. Correlate the later producer event using the same request ID.
+These durations are lifecycle measurements, not TTFT/TPOT benchmarks.
+
+Actual `prompt_tokens` and `completion_tokens` are included when a successful
+producer result is available. Otherwise the fields are omitted, not replaced by
+zero, the requested cap, or estimated partial counts. A disconnected request may
+therefore have counts only in its later producer event.
+
+Errors include a sanitized `error_code`; unexpected failures also include
+`exception_type`, never the exception message. Lifecycle records exclude messages,
+rendered prompts, generated text, token IDs, raw bodies, authorization headers,
+raw validation inputs, and tracebacks. The middleware observes send/receive
+boundaries without buffering or logging response bodies.
+
+To inspect a request, send either curl example above with `-i`, then find its
+`X-Request-ID` in the server's JSON lines. Do not interpret Uvicorn's streaming
+`200 OK` access line as completed generation; inspect `request_finished.outcome`
+and, after a disconnect, the separate `producer_finished` event.
+
 ## Run behavioral tests
 
 ```bash
@@ -237,7 +294,8 @@ deterministic ASGI ownership regressions.
 
 The suite covers request validation, context budgets, lifecycle transitions,
 busy admission, consumer cancellation, SSE progress and terminal metadata,
-preparation/producer failures, and disconnect ownership. It uses offline
+preparation/producer failures, disconnect ownership, and lifecycle log privacy,
+correlation, and timing boundaries. It uses offline
 inference fixtures and controlled worker resources. HTTPX covers ordinary
 requests; direct ASGI connections expose streaming frames without buffering.
 Real-Qwen HTTP smoke evidence is recorded separately in `logs/practice.md`.
