@@ -12,6 +12,13 @@ Read [the session handoff in logs/practice.md](logs/practice.md) before continui
 with a new mentor. It records inference experiments, verified API checkpoints,
 and the next task. Use [plan.md](plan.md) for the broader roadmap.
 
+Stage 2 technical acceptance and the Phase 3 benchmark implementation are
+verified. The suite has 73 passing tests; real-Qwen evidence includes 80 measured
+HTTP requests, 80 measured fixed-length generations, and a separate CPU profile.
+Next: interpret the [benchmark results](logs/practice.md#phase-3-reproducible-inference-benchmarks)
+before changing performance settings or starting Stage 4. Independent learning
+checks remain pending; automated verification does not prove understanding.
+
 ## Explore the codebase with Understand Anything
 
 [Understand Anything](https://github.com/Egonex-AI/Understand-Anything) is a
@@ -286,6 +293,137 @@ To inspect a request, send either curl example above with `-i`, then find its
 `200 OK` access line as completed generation; inspect `request_finished.outcome`
 and, after a disconnect, the separate `producer_finished` event.
 
+## Reproducible benchmarks
+
+Phase 3 keeps the CPU float32, single-worker service as its baseline. Benchmark
+commands are separate modules under `benchmarks/`; normal `src.api:app` behavior
+and its HTTP contract are unchanged. No additional packages are required.
+
+### Create the fixed workload
+
+Run from the repository root. Model artifacts must already be in the Hugging
+Face cache: these tools prohibit downloads during measured startup. With the
+verified snapshot, formatted inputs contain 59 or 990 tokens, paired with output
+caps of 32 or 128. Exact messages, template hash, actual counts, and snapshot
+revision are saved in the manifest:
+
+```bash
+.venv/bin/python -m benchmarks.workloads \
+  --output benchmark-results/run-1/workload.json
+```
+
+These are synthetic prompts, not a quality evaluation. The long input repeats
+background material to vary context length without changing the task. All cases
+fit the service's 2048-token combined context budget.
+
+### Measure HTTP delivery and model token production
+
+In terminal A, choose an unused localhost port, such as 8001:
+
+```bash
+HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false \
+  .venv/bin/python -m benchmarks.server --port 8001 \
+  --metrics benchmark-results/run-1/server.jsonl
+```
+
+This opt-in server loads the actual runtime once, preserves the existing admission
+and shutdown paths, and records one model-timing row per generation. Scoped
+wrappers correlate rows with the server-generated `X-Request-ID`; they restore
+the original methods at shutdown. No extra inference worker is introduced.
+
+After startup completes, run terminal B:
+
+```bash
+.venv/bin/python -m benchmarks.client \
+  --url http://127.0.0.1:8001 \
+  --workload benchmark-results/run-1/workload.json \
+  --warmups 2 --repeats 20 \
+  --output benchmark-results/run-1/http.json
+
+.venv/bin/python -m benchmarks.report \
+  --client benchmark-results/run-1/http.json \
+  --server-metrics benchmark-results/run-1/server.jsonl \
+  --output benchmark-results/run-1/report.json
+```
+
+Requests are sequential. Each case has its own warm-up and measured window.
+Errors are recorded without retries, and the client saves evidence before
+returning a nonzero exit status. Ctrl-C saves collected samples and returns 130.
+Stop the benchmark server normally with Ctrl-C before running model-side
+experiments; do not benchmark competing model processes simultaneously.
+
+The client can target another compatible server by changing `--url` and supplying
+`--server-config path/to/config.json`. That JSON object is declared configuration,
+not hardware detected by the client. A compatible server must provide valid
+terminal usage and `[DONE]`; a separate final usage chunk is also accepted.
+Without model instrumentation, omit `--server-metrics`: model timings and server
+memory remain unavailable rather than being estimated from text chunks.
+
+### Natural stopping, fixed-length generation, and profiling
+
+Natural HTTP runs preserve EOS and record actual output lengths, which may be
+shorter than their caps. The separate model-side harness can run natural or
+fixed-length experiments:
+
+```bash
+.venv/bin/python -m benchmarks.model \
+  --workload benchmark-results/run-1/workload.json \
+  --mode fixed --warmups 2 --repeats 20 \
+  --output benchmark-results/run-1/fixed.json
+```
+
+Use `--mode natural` for a standalone natural-stopping comparison, and repeat
+`--case CASE_NAME` to select cases. Fixed mode sets matching `min_new_tokens` and
+`max_new_tokens` only on the fresh per-call generation configuration. It suppresses
+ordinary EOS until the requested length without changing shared defaults,
+production API fields, or context/output caps. It is not a quality measurement.
+
+Profile a representative slow case in a separate process/run:
+
+```bash
+.venv/bin/python -m benchmarks.model \
+  --workload benchmark-results/run-1/workload.json \
+  --profile-case long-input-long-output --warmups 2 \
+  --output benchmark-results/run-1/profile.json
+```
+
+Profiling produces operator self/total CPU times, call counts, allocation
+statistics, and a neighboring `.trace.json` Chrome trace. These instrumented
+timings are excluded from the repeated-run headline statistics.
+
+### Interpret the measurements
+
+- **Client E2E:** request start to receipt of `[DONE]`, not eventual connection
+  closure. A malformed or incomplete stream is an error, not a successful sample.
+- **Client first text:** request start to first nonempty content event; role-only
+  events do not count.
+- **Model TTFT:** immediately before `model.generate()` to its first generated
+  token callback. Includes generation setup/prefill, excludes our tokenization.
+- **Mean TPOT:** `(last_token_time - first_token_time) / (N - 1)`, unavailable for
+  zero or one output token. Inter-token intervals are reported separately.
+- **Useful output throughput:** successfully delivered generated IDs divided by
+  the complete measured case window, including failure time and client overhead.
+  EOS is counted when generated. Failed or canceled work is not useful output.
+- **Memory:** `process_peak_rss_bytes` is process lifetime high-water RSS, not
+  current memory, per-request allocation, or Apple unified/device memory.
+
+Reports join server/client durations by request ID, never by subtracting clocks
+across processes. They reject mismatched model revisions and token accounting.
+Warm-ups, startup/loading, profiling, and measured requests remain separate.
+Hardware, package versions, model revision, actual generation settings, and
+PyTorch thread counts accompany the results. The recorded baseline launch uses
+`HF_HUB_OFFLINE=1` and `TOKENIZERS_PARALLELISM=false`.
+
+Twenty samples per case make p95 exploratory, not a stable production tail
+estimate. Synthetic workload order, background activity, thermal state, and
+instrumentation overhead can affect comparisons. No device/concurrency
+optimization should be justified from a single run.
+
+Artifacts live under ignored `benchmark-results/`. Commands refuse to overwrite
+existing result files; choose a new run directory when repeating an experiment.
+Measured evidence and bottleneck interpretation are recorded in
+[`logs/practice.md`](logs/practice.md).
+
 ## Run behavioral tests
 
 ```bash
@@ -295,10 +433,16 @@ and, after a disconnect, the separate `producer_finished` event.
 The suite covers request validation, context budgets, lifecycle transitions,
 busy admission, consumer cancellation, SSE progress and terminal metadata,
 preparation/producer failures, disconnect ownership, and lifecycle log privacy,
-correlation, and timing boundaries. It uses offline
-inference fixtures and controlled worker resources. HTTPX covers ordinary
+correlation, and timing boundaries. A tiny offline model exercises context
+limits and EOS-at-cap precedence, including invisible EOS token accounting.
+Other offline fixtures hold or fail producers to expose lifecycle transitions.
+HTTPX covers ordinary
 requests; direct ASGI connections expose streaming frames without buffering.
 Real-Qwen HTTP smoke evidence is recorded separately in `logs/practice.md`.
+Benchmark regressions additionally cover completion timing boundaries, malformed
+or truncated SSE, token/usage accounting, warm-up exclusion, cancellation,
+request-ID correlation, and fixed-length configuration isolation.
+
 
 ## Inspect tokenization and two-token generation
 

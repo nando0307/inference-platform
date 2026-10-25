@@ -14,10 +14,15 @@ prompt timing comparisons, KV tensor storage inspection, token-ID comparisons
 against Hugging Face `generate()` for token-limit and EOS stopping, and an
 initial synchronized CPU/MPS float32 comparison. Do not restart the basics.
 
-Current API state: Stage 2 Checkpoints 1-11 are implemented and verified, including
-ordinary HTTP completions, incremental SSE, disconnect ownership, and private
-lifecycle logging. Next is Checkpoint 12, consolidated end-to-end verification
-and learning checks. Earlier entries describe the state at that time.
+Current API state: Stage 2 Checkpoints 1-11 and Checkpoint 12 technical acceptance
+are implemented and verified, including ordinary HTTP completions, incremental
+SSE, disconnect ownership, private lifecycle logging, and graceful shutdown.
+Phase 3 benchmarks are now implemented and verified: 73 tests, 80 measured HTTP
+requests, 80 measured fixed-length generations, and a separate CPU profile.
+Next: explain the timing boundaries and interpret the measured baseline before
+starting Stage 4. The Phase 2 questions were reviewed with the learner, but
+independent understanding checks remain pending. Earlier entries describe the
+state at that time.
 Manual top-k/top-p lessons were explicitly skipped, not completed. Use the
 stable roadmap [plan.md](../plan.md), this evidence log, and actual code together.
 
@@ -1052,3 +1057,339 @@ Checkpoint 11 is complete. Next: Checkpoint 12, consolidate the final service
 acceptance checks and answer the learning questions. Do not mark the entire
 phase complete solely from this logging checkpoint.
 
+## Checkpoint 12: complete service verification
+
+Technical acceptance is verified. The learner still needs to answer the
+[learning questions](../plan.md#learning-checks); do not mark those complete
+from test or smoke results.
+
+### Regression coverage
+
+Reviewed the existing schema, context, lifecycle, admission, ordinary-response,
+streaming, disconnect, failure-recovery, and logging regressions. Added the
+missing explicit EOS-at-output-cap boundary in `tests/test_inference.py`.
+The existing tiny offline model executes real Hugging Face generation with
+controlled logits: one visible token followed by EOS at cap 2. Both configured
+EOS IDs are exercised separately. The result retains both generated IDs,
+decodes only the visible token, and reports `stop`, not `length`.
+
+Full suite:
+
+```text
+.venv/bin/python -m unittest discover -s tests -v
+Ran 53 tests in 1.172s
+OK
+```
+
+A separate fresh-process import check made both Hugging Face `from_pretrained`
+loaders raise if called. Importing `src.api` succeeded without calling either:
+application import does not load weights.
+
+### Real-Qwen HTTP verification
+
+Ran the actual application with Qwen/Qwen2.5-0.5B-Instruct, CPU float32, on an
+OS-assigned localhost port in a separate process. Used HTTPX, `curl -N`, and
+raw TCP clients for disconnects. The existing user server was not changed.
+The runtime loaded once and was reused across 64 chat requests. Real model
+forward calls ran in evaluation mode with `torch.inference_mode()` enabled.
+
+| Check | Observed result |
+| --- | --- |
+| Ordinary greedy arithmetic request | HTTP 200; 43 prompt + 2 completion = 45 tokens; `stop` |
+| Same request with output cap 2 | Ordinary and streaming both retained the same generated IDs and reported `stop`; EOS counted despite being invisible |
+| Same request with output cap 1 | One generated ID; `length` |
+| Sampling at temperature 0.7, top-p 0.9 | HTTP 200; 43 + 2 = 45 tokens; actual generation config used sampling and `top_k=0` |
+| Configuration isolation | Per-request generation configs preserved both model EOS IDs, one beam/return sequence, cache use, and repetition penalty 1; saved model configuration remained unchanged |
+| Invalid HTTP requests | 28 schema/body cases returned 422 without model execution or private-value echoes; included strict types/ranges, unknown fields, malformed JSON/UTF-8, NaN, and greedy/top-p incompatibility |
+| Routing | GET on the chat route returned 405; unknown route returned 404 |
+| Exact formatted context budget | 2020 prompt + requested cap 28 = 2048 accepted in both modes; actual usage 2020 + 23 = 2043 |
+| One token over | 2020 + requested cap 29 = 2049 returned JSON 400 before model execution in both modes |
+| Oversized prompt | Repeated-word prompt returned JSON 400 before model execution in both modes; no truncation or streaming headers |
+
+Sampling is validated by the actual generation settings and successful execution,
+not by requiring a different answer from greedy decoding.
+
+For three greedy prompt pairs, ordinary and streaming runs produced identical
+generated ID sequences and decoded text. Each actual `curl -N` client received
+nonempty content before its producer exited:
+
+| Prompt case | Prompt / completion / total tokens | SSE chunks including role and terminal, excluding `[DONE]` | Finish |
+| --- | --- | --- | --- |
+| English animal list, cap 24 | 38 / 24 / 62 | 16 | `length` |
+| Chinese text with punctuation, cap 64 | 47 / 5 / 52 | 5 | `stop` |
+| Portuguese accents and punctuation, cap 64 | 54 / 18 / 72 | 7 | `stop` |
+
+Each successful stream had one role event, stable identity/creation metadata,
+one successful terminal event with usage matching actual generated IDs, and
+exactly one `[DONE]`. Chunk counts are not token counts. These are correctness
+observations, not timing benchmarks or first-token latency measurements.
+
+### Ownership, failures, and shutdown
+
+Temporary wrappers held execution only after a real model forward call; stream
+cases waited until real nonempty text had been emitted. While each producer was
+held, `/health` returned 200, `/ready` returned 503 with `busy`, valid overlapping
+chat requests returned 429, and invalid requests still returned 422.
+
+- Ordinary client disconnect followed by an injected worker failure: delivery
+  ended as `disconnected`, but admission stayed busy until producer exit.
+  The abandoned `RuntimeError` was observed, readiness recovered, and a later
+  real-model request returned 200.
+- Streaming client disconnect: delivery ended while the real producer continued.
+  Admission stayed busy until completion, then a later request returned 200.
+- Connected streaming failure after content: an injected `RuntimeError` produced
+  one sanitized SSE error and one `[DONE]`, without successful finish metadata
+  or usage. Delivery was logged as failed despite HTTP 200. A later request
+  returned 200.
+- Graceful shutdown after an ordinary client disconnected: the real producer
+  remained held while Uvicorn entered lifespan shutdown. The runtime and busy
+  slot remained owned, initialization/readiness state was cleared, new internal
+  admission raised `InferenceUnavailable`, and the event loop stayed responsive.
+  Uvicorn had closed its listener, so this is not evidence of an HTTP 503 response
+  during shutdown. After releasing the worker, shutdown waited for completion,
+  then cleared runtime/executor references and retained futures; the guard was
+  unlocked.
+
+The controlled gates/errors expose lifecycle transitions; they do not replace
+model computation. Existing permanent regressions additionally cover startup
+failure, unavailable HTTP 503, preparation/submission failures, and both relevant
+ASGI disconnect paths.
+
+### Lifecycle/privacy evidence and remaining work
+
+The run captured 114 actual lifecycle records for 64 chat requests:
+
+- 25 accepted producers: 19 completed, 4 rejected for context, 2 injected failures.
+- Delivery outcomes: 17 completed, 43 rejected, 3 disconnected, 1 failed.
+- Delivery statuses: 19 HTTP 200, 32 HTTP 422, 4 HTTP 400, 7 HTTP 429, and 2
+  disconnected ordinary requests without committed response headers.
+
+Every chat request had exactly one delivery terminal event. Every accepted
+request had a corresponding producer terminal event. Private prompt/validation/
+exception markers were absent from captured server stderr, and generated private
+output was absent from lifecycle records. No raw traceback, invalid-generation-
+flags warning, or unhandled async exception was observed.
+
+The smoke process exited successfully after graceful shutdown. Temporary
+instrumentation stayed in memory; no smoke files or server processes remain.
+No production source changes were needed. README and the Checkpoint 12 technical
+checklist now reflect the verified state. Generated changelogs and `.ua` files
+were not edited, and no staging, commits, or other Git operations were performed.
+
+Remaining: the learner answers the 15 Checkpoint 12 questions in `plan.md`.
+Technical checks are complete; learning verification is intentionally pending.
+
+## Phase 3: reproducible inference benchmarks
+
+The learner authorized implementation of the seven benchmark steps after the
+timing-boundary lesson. Production `src/` code, HTTP request/response fields,
+dependencies, and the existing user server were left unchanged.
+
+### Tools and measurement contract
+
+- `benchmarks/workloads.py` creates the fixed synthetic manifest using the actual
+  cached tokenizer. Inputs are 59 and 990 formatted tokens, each paired with
+  output caps 32 and 128. Exact messages, token counts, template hash, and snapshot
+  revision are retained.
+- `benchmarks/client.py` is a separate sequential HTTP streaming client. It
+  records first nonempty content and receipt of `[DONE]`, actual terminal usage,
+  failures, and cancellations. It does not count chunks as tokens or retry errors.
+- `benchmarks/timing.py` timestamps actual generated-token callbacks, excludes
+  the initial full-prompt callback, verifies callback counts against returned
+  generated IDs, and reports TTFT, mean TPOT, and individual inter-token intervals.
+- `benchmarks/server.py` opts into timing on the real service without changing
+  production startup. Scoped wrappers carry request IDs into the existing worker
+  and remain installed until the original shutdown path finishes.
+- `benchmarks/report.py` joins durations by request ID, rejects token/revision
+  mismatches, excludes warm-ups from headline statistics, and leaves unavailable
+  measurements null. It never subtracts absolute timestamps across processes.
+- `benchmarks/model.py` provides separate natural/fixed model-side experiments
+  and a separate profiler mode. Fixed mode changes only the request-local
+  `min_new_tokens`, preserving context/output limits and shared model defaults.
+
+Commands and field definitions are in the README benchmark section. All run
+artifacts are under ignored `benchmark-results/phase3/`; result writers refuse
+to overwrite existing evidence.
+
+### Baseline and startup
+
+Observed environment, rather than a guessed hardware specification:
+
+- Apple M1 Pro, 8 logical CPUs; reported platform macOS 26.6.2 arm64.
+- Python 3.12.13, PyTorch 2.14.1, Transformers 5.18.0, Tokenizers 0.23.2.
+- FastAPI 0.143.3, Uvicorn 0.54.0, HTTPX 0.28.1.
+- Qwen/Qwen2.5-0.5B-Instruct snapshot
+  `7ae557604adf67be50417f59c2c2f167def9a775`, CPU float32.
+- One worker, one sequential client, 2048-token combined context limit.
+- PyTorch reported 6 intra-op and 8 inter-op threads; no thread tuning was applied.
+- HTTP benchmark server launch used `HF_HUB_OFFLINE=1` and
+  `TOKENIZERS_PARALLELISM=false`, also retained in `server-config.json`.
+
+This Transformers version does not retain `_commit_hash` on its configuration
+object. The benchmark therefore discovers the cached snapshot explicitly and
+pins both model and tokenizer loading to that revision. No weights were downloaded.
+Download time is unmeasured, not zero. The server loaded once: 2433.35 ms for
+cached runtime loading and 2516.07 ms from lifespan entry to instrumentation
+readiness. The startup interval excludes Python/module imports and all request
+measurements.
+
+### Repeated natural-stopping HTTP workload
+
+Executed the actual benchmark client against an isolated localhost instrumented
+server. Each case ran two excluded warm-ups followed by 20 measured requests,
+in manifest order. All 88 requests succeeded; all 80 measured requests joined
+to model records by request ID, with no missing records, errors, or cancellations.
+Every first nonempty content delivery preceded model-generation completion.
+
+| Formatted input / output cap | Measured requests | E2E p50 / p95 ms | Client first-text p50 ms | Model TTFT p50 ms | Mean TPOT p50 ms | Useful output tokens/s | Process peak RSS MiB |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 59 / 32 | 20 | 2395.34 / 2505.33 | 189.80 | 115.72 | 73.49 | 13.06 | 1994.03 |
+| 59 / 128 | 20 | 10204.78 / 13064.56 | 200.70 | 122.31 | 78.97 | 12.07 | 1994.03 |
+| 990 / 32 | 20 | 3303.79 / 3757.35 | 752.22 | 660.09 | 85.28 | 9.55 | 2103.45 |
+| 990 / 128 | 20 | 11333.54 / 13829.09 | 807.89 | 719.91 | 82.64 | 10.79 | 2105.03 |
+
+All natural requests reached their caps and reported `length`, producing 6400
+measured output tokens. Natural stopping was enabled, but this particular
+workload did not demonstrate early EOS. No output text or token IDs were retained
+in the per-request measurements.
+
+Pooled inter-token p50/p95 intervals were respectively 72.60/82.50,
+74.65/105.79, 79.82/111.71, and 78.88/112.17 ms. These pooled intervals are
+different statistics from the distribution of per-request mean TPOT.
+
+For each correlated request, subtracting model-call duration from client E2E
+duration left median residuals of 2.43, 5.90, 4.66, and 12.38 ms across the four
+cases. The model-generation region occupied a median 99.86-99.95% of E2E time.
+That region includes Hugging Face generation logic and streamer callbacks, not
+only matrix kernels. This compares paired durations, not cross-process clock
+timestamps.
+
+Artifacts: `workload.json`, `server-config.json`, `http.json`, `server.jsonl`,
+and `report.json`. The benchmark server exited normally with code 0 before
+starting model-side profiling.
+
+### Separate profiler and bottleneck interpretation
+
+Selected `long-input-long-output` because it had the largest measured median
+E2E latency. A separate process ran two warm-ups and one profiled natural
+generation: 990 input tokens and 128 generated tokens. Its timing is not included
+in the HTTP result table.
+
+| Operator | Calls | Self CPU time ms |
+| --- | --- | --- |
+| `aten::mm` | 12416 | 8093.34 |
+| `aten::addmm` | 9216 | 486.60 |
+| `aten::_scaled_dot_product_flash_attention_for_cpu` | 3072 | 465.90 |
+| `aten::cat` | 12672 | 454.09 |
+| `aten::mul` | 28416 | 99.74 |
+| `aten::silu` | 3072 | 78.75 |
+
+The profiled generation region lasted 11347.14 ms. Dense matrix multiplication
+dominated recorded operator self time; paired client/model durations show that
+HTTP delivery overhead was small in this workload. The evidence identifies the
+dominant operation, but does not establish whether arithmetic throughput or memory
+bandwidth is the hardware limit. Do not claim CPU saturation or a device speedup
+without a controlled measurement.
+
+Artifacts: `profile.json` contains samples and operator data, with no headline
+case summaries; `profile.trace.json` is the separate 387618436-byte Chrome trace.
+Profiler shape/memory collection and trace export add overhead. Operator allocation
+totals are not peak process memory, and negative operator memory deltas are not
+negative RSS.
+
+### Regression and HTTP timing-boundary evidence
+
+The integrated suite passed: `Ran 73 tests in 1.183s`, `OK`. New regressions cover
+SSE truncation/errors, actual usage, first-text versus role events, EOS accounting,
+token callbacks, fixed-length isolation, warm-up exclusion, and correlated reports.
+
+A real HTTP fixture exposed an initial client timing error: `[DONE]` arrived
+about 2 ms after request start, but HTTP body closure was delayed by 400 ms.
+The initial implementation reported about 408 ms. After correcting the boundary,
+the same scenario reported about 4 ms despite the closure delay. The permanent
+streaming regression now checks that delayed HTTP closure does not inflate E2E.
+
+A separate real HTTP fixture interrupted the client during warm-up. The CLI
+returned 130 and saved the canceled sample. Reporting succeeded with zero measured
+requests, one warm-up failure, and null throughput/latency rather than invented
+zero-valued performance.
+
+### Fixed-length measurements and EOS isolation
+
+After the HTTP server and profiler process had exited, ran the standalone
+fixed-length command with two warm-ups and 20 measured generations per case.
+All 88 calls succeeded. All 80 measured generations produced exactly their
+requested caps, and actual per-call settings recorded
+`min_new_tokens == max_new_tokens`.
+
+| Formatted input / output cap | Measured requests | Model-side request p50 ms | TTFT p50 ms | Mean TPOT p50 ms | Output tokens/s |
+| --- | --- | --- | --- | --- | --- |
+| 59 / 32 | 20 | 2490.98 | 118.19 | 76.55 | 12.74 |
+| 59 / 128 | 20 | 9955.30 | 118.22 | 77.47 | 12.77 |
+| 990 / 32 | 20 | 3175.44 | 661.26 | 81.08 | 9.77 |
+| 990 / 128 | 20 | 10742.39 | 643.83 | 79.50 | 11.62 |
+
+Artifact: `fixed.json`. Model-side request time includes tokenization and final
+decoding, but is not HTTP E2E latency. This run has no downstream text streamer
+and occurred later in a separate process. Differences from the HTTP table are
+not evidence that forcing output length improves serving performance.
+
+Because the four main natural prompts all reached their caps, an additional
+real-Qwen correctness control used an arithmetic prompt with 43 formatted input
+tokens and an output cap of 8, all on one runtime:
+
+| Mode | Actual generated tokens | Finish reason | Actual `min_new_tokens` |
+| --- | --- | --- | --- |
+| Natural | 2 | `stop` | unset |
+| Fixed | 8 | `length` | 8 |
+| Natural again | 2 | `stop` | unset |
+
+The two natural runs produced identical generated ID sequences, and the shared
+model generation configuration was unchanged. The terminating EOS was counted
+but not printed or saved as an ID. Artifact: `eos-control.json`; this is a
+correctness control, not another performance sample.
+
+### Real model failure accounting and recovery
+
+A separate in-memory harness ran the actual instrumented server and raised a
+private-marker `RuntimeError` after its fourth successful real forward call.
+The timing recorder had observed three generated-token callbacks before failure.
+The benchmark client had received nonempty content, then recorded
+`generation_failed` with null completion usage rather than counting that partial
+output as a completed response.
+
+The same client run then sent another real request, which completed with 32
+generated tokens. The CLI saved both samples and exited 1 as required for a run
+containing an error. Model/client request IDs matched; the joined report contained
+one error, one success, and one known failed producer duration. Only the 32
+successfully delivered output tokens contributed to useful throughput, while
+the measured elapsed window included the failed request.
+
+Artifacts: `failure-server.jsonl`, `failure-http.json`, and `failure-report.json`.
+Readiness recovered to HTTP 200. The harness server shut down normally with code
+0; its captured logs contained neither the injected private exception marker
+nor a traceback. The injection remained in memory, not in a production endpoint,
+flag, or committed smoke script.
+
+### Interpretation limits
+
+Twenty measured requests per case make p95 exploratory, not a stable production
+tail estimate. The machine was not certified free of other activity; fixed case
+order and thermal state can affect comparisons. Process RSS is a lifetime
+high-water mark, not per-case allocation or unified/device memory. Token timing
+and metrics output add overhead. No MPS comparison, queue, concurrency change,
+or performance optimization is justified by this single baseline run.
+
+### Completion and next lesson
+
+The seven requested Phase 3 implementation steps are complete and exercised.
+README has repeatable commands and metric definitions; `plan.md` reflects the
+verified technical checklist. All benchmark/harness processes started for this
+work exited. No production source, package versions, generated changelogs,
+`.ua` artifacts, staging, or commits were changed.
+
+Next lesson: use the table to explain why client first text differs from model
+TTFT, why longer inputs mainly affect prefill, why mean TPOT differs from pooled
+inter-token percentiles, and why matrix-kernel dominance does not by itself
+prove memory-bandwidth saturation. The learner's explanations remain to be
+verified; Stage 4 implementation is not implicitly authorized.

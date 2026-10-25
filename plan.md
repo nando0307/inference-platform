@@ -902,31 +902,36 @@ the process exited with code 0. These are correctness checks, not benchmarks.
 
 ## Checkpoint 12: Prove the complete service
 
-- [ ] Add permanent behavioral regressions in `tests/test_api.py` using the
-  standard-library `unittest` runner; add `httpx` only if needed as a test client.
-- [ ] Cover combined context exact-fit and one-token-over boundaries, including
+Technical verification is complete: 53 passing tests and a real-Qwen HTTP run
+covering 64 chat requests, one loaded runtime, and 114 lifecycle records.
+Detailed evidence and limitations are in
+[the practice log](logs/practice.md#checkpoint-12-complete-service-verification).
+The learning questions below remain unanswered by the learner.
+
+- [x] Add permanent behavioral regressions in `tests/` using the
+  standard-library `unittest` runner and `httpx` as an HTTP test client.
+- [x] Cover combined context exact-fit and one-token-over boundaries, including
   template overhead.
-- [ ] Cover invalid numeric types, nonfinite values, unknown fields, and
+- [x] Cover invalid numeric types, nonfinite values, unknown fields, and
   incompatible greedy/top-p settings.
-- [ ] Hold a producer and prove 429 rejection while health remains responsive.
-- [ ] Prove consumer cancellation/disconnect does not admit work before actual
+- [x] Hold a producer and prove 429 rejection while health remains responsive.
+- [x] Prove consumer cancellation/disconnect does not admit work before actual
   producer exit.
-- [ ] Prove failure before preparation resolves the waiter as an ordinary error.
-- [ ] Prove failure after stream start terminates without a successful finish
+- [x] Prove failure before preparation resolves the waiter as an ordinary error.
+- [x] Prove failure after stream start terminates without a successful finish
   event and permits a later request.
-- [ ] Prove EOS at the output cap reports `stop`.
-- [ ] Prove private inputs are absent from validation responses and logs.
-- [ ] Run the actual application with the real Qwen model over HTTP. Held or
+- [x] Prove EOS at the output cap reports `stop`.
+- [x] Prove private inputs are absent from validation responses and logs.
+- [x] Run the actual application with the real Qwen model over HTTP. Held or
   failing fixtures prove transitions, not real-model integration.
-- [ ] Update existing run/contract documentation and `logs/practice.md` with
+- [x] Update existing run/contract documentation and `logs/practice.md` with
   observed evidence after implementation. Do not manually edit generated
   changelogs.
 
 ### Environment and launch
 
-The following are future implementation checks, not claims that a server exists
-or these checks have passed. Run from the repository using its existing `.venv`.
-After dependency edits are authorized and applied:
+The service and checks below have been exercised. Run these commands from the
+repository using its existing `.venv` to reproduce the documented HTTP examples:
 
 ```bash
 .venv/bin/python -m pip install -r requirements.txt
@@ -1021,7 +1026,7 @@ silently substitute a different model.
 
 ### Learning checks
 
-Answer without referring to implementation:
+Pending learner verification. Answer without referring to implementation:
 
 1. Why load the model once rather than per request?
 2. Why does importing the application not load weights?
@@ -1066,6 +1071,14 @@ of this stage.
 
 # Stage 3: Build a Reproducible Benchmark
 
+Implemented and verified: 73 passing regressions, 80 measured natural-stopping
+HTTP requests, 80 measured fixed-length model-side generations, separate
+profiling, and real failure/cancellation controls. See
+[the benchmark commands](README.md#reproducible-benchmarks) and
+[measured evidence and limitations](logs/practice.md#phase-3-reproducible-inference-benchmarks).
+The next learning task is interpreting these results, not automatically
+changing devices or adding concurrency.
+
 ## Central question
 
 Where does time go, and what limits performance?
@@ -1085,25 +1098,29 @@ Where does time go, and what limits performance?
 
 ## Assignments
 
-- [ ] Create a small fixed collection of benchmark prompts.
-- [ ] Include short and longer inputs.
-- [ ] Implement the load client as a separate program that can also target the
+- [x] Create a small fixed collection of benchmark prompts.
+- [x] Include short and longer inputs.
+- [x] Implement the load client as a separate program that can also target the
   Stage 8 engine by changing its URL and declared configuration.
-- [ ] Measure prompt lengths after chat formatting in tokens, not characters;
+- [x] Measure prompt lengths after chat formatting in tokens, not characters;
   distinguish actual input tokens from batch-padding positions.
-- [ ] Record actual input and generated token counts.
-- [ ] Measure startup separately from request processing.
-- [ ] Warm up the model before steady-state measurements.
-- [ ] Run repeated requests rather than reporting one result.
-- [ ] Report sample counts, median latency, and p95 latency.
-- [ ] Measure memory using a clearly named metric.
-- [ ] Record hardware, software versions, model revision, and generation
+- [x] Record actual input and generated token counts.
+- [x] Measure startup separately from request processing.
+- [x] Warm up the model before steady-state measurements.
+- [x] Run repeated requests rather than reporting one result.
+- [x] Report sample counts, median latency, and p95 latency.
+- [x] Measure memory using a clearly named metric.
+- [x] Record hardware, software versions, model revision, and generation
 settings.
-- [ ] Instrument token production separately from streamed-text delivery.
-- [ ] Profile a representative slow case with `torch.profiler` or `py-spy`
+- [x] Instrument token production separately from streamed-text delivery.
+- [x] Profile a representative slow case with `torch.profiler` or `py-spy`
   instead of guessing the bottleneck from total duration.
-- [ ] Keep profiling runs separate from headline performance measurements
+- [x] Keep profiling runs separate from headline performance measurements
   because instrumentation can alter timing.
+- [x] Run natural-stopping and separate fixed-length workloads, with a real
+  early-EOS control proving that fixed settings do not leak into later requests.
+- [x] Preserve error/cancellation outcomes and exclude undelivered work from
+  useful throughput.
 
 ### Define the metrics before collecting them
 

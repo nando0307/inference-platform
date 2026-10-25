@@ -28,3 +28,6 @@ venv/
 .ua/tmp/
 .ua/.trash-*/
 .ua/diff-overlay.json
+
+# Reproducible benchmark run artifacts and profiler traces
+/benchmark-results/
