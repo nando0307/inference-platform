@@ -90,6 +90,32 @@ class ContextBudgetTests(unittest.TestCase):
         self.assertEqual(result.prompt_tokens + len(result.generated_ids), 19)
         self.assertEqual(result.finish_reason, "length")
 
+    def test_either_eos_at_output_cap_reports_stop_and_counts_invisible_token(self):
+        tokenizer = self.runtime.tokenizer
+        eos_ids = [tokenizer.eos_token_id, tokenizer.pad_token_id]
+        self.runtime.model.generation_config.eos_token_id = eos_ids
+        self.runtime.eos_token_ids = set(eos_ids)
+        visible_id = tokenizer.convert_tokens_to_ids("reply")
+        for eos_id in eos_ids:
+            with self.subTest(eos_id=eos_id):
+                selected_ids = iter([visible_id, eos_id])
+
+                def select_token(model, args, output):
+                    # Control logits, not generate(): exercise real stopping/decoding.
+                    output.logits.fill_(float("-inf"))
+                    output.logits[..., next(selected_ids)] = 0
+
+                hook = self.runtime.model.register_forward_hook(select_token)
+                try:
+                    result = self.run_generation(max_new_tokens=2)
+                finally:
+                    hook.remove()
+                self.assertEqual(result.generated_ids, [visible_id, eos_id])
+                self.assertEqual(len(result.generated_ids), 2)
+                self.assertEqual(result.finish_reason, "stop")
+                self.assertEqual(result.text, "reply")
+                self.assertEqual(result.prompt_tokens, self.prompt_tokens)
+
     def test_one_token_over_rejects_before_preparation_and_generation(self):
         prepared = Mock()
         self.messages[-1]["content"] = "PRIVATE-CONTEXT-MARKER"
