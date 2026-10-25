@@ -60,6 +60,77 @@ class BenchmarkReportTests(unittest.TestCase):
         self.assertIsNone(case["model_ttft_ms"]["p50"])
         self.assertIsNone(case["model_tpot_ms"]["p95"])
         self.assertIsNone(case["process_peak_rss_bytes"])
+        self.assertIsNone(case["known_failed_or_canceled_generation_ms"])
+
+    def test_legacy_artifacts_leave_queue_and_cancellation_measurements_unavailable(self):
+        report = build_report(self.client, self.server)
+        case = report["cases"][0]
+        self.assertIsNone(case["queue_wait_ms"]["p50"])
+        self.assertEqual(case["missing_successful_queue_samples"], 2)
+        self.assertIsNone(case["cancellation_delay_ms"]["p50"])
+        self.assertEqual(case["missing_cancellation_delay_samples"], 1)
+        self.assertEqual(case["scheduling_samples"], 0)
+        self.assertTrue(all(row["queue_wait_ms"] is None for row in report["samples"]))
+
+    def test_authoritative_scheduling_joins_queue_and_cancel_delays_without_changing_model_ttft(self):
+        self.server[1]["queue_wait_ms"] = 999
+        self.server.extend([
+            dict(type="scheduling", request_id="one", state="completed", queue_wait_ms=0,
+                 cancellation_delay_ms=None, cancellation_reason=None),
+            dict(type="scheduling", request_id="three", state="completed", queue_wait_ms=120,
+                 cancellation_delay_ms=None, cancellation_reason=None),
+            dict(type="scheduling", request_id="gone", state="canceled", queue_wait_ms=250,
+                 cancellation_delay_ms=17, cancellation_reason="client_disconnected"),
+        ])
+        self.server[3].update(status="canceled", completion_tokens=None)
+        report = build_report(self.client, self.server)
+        case = report["cases"][0]
+        self.assertEqual(case["queue_wait_ms"]["n"], 3)
+        self.assertEqual(case["queue_wait_ms"]["p50"], 120)
+        self.assertEqual(case["model_ttft_ms"]["p50"], 4)
+        self.assertEqual(case["client_first_text_ms"]["p50"], 10)
+        self.assertEqual(case["cancellation_delay_ms"]["p50"], 17)
+        self.assertEqual(case["missing_cancellation_delay_samples"], 0)
+        self.assertEqual(case["server_canceled"], 1)
+        joined = {row["request_id"]: row for row in report["samples"]}
+        self.assertEqual(joined["gone"]["cancellation_reason"], "client_disconnected")
+        self.assertEqual(joined["three"]["queue_wait_ms"], 120)
+        self.assertIsNone(joined["gone"]["completion_tokens"])
+
+    def test_queued_cancellation_has_no_fabricated_queue_wait_or_generation_time(self):
+        self.server = self.server[:3]
+        self.server.append(dict(
+            type="scheduling", request_id="gone", state="canceled", queue_wait_ms=None,
+            cancellation_delay_ms=None, cancellation_reason="client_disconnected",
+        ))
+        case = build_report(self.client, self.server)["cases"][0]
+        self.assertEqual(case["canceled_before_start"], 1)
+        self.assertEqual(case["server_canceled"], 1)
+        self.assertEqual(case["missing_cancellation_delay_samples"], 0)
+        self.assertEqual(case["cancellation_delay_ms"]["n"], 0)
+        self.assertIsNone(case["known_failed_or_canceled_generation_ms"])
+
+    def test_generation_queue_wait_is_usable_before_terminal_scheduling_arrives(self):
+        self.server[1]["queue_wait_ms"] = 75
+        self.server[3]["queue_wait_ms"] = 90
+        report = build_report(self.client, self.server)
+        case = report["cases"][0]
+        self.assertEqual(case["queue_wait_ms"]["n"], 2)
+        self.assertEqual(case["queue_wait_ms"]["p50"], 82.5)
+        self.assertEqual(case["missing_cancellation_delay_samples"], 1)
+        self.assertIsNone(case["cancellation_delay_ms"]["p50"])
+        self.assertTrue(report["warnings"])
+
+    def test_http_429_is_explicit_even_in_legacy_error_rows_and_never_useful_throughput(self):
+        self.client["samples"][3]["http_status"] = 429
+        case = build_report(self.client, self.server)["cases"][0]
+        self.assertEqual((case["errors"], case["rejections"], case["canceled"]), (0, 1, 1))
+        self.assertEqual(case["useful_output_tokens_per_second"], 2)
+
+    def test_duplicate_scheduling_records_are_ambiguous_even_without_model_records(self):
+        scheduling = dict(type="scheduling", request_id="gone", state="canceled")
+        with self.assertRaises(ValueError):
+            build_report(self.client, [self.server[0], scheduling, scheduling])
 
     def test_mismatched_revision_counts_and_duplicate_ids_cannot_form_a_report(self):
         for corruption in ("revision", "counts", "duplicate"):

@@ -8,7 +8,10 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import WhitespaceSplit
 from transformers import GPT2Config, GPT2LMHeadModel, PreTrainedTokenizerFast
 
-from src.inference import ContextLimitError, Runtime, generate, load_runtime
+from src.inference import (
+    CancellationToken, ContextLimitError, GenerationCancelled, Runtime,
+    generate, load_runtime,
+)
 
 
 class ContextBudgetTests(unittest.TestCase):
@@ -73,7 +76,7 @@ class ContextBudgetTests(unittest.TestCase):
         # Five content tokens, eight turn markers, BOS, and assistant prefix.
         self.prompt_tokens = 15
 
-    def run_generation(self, messages=None, max_new_tokens=4, on_prepared=None):
+    def run_generation(self, messages=None, max_new_tokens=4, on_prepared=None, cancellation=None):
         return generate(
             self.runtime,
             self.messages if messages is None else messages,
@@ -81,6 +84,7 @@ class ContextBudgetTests(unittest.TestCase):
             temperature=0,
             top_p=1,
             on_prepared=on_prepared,
+            cancellation=cancellation,
         )
 
     def test_exact_fit_keeps_full_history_and_requested_output_budget(self):
@@ -158,6 +162,59 @@ class ContextBudgetTests(unittest.TestCase):
             hook.remove()
         self.assertEqual(events[0:2], ["prepared", "forward"])
         self.assertEqual(events.count("prepared"), 1)
+
+    def test_cancellation_before_or_after_preparation_never_enters_model(self):
+        for during_preparation in (False, True):
+            with self.subTest(during_preparation=during_preparation):
+                token = CancellationToken()
+                forwards = []
+                hook = self.runtime.model.register_forward_pre_hook(
+                    lambda model, args: forwards.append(True)
+                )
+                if not during_preparation:
+                    token.cancel("client_disconnected")
+                try:
+                    with self.assertRaises(GenerationCancelled) as caught:
+                        self.run_generation(
+                            cancellation=token,
+                            on_prepared=lambda: token.cancel("client_disconnected"),
+                        )
+                finally:
+                    hook.remove()
+                self.assertEqual(caught.exception.reason, "client_disconnected")
+                self.assertEqual(forwards, [])
+
+    def test_running_cancellation_stops_after_current_step_and_is_request_local(self):
+        token = CancellationToken()
+        forwards = []
+
+        def cancel_after_forward(model, args, output):
+            forwards.append(True)
+            token.cancel("client_disconnected")
+
+        hook = self.runtime.model.register_forward_hook(cancel_after_forward)
+        try:
+            with self.assertRaises(GenerationCancelled):
+                self.run_generation(cancellation=token)
+        finally:
+            hook.remove()
+        # Post-generation cancellation alone would waste all four forward calls.
+        self.assertEqual(len(forwards), 1)
+        recovered = self.run_generation()
+        self.assertEqual(len(recovered.generated_ids), 4)
+        self.assertEqual(recovered.finish_reason, "length")
+
+    def test_first_cancellation_reason_and_timestamp_are_retained(self):
+        token = CancellationToken()
+        token.cancel("client_disconnected")
+        first_requested_at = token.requested_at
+        token.cancel("shutdown")
+        self.assertEqual(token.reason, "client_disconnected")
+        self.assertIsNotNone(first_requested_at)
+        self.assertEqual(token.requested_at, first_requested_at)
+        with self.assertRaises(GenerationCancelled) as caught:
+            token.raise_if_cancelled()
+        self.assertEqual(caught.exception.reason, "client_disconnected")
 
 
 class RuntimeContextLimitTests(unittest.TestCase):

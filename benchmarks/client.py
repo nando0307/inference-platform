@@ -1,6 +1,7 @@
-"""Sequential streaming HTTP measurements; this module never loads model weights."""
+"""Bounded-wave streaming HTTP measurements; this module never loads model weights."""
 
 import argparse
+import asyncio
 import json
 import math
 import re
@@ -16,10 +17,10 @@ class StreamError(ValueError):
     pass
 
 
-def _events(response):
+async def _events(response):
     """Dispatch complete SSE data events, including multiline data and CRLF."""
     data = []
-    for line in response.iter_lines():
+    async for line in response.aiter_lines():
         if not line:
             if data:
                 yield "\n".join(data)
@@ -58,11 +59,11 @@ def _terminal_usage(usage, case, finish_reason):
     return counts
 
 
-def _consume_stream(response, row, case, started):
+async def _consume_stream(response, row, case, started, *, cancel_after_text=False):
     finish_reason = None
     usage = None
     done = False
-    for event in _events(response):
+    async for event in _events(response):
         if done:
             raise StreamError("malformed_stream")
         if event == "[DONE]":
@@ -104,6 +105,9 @@ def _consume_stream(response, row, case, started):
                 raise StreamError("malformed_stream")
             if content and row["first_text_ms"] is None:
                 row["first_text_ms"] = (perf_counter() - started) * 1000
+                if cancel_after_text:
+                    row.update(status="canceled", error_code="cancel_after_text")
+                    return
             finish_reason = choice.get("finish_reason")
             if finish_reason is not None and finish_reason not in ("stop", "length"):
                 raise StreamError("invalid_finish_reason")
@@ -118,7 +122,7 @@ def _consume_stream(response, row, case, started):
     row.update(usage, finish_reason=finish_reason, status="success")
 
 
-def run_request(client, url, workload, case, phase, iteration):
+async def run_request(client, url, workload, case, phase, iteration, *, cancel_after_text=False):
     row = {
         "case": case["name"], "phase": phase, "iteration": iteration,
         "status": "error", "http_status": None, "request_id": None,
@@ -133,34 +137,42 @@ def run_request(client, url, workload, case, phase, iteration):
     }
     started = perf_counter()
     try:
-        with client.stream("POST", url.rstrip("/") + "/v1/chat/completions", json=payload) as response:
+        async with client.stream("POST", url.rstrip("/") + "/v1/chat/completions", json=payload) as response:
             row["http_status"] = response.status_code
             row["request_id"] = response.headers.get("x-request-id")
             if response.status_code != 200:
-                response.read()
+                await response.aread()
                 try:
                     error = response.json()
                 except ValueError:
                     error = None
                 row["error_code"] = _error_code(error, "http_error")
+                if response.status_code == 429:
+                    row["status"] = "rejected"
+                elif row["error_code"] in ("request_canceled", "slow_consumer"):
+                    row["status"] = "canceled"
             elif response.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "text/event-stream":
                 row["error_code"] = "unexpected_content_type"
             else:
                 response.encoding = "utf-8"
-                _consume_stream(response, row, case, started)
+                await _consume_stream(
+                    response, row, case, started, cancel_after_text=cancel_after_text
+                )
     except StreamError as error:
         row["error_code"] = str(error)
+        if row["error_code"] in ("request_canceled", "slow_consumer"):
+            row["status"] = "canceled"
     except httpx.TimeoutException:
         row["error_code"] = "timeout"
     except httpx.HTTPError:
         row["error_code"] = "transport_error"
-    except KeyboardInterrupt:
+    except (asyncio.CancelledError, KeyboardInterrupt):
         row["status"] = "canceled"
         row["error_code"] = "interrupted"
     finally:
         if row["status"] != "success" or row["error_code"] is not None or row["e2e_ms"] is None:
             row["e2e_ms"] = (perf_counter() - started) * 1000
-    if row["error_code"] is not None and row["status"] != "canceled":
+    if row["error_code"] is not None and row["status"] not in ("canceled", "rejected"):
         row["status"] = "error"
     return row
 
@@ -172,6 +184,7 @@ def _summary(rows, elapsed):
     return {
         "measured_requests": len(measured), "successes": len(successes),
         "errors": sum(row["status"] == "error" for row in measured),
+        "rejections": sum(row["http_status"] == 429 for row in measured),
         "canceled": sum(row["status"] == "canceled" for row in measured),
         "warmup_errors": sum(row["phase"] == "warmup" and row["status"] != "success" for row in rows),
         "successful_completion_tokens": tokens,
@@ -181,15 +194,22 @@ def _summary(rows, elapsed):
     }
 
 
-def run_benchmark(url, workload, cases, *, server_config=None, warmups=2, repeats=20, timeout=120):
+async def _run_benchmark(
+    url, workload, cases, *, server_config=None, warmups=2, repeats=20, timeout=120,
+    concurrency=1, cancel_after_text=False,
+):
     result = {
         "schema_version": 1, "kind": "http", "environment": environment(),
         "workload": workload, "declared_server_config": server_config,
         "url": url, "timeout_seconds": timeout, "warmups": warmups, "repeats": repeats,
+        "concurrency": concurrency, "workload_mode": "bounded_waves",
+        "cancel_after_text": cancel_after_text,
+        "planned_measured_requests_per_case": repeats,
         "interrupted": False, "cases": [], "samples": [],
     }
     try:
-        with httpx.Client(timeout=timeout) as client:
+        limits = httpx.Limits(max_connections=concurrency, max_keepalive_connections=concurrency)
+        async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
             for case in cases:
                 entry = {"name": case["name"], "elapsed_seconds": 0.0, "summary": {}}
                 result["cases"].append(entry)
@@ -199,19 +219,50 @@ def run_benchmark(url, workload, cases, *, server_config=None, warmups=2, repeat
                     for phase, count in (("warmup", warmups), ("measured", repeats)):
                         if phase == "measured":
                             measured_start = perf_counter()
-                        for iteration in range(1, count + 1):
-                            row = run_request(client, url, workload, case, phase, iteration)
-                            rows.append(row)
-                            result["samples"].append(row)
-                            if row["status"] == "canceled":
-                                raise KeyboardInterrupt
+                        # Warm up sequentially; only measured waves exercise concurrency.
+                        width = concurrency if phase == "measured" else 1
+                        for first in range(1, count + 1, width):
+                            tasks = [
+                                asyncio.create_task(run_request(
+                                    client, url, workload, case, phase, iteration,
+                                    cancel_after_text=cancel_after_text and phase == "measured",
+                                ))
+                                for iteration in range(first, min(first + width, count + 1))
+                            ]
+                            try:
+                                await asyncio.gather(*tasks)
+                            finally:
+                                for task in tasks:
+                                    if not task.done():
+                                        task.cancel()
+                                outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+                                for row in outcomes:
+                                    if isinstance(row, dict):
+                                        rows.append(row)
+                                        result["samples"].append(row)
+                            if any(row.get("error_code") == "interrupted" for row in outcomes
+                                   if isinstance(row, dict)):
+                                raise asyncio.CancelledError
                 finally:
                     if measured_start is not None:
                         entry["elapsed_seconds"] = perf_counter() - measured_start
                     entry["summary"] = _summary(rows, entry["elapsed_seconds"])
-    except KeyboardInterrupt:
+    except (asyncio.CancelledError, KeyboardInterrupt):
         result["interrupted"] = True
     return result
+
+
+def run_benchmark(
+    url, workload, cases, *, server_config=None, warmups=2, repeats=20, timeout=120,
+    concurrency=1, cancel_after_text=False,
+):
+    if type(concurrency) is not int or concurrency < 1:
+        raise ValueError("Concurrency must be a positive integer")
+    return asyncio.run(_run_benchmark(
+        url, workload, cases, server_config=server_config, warmups=warmups,
+        repeats=repeats, timeout=timeout, concurrency=concurrency,
+        cancel_after_text=cancel_after_text,
+    ))
 
 
 def _load_workload(path):
@@ -275,11 +326,15 @@ def main(argv=None):
     parser.add_argument("--server-config", help="JSON object of declared, not detected, server configuration")
     parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=20)
+    parser.add_argument("--concurrency", type=int, default=1, help="Maximum requests per measured wave")
+    parser.add_argument("--cancel-after-text", action="store_true",
+                        help="Close each measured stream after its first nonempty content event")
     parser.add_argument("--timeout", type=float, default=120, help="HTTP timeout in seconds")
     parser.add_argument("--case", action="append", dest="case_names")
     args = parser.parse_args(argv)
-    if args.warmups < 0 or args.repeats < 1 or not math.isfinite(args.timeout) or args.timeout <= 0:
-        parser.error("Require warmups >= 0, repeats >= 1, and a finite positive timeout")
+    if (args.warmups < 0 or args.repeats < 1 or args.concurrency < 1
+            or not math.isfinite(args.timeout) or args.timeout <= 0):
+        parser.error("Require warmups >= 0, repeats >= 1, concurrency >= 1, and a finite positive timeout")
     try:
         url = httpx.URL(args.url)
         if url.scheme not in ("http", "https") or not url.host or url.query or url.fragment:
@@ -304,6 +359,7 @@ def main(argv=None):
     result = run_benchmark(
         args.url, workload, cases, server_config=server_config,
         warmups=args.warmups, repeats=args.repeats, timeout=args.timeout,
+        concurrency=args.concurrency, cancel_after_text=args.cancel_after_text,
     )
     write_json(args.output, result)
     for case in result["cases"]:
@@ -315,16 +371,21 @@ def main(argv=None):
             return "n/a" if value is None else f"{value:.2f}"
         print(
             f"{case['name']}: success={summary['successes']}/{summary['measured_requests']} "
-            f"errors={summary['errors']} canceled={summary['canceled']} "
+            f"errors={summary['errors']} rejected429={summary['rejections']} canceled={summary['canceled']} "
             f"warmup_failures={summary['warmup_errors']} "
             f"E2E p50/p95={number(latency['p50'])}/{number(latency['p95'])} ms "
             f"first-text p50={number(first)} ms tokens/s={number(throughput)}"
         )
+    print(f"Workload: bounded_waves, concurrency={args.concurrency}, total measured requests/case={args.repeats}.")
     print("Latency percentiles use successful measured samples; small-sample p95 is exploratory.")
     print(f"Saved {args.output}")
     if result["interrupted"]:
         return 130
-    return int(any(row["status"] != "success" for row in result["samples"]))
+    return int(any(
+        row["status"] != "success"
+        and not (args.cancel_after_text and row["error_code"] == "cancel_after_text")
+        for row in result["samples"]
+    ))
 
 
 if __name__ == "__main__":

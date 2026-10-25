@@ -10,14 +10,16 @@ from uuid import UUID
 import httpx
 from pydantic import ValidationError
 
+from src import api
 from src.api import (
     ChatCompletionRequest,
     InferenceBusy,
     InferenceUnavailable,
     app,
+    cancel_inference,
     submit_inference,
 )
-from src.inference import ContextLimitError, GenerationResult, MODEL_ID
+from src.inference import ContextLimitError, GenerationCancelled, GenerationResult, MODEL_ID
 
 
 def request_data(**changes):
@@ -176,7 +178,10 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(health.status_code, 200)
                 self.assertEqual(health.json(), {"status": "alive"})
                 self.assertEqual(ready.status_code, 200)
-                self.assertEqual(ready.json(), {"ready": True, "status": "ready"})
+                self.assertEqual(ready.json(), {
+                    "ready": True, "status": "ready", "running": 0,
+                    "queued": 0, "queue_capacity": 2,
+                })
                 self.assertIs(app.state.runtime, self.runtime)
             self.loader.assert_called_once_with()
 
@@ -209,19 +214,30 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(app.state.executor)
 
     async def test_health_remains_available_when_inference_slot_is_busy(self):
+        started, release = Event(), Event()
+
+        def held(*args, **kwargs):
+            started.set()
+            if not release.wait(5):
+                raise TimeoutError("Producer was not released")
+            return GenerationResult("ok", 1, [2], "stop")
+
         async with app.router.lifespan_context(app):
-            app.state.admission_guard.acquire()
-            try:
-                health = await self.client.get("/health")
-                ready = await self.client.get("/ready")
-                self.assertEqual(health.status_code, 200)
-                self.assertEqual(ready.status_code, 503)
-                self.assertEqual(ready.json(), {"ready": False, "status": "busy"})
-            finally:
-                app.state.admission_guard.release()
-            ready = await self.client.get("/ready")
-            self.assertEqual(ready.status_code, 200)
-            self.assertTrue(ready.json()["ready"])
+            with patch("src.api.generate", side_effect=held):
+                job = submit_inference(app, ChatCompletionRequest.model_validate(request_data()))
+                try:
+                    self.assertTrue(await asyncio.to_thread(started.wait, 2))
+                    self.assertEqual((await self.client.get("/health")).status_code, 200)
+                    ready = await self.client.get("/ready")
+                    self.assertEqual(ready.status_code, 200)
+                    self.assertEqual(ready.json(), {
+                        "ready": True, "status": "busy", "running": 1,
+                        "queued": 0, "queue_capacity": 2,
+                    })
+                finally:
+                    release.set()
+                    await job.result
+            self.assertTrue((await self.client.get("/ready")).json()["ready"])
 
     async def test_uninitialized_application_does_not_claim_readiness(self):
         with (
@@ -230,7 +246,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         ):
             ready = await self.client.get("/ready")
         self.assertEqual(ready.status_code, 503)
-        self.assertEqual(ready.json(), {"ready": False, "status": "not_ready"})
+        self.assertEqual(ready.json()["status"], "not_ready")
 
     async def test_shutdown_waits_for_worker_without_blocking_http_loop(self):
         context = app.router.lifespan_context(app)
@@ -239,7 +255,6 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         release = Event()
         shutdown_started = Event()
         executor = app.state.executor
-        guard = app.state.admission_guard
 
         def held_producer(*args, **kwargs):
             started.set()
@@ -249,7 +264,11 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         generation_patch = patch("src.api.generate", side_effect=held_producer)
         generation_patch.start()
         self.addCleanup(generation_patch.stop)
-        future = submit_inference(app, ChatCompletionRequest.model_validate(request_data()))
+        job = submit_inference(app, ChatCompletionRequest.model_validate(request_data()))
+        prepared = asyncio.get_running_loop().create_future()
+        queued = submit_inference(
+            app, ChatCompletionRequest.model_validate(request_data()), prepared=prepared,
+        )
         original_shutdown = executor.shutdown
 
         def observed_shutdown(*args, **kwargs):
@@ -266,7 +285,14 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                 shutdown_task = asyncio.create_task(context.__aexit__(None, None, None))
                 self.assertTrue(await asyncio.to_thread(shutdown_started.wait, 2))
                 self.assertFalse(shutdown_task.done())
-                self.assertFalse(future.done())
+                self.assertFalse(job.result.done())
+                self.assertEqual(job.cancellation.reason, "shutdown")
+                self.assertEqual(queued.state, "canceled")
+                for future in (queued.result, prepared):
+                    with self.assertRaises(GenerationCancelled) as canceled:
+                        await future
+                    self.assertEqual(canceled.exception.reason, "shutdown")
+                self.assertIsNone(queued.producer)
                 self.assertIs(app.state.runtime, self.runtime)
                 self.assertFalse(app.state.initialized)
                 health = await self.client.get("/health")
@@ -274,7 +300,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(health.status_code, 200)
                 self.assertEqual(ready.status_code, 503)
                 self.assertEqual(
-                    ready.json(), {"ready": False, "status": "shutting_down"}
+                    ready.json()["status"], "shutting_down"
                 )
                 with self.assertRaises(InferenceUnavailable):
                     submit_inference(
@@ -282,11 +308,12 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                     )
                 release.set()
                 await asyncio.wait_for(shutdown_task, timeout=3)
-            self.assertIs(future.result(), self.runtime)
+            with self.assertRaises(GenerationCancelled):
+                await job.result
             self.assertIsNone(app.state.runtime)
             self.assertIsNone(app.state.executor)
             self.assertEqual(app.state.producer_futures, set())
-            self.assertFalse(guard.locked())
+            self.assertIsNone(app.state.active_job)
         finally:
             release.set()
             safety_release.cancel()
@@ -321,84 +348,276 @@ class AdmissionTests(unittest.IsolatedAsyncioTestCase):
                 ):
                     with self.assertRaises(InferenceUnavailable):
                         submit_inference(app, self.request)
-                self.assertFalse(app.state.admission_guard.locked())
+                self.assertIsNone(app.state.active_job)
                 self.assertEqual(app.state.producer_futures, set())
 
-    async def test_busy_rejection_and_consumer_cancellation_keep_worker_owned(self):
-        started = Event()
-        release = Event()
+    async def test_fifo_capacity_and_cancellation_retain_actual_worker_ownership(self):
+        started, release = Event(), Event()
         loop_thread = get_ident()
+        calls = []
 
-        def held_generation(*args, **kwargs):
+        def held_generation(runtime, messages, **kwargs):
             self.assertNotEqual(get_ident(), loop_thread)
-            started.set()
-            if not release.wait(5):
-                raise TimeoutError("Test producer was not released.")
+            name = messages[0]["content"]
+            calls.append(name)
+            if name == "first":
+                started.set()
+                if not release.wait(5):
+                    raise TimeoutError("Test producer was not released.")
             return self.result
 
+        def admit(name):
+            return submit_inference(app, ChatCompletionRequest.model_validate(
+                request_data(messages=[{"role": "user", "content": name}]),
+            ))
+
         with patch("src.api.generate", side_effect=held_generation):
-            result = submit_inference(app, self.request)
-            producer = next(iter(app.state.producer_futures))
+            first = admit("first")
             try:
                 self.assertTrue(await asyncio.to_thread(started.wait, 2))
+                second, third = admit("second"), admit("third")
+                self.assertIsNone(second.producer)
+                self.assertIsNone(third.producer)
+                self.assertEqual(calls, ["first"])
+                self.assertEqual(app.state.producer_futures, {first.producer})
                 with self.assertRaises(InferenceBusy):
-                    submit_inference(app, self.request)
-                self.assertEqual(app.state.producer_futures, {producer})
-                health = await self.client.get("/health")
+                    admit("overflow")
+                self.assertEqual((await self.client.get("/health")).status_code, 200)
                 ready = await self.client.get("/ready")
-                self.assertEqual(health.status_code, 200)
                 self.assertEqual(ready.status_code, 503)
-                self.assertEqual(ready.json(), {"ready": False, "status": "busy"})
+                self.assertEqual(ready.json(), {
+                    "ready": False, "status": "full", "running": 1,
+                    "queued": 2, "queue_capacity": 2,
+                })
 
-                consumer_started = asyncio.Event()
-
-                async def consume():
-                    consumer_started.set()
-                    return await result
-
-                consumer = asyncio.create_task(consume())
-                await consumer_started.wait()
-                consumer.cancel()
-                with self.assertRaises(asyncio.CancelledError):
-                    await consumer
-                self.assertTrue(result.cancelled())
-                self.assertFalse(producer.cancelled())
-                self.assertFalse(producer.done())
-                self.assertTrue(app.state.admission_guard.locked())
-                self.assertEqual(app.state.producer_futures, {producer})
+                cancel_inference(app, second)
+                with self.assertRaises(GenerationCancelled):
+                    await second.result
+                self.assertIsNone(second.started_at)
+                self.assertEqual((await self.client.get("/ready")).status_code, 200)
+                fourth = admit("fourth")
+                cancel_inference(app, first)
+                self.assertIs(app.state.active_job, first)
+                self.assertFalse(first.producer.done())
+                self.assertEqual(calls, ["first"])
                 with self.assertRaises(InferenceBusy):
-                    submit_inference(app, self.request)
+                    admit("still full")
             finally:
                 release.set()
-                await asyncio.wait_for(asyncio.shield(producer), timeout=3)
-
-            self.assertFalse(app.state.admission_guard.locked())
+                await asyncio.gather(first.result, return_exceptions=True)
+            self.assertEqual(first.state, "canceled")
+            self.assertEqual(await third.result, self.result)
+            self.assertEqual(await fourth.result, self.result)
+            self.assertEqual(calls, ["first", "third", "fourth"])
+            self.assertIsNone(app.state.active_job)
             self.assertEqual(app.state.producer_futures, set())
-            ready = await self.client.get("/ready")
-            self.assertEqual(ready.status_code, 200)
-            recovered = await submit_inference(app, self.request)
-            self.assertEqual(recovered, self.result)
+            self.assertEqual((await self.client.get("/ready")).status_code, 200)
 
     async def test_context_and_generation_failures_release_slot_for_recovery(self):
         for failure in (ContextLimitError("Oversized request"), RuntimeError("Failed")):
             with self.subTest(failure=type(failure).__name__):
                 with patch("src.api.generate", side_effect=[failure, self.result]):
                     with self.assertRaises(type(failure)):
-                        await submit_inference(app, self.request)
-                    self.assertFalse(app.state.admission_guard.locked())
+                        await submit_inference(app, self.request).result
+                    self.assertIsNone(app.state.active_job)
                     self.assertEqual(app.state.producer_futures, set())
-                    recovered = await submit_inference(app, self.request)
+                    recovered = await submit_inference(app, self.request).result
                     self.assertEqual(recovered, self.result)
 
     async def test_submission_failure_releases_slot_for_recovery(self):
         with patch.object(app.state.executor, "submit", side_effect=RuntimeError("No worker")):
             with self.assertRaises(RuntimeError):
-                submit_inference(app, self.request)
-        self.assertFalse(app.state.admission_guard.locked())
+                await submit_inference(app, self.request).result
+        self.assertIsNone(app.state.active_job)
         self.assertEqual(app.state.producer_futures, set())
         with patch("src.api.generate", return_value=self.result):
-            recovered = await submit_inference(app, self.request)
+            recovered = await submit_inference(app, self.request).result
         self.assertEqual(recovered, self.result)
+
+    async def test_worker_failures_promote_fifo_and_wake_preparation(self):
+        for failure in (ContextLimitError("Token limit"), RuntimeError("Private failure")):
+            with self.subTest(failure=type(failure).__name__):
+                started, release = Event(), Event()
+                calls = []
+
+                def generate(*args, **kwargs):
+                    calls.append(len(calls))
+                    if len(calls) == 1:
+                        started.set()
+                        if not release.wait(5):
+                            raise TimeoutError("Producer was not released")
+                        raise failure
+                    return self.result
+
+                with patch("src.api.generate", side_effect=generate):
+                    prepared = asyncio.get_running_loop().create_future()
+                    first = submit_inference(app, self.request, prepared=prepared)
+                    queued = []
+                    try:
+                        self.assertTrue(await asyncio.to_thread(started.wait, 2))
+                        queued = [submit_inference(app, self.request) for _ in range(2)]
+                        self.assertTrue(all(job.producer is None for job in queued))
+                    finally:
+                        release.set()
+                    for future in (first.result, prepared):
+                        with self.assertRaises(type(failure)):
+                            await future
+                    self.assertEqual(await queued[0].result, self.result)
+                    self.assertEqual(await queued[1].result, self.result)
+                    self.assertLessEqual(queued[0].finished_at, queued[1].started_at)
+                    self.assertEqual(calls, [0, 1, 2])
+                    self.assertIsNone(app.state.active_job)
+
+    async def test_failed_submission_during_promotion_does_not_strand_next_job(self):
+        started, release = Event(), Event()
+
+        def held(*args, **kwargs):
+            started.set()
+            if not release.wait(5):
+                raise TimeoutError("Producer was not released")
+            return self.result
+
+        original_submit = app.state.executor.submit
+        attempts = 0
+
+        def fail_once(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("Worker submission failed")
+            return original_submit(*args, **kwargs)
+
+        with patch("src.api.generate", side_effect=held):
+            first = submit_inference(app, self.request)
+            try:
+                self.assertTrue(await asyncio.to_thread(started.wait, 2))
+                prepared = asyncio.get_running_loop().create_future()
+                second = submit_inference(app, self.request, prepared=prepared)
+                third = submit_inference(app, self.request)
+                with patch.object(app.state.executor, "submit", side_effect=fail_once):
+                    release.set()
+                    await first.result
+                    for future in (second.result, prepared):
+                        with self.assertRaises(RuntimeError):
+                            await future
+                    self.assertEqual(await third.result, self.result)
+                self.assertIsNone(second.started_at)
+                self.assertEqual(second.state, "failed")
+                self.assertIsNone(app.state.active_job)
+            finally:
+                release.set()
+                await asyncio.gather(first.result, return_exceptions=True)
+
+    async def test_slot_is_released_by_raw_future_completion_not_worker_finally(self):
+        finished_generation, release_future = Event(), Event()
+        original_run = api._run_inference
+        first_job = None
+
+        def held_exit(runtime, job, loop):
+            result = original_run(runtime, job, loop)
+            if job is first_job:
+                finished_generation.set()
+                if not release_future.wait(5):
+                    raise TimeoutError("Raw worker was not released")
+            return result
+
+        # Hold generation until first_job is assigned, then hold the raw worker exit.
+        begin = Event()
+
+        def generate(*args, **kwargs):
+            if not begin.wait(5):
+                raise TimeoutError("Generation was not released")
+            return self.result
+
+        with (
+            patch("src.api._run_inference", side_effect=held_exit),
+            patch("src.api.generate", side_effect=generate) as generation,
+        ):
+            first_job = submit_inference(app, self.request)
+            begin.set()
+            try:
+                self.assertTrue(await asyncio.to_thread(finished_generation.wait, 2))
+                second = submit_inference(app, self.request)
+                self.assertIs(app.state.active_job, first_job)
+                self.assertIsNotNone(first_job.finished_at)
+                self.assertFalse(first_job.producer.done())
+                self.assertFalse(first_job.result.done())
+                self.assertIsNone(second.producer)
+                self.assertEqual(generation.call_count, 1)
+            finally:
+                release_future.set()
+                await first_job.result
+            self.assertEqual(await second.result, self.result)
+
+    async def test_delivery_abort_after_worker_exit_does_not_relabel_success(self):
+        original_done = api._producer_done
+
+        def abort_before_callback(application, job, producer):
+            self.assertTrue(producer.done())
+            self.assertIsNotNone(job.finished_at)
+            cancel_inference(application, job, "slow_consumer")
+            original_done(application, job, producer)
+
+        with (
+            patch("src.api.generate", return_value=self.result),
+            patch("src.api._producer_done", side_effect=abort_before_callback),
+        ):
+            job = submit_inference(app, self.request)
+            self.assertEqual(await job.result, self.result)
+        self.assertEqual(job.state, "completed")
+        self.assertFalse(job.cancellation.is_cancelled())
+        self.assertIsNone(app.state.active_job)
+
+    async def test_worker_exit_between_cancellation_check_and_signal_preserves_success(self):
+        entered, release, exited = Event(), Event(), Event()
+        original_worker = api._run_inference
+
+        def held_result(*args, **kwargs):
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError("Generation was not released")
+            return self.result
+
+        def observed_exit(*args):
+            try:
+                return original_worker(*args)
+            finally:
+                exited.set()
+
+        with (
+            patch("src.api.generate", side_effect=held_result),
+            patch("src.api._run_inference", side_effect=observed_exit),
+            self.assertLogs(api.logger, level="INFO") as captured,
+        ):
+            job = submit_inference(
+                app, self.request, request_log=api._RequestLog(api.perf_counter()),
+            )
+            try:
+                self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                original_cancel = job.cancellation.cancel
+
+                def signal_after_exit(reason):
+                    release.set()
+                    if not exited.wait(2):
+                        raise TimeoutError("Worker did not exit")
+                    original_cancel(reason)
+
+                with patch.object(job.cancellation, "cancel", side_effect=signal_after_exit):
+                    cancel_inference(app, job)
+                self.assertLess(job.finished_at, job.cancellation.requested_at)
+                self.assertEqual(await job.result, self.result)
+            finally:
+                release.set()
+        self.assertEqual(job.state, "completed")
+        self.assertIsNone(app.state.active_job)
+        records = [json.loads(record.getMessage()) for record in captured.records]
+        for event in ("producer_finished", "scheduling_finished"):
+            record = next(row for row in records if row["event"] == event)
+            self.assertIsNone(record["cancellation_delay_ms"])
+            self.assertNotIn("cancellation_reason", record)
+        producer = next(row for row in records if row["event"] == "producer_finished")
+        self.assertEqual(producer["outcome"], "completed")
+        self.assertEqual(producer["completion_tokens"], len(self.result.generated_ids))
 
     async def test_abandoned_failure_is_observed_and_does_not_leak_busy_slot(self):
         started = Event()
@@ -417,27 +636,27 @@ class AdmissionTests(unittest.IsolatedAsyncioTestCase):
 
         try:
             with patch("src.api.generate", side_effect=failing_generation):
-                result = submit_inference(app, self.request)
+                job = submit_inference(app, self.request)
                 producer = next(iter(app.state.producer_futures))
                 producer.add_done_callback(lambda future: completed.set())
                 try:
                     self.assertTrue(await asyncio.to_thread(started.wait, 2))
-                    result.cancel()
-                    with self.assertRaises(InferenceBusy):
-                        submit_inference(app, self.request)
+                    cancel_inference(app, job)
+                    self.assertIs(app.state.active_job, job)
+                    self.assertFalse(job.producer.done())
                 finally:
                     release.set()
                     await asyncio.wait_for(completed.wait(), timeout=3)
-                self.assertFalse(app.state.admission_guard.locked())
+                self.assertIsNone(app.state.active_job)
                 self.assertEqual(app.state.producer_futures, set())
                 # Never await or retrieve the producer exception in this test.
                 del producer
-                del result
+                del job
             await asyncio.sleep(0)
             gc.collect()
             self.assertEqual(unhandled, [])
             with patch("src.api.generate", return_value=self.result):
-                recovered = await submit_inference(app, self.request)
+                recovered = await submit_inference(app, self.request).result
             self.assertEqual(recovered, self.result)
         finally:
             release.set()
@@ -486,8 +705,10 @@ class CompletionEndpointTests(unittest.IsolatedAsyncioTestCase):
             (request_data(messages=[{"role": "user", "content": marker, marker: marker}]), "invalid_request"),
             (request_data(top_p=0.9), "invalid_parameter_combination"),
         ]
-        app.state.admission_guard.acquire()
-        try:
+        with (
+            patch.object(app.state, "active_job", object()),
+            patch.object(app.state, "pending_jobs", [object(), object()]),
+        ):
             for body, code in cases:
                 with self.subTest(body=body):
                     response = await self.client.post(
@@ -502,8 +723,6 @@ class CompletionEndpointTests(unittest.IsolatedAsyncioTestCase):
                     self.assertNotIn(marker, response.text)
                     self.assertNotEqual(response.headers["X-Request-ID"], marker)
             self.assertEqual(app.state.producer_futures, set())
-        finally:
-            app.state.admission_guard.release()
 
     async def test_unavailable_application_returns_503(self):
         for initialized, shutting_down in ((False, False), (True, True)):
@@ -514,7 +733,7 @@ class CompletionEndpointTests(unittest.IsolatedAsyncioTestCase):
                 ):
                     response = await self.client.post(self.path, json=request_data())
                 self.assert_error(response, 503, "not_ready")
-                self.assertFalse(app.state.admission_guard.locked())
+                self.assertIsNone(app.state.active_job)
 
     async def test_preparation_and_generation_errors_allow_later_success(self):
         marker = "PRIVATE-INPUT-MARKER"
@@ -537,7 +756,7 @@ class CompletionEndpointTests(unittest.IsolatedAsyncioTestCase):
                     )
                     self.assert_error(response, status, code)
                     self.assertNotIn(marker, response.text)
-                    self.assertFalse(app.state.admission_guard.locked())
+                    self.assertIsNone(app.state.active_job)
                     recovered = await self.client.post(self.path, json=request_data())
                     self.assertEqual(recovered.status_code, 200)
                 ready = await self.client.get("/ready")
@@ -548,14 +767,13 @@ class CompletionEndpointTests(unittest.IsolatedAsyncioTestCase):
             response = await self.client.post(self.path, json=request_data())
         self.assert_error(response, 500, "generation_failed")
         self.assertNotIn("SECRET", response.text)
-        self.assertFalse(app.state.admission_guard.locked())
+        self.assertIsNone(app.state.active_job)
         with patch("src.api.generate", return_value=self.result):
             recovered = await self.client.post(self.path, json=request_data())
         self.assertEqual(recovered.status_code, 200)
 
-    async def test_busy_and_canceled_http_handler_retain_producer_ownership(self):
-        started = Event()
-        release = Event()
+    async def test_full_queue_and_canceled_http_handler_retain_producer_ownership(self):
+        started, release = Event(), Event()
 
         def held_generation(*args, **kwargs):
             started.set()
@@ -565,31 +783,36 @@ class CompletionEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("src.api.generate", side_effect=held_generation):
             first = asyncio.create_task(self.client.post(self.path, json=request_data()))
+            queued = []
             producer = None
             try:
                 self.assertTrue(await asyncio.to_thread(started.wait, 2))
-                producer = next(iter(app.state.producer_futures))
-                health = await self.client.get("/health")
-                ready = await self.client.get("/ready")
-                self.assertEqual(health.status_code, 200)
-                self.assertEqual(ready.status_code, 503)
-                second = await self.client.post(self.path, json=request_data())
-                self.assert_error(second, 429, "server_busy")
+                active = app.state.active_job
+                producer = active.producer
+                queued = [
+                    submit_inference(app, ChatCompletionRequest.model_validate(request_data()))
+                    for _ in range(2)
+                ]
+                self.assertEqual((await self.client.get("/health")).status_code, 200)
+                self.assertEqual((await self.client.get("/ready")).status_code, 503)
+                overflow = await self.client.post(self.path, json=request_data())
+                self.assert_error(overflow, 429, "server_busy")
                 first.cancel()
                 with self.assertRaises(asyncio.CancelledError):
                     await first
                 self.assertFalse(producer.done())
-                self.assertTrue(app.state.admission_guard.locked())
-                third = await self.client.post(self.path, json=request_data())
-                self.assert_error(third, 429, "server_busy")
+                self.assertIs(app.state.active_job, active)
+                self.assertEqual(active.cancellation.reason, "request_canceled")
+                overflow = await self.client.post(self.path, json=request_data())
+                self.assert_error(overflow, 429, "server_busy")
             finally:
                 release.set()
                 if producer is not None:
-                    await asyncio.wait_for(asyncio.shield(producer), timeout=3)
-                await asyncio.gather(first, return_exceptions=True)
+                    await asyncio.gather(producer, return_exceptions=True)
+                await asyncio.gather(first, *(job.result for job in queued), return_exceptions=True)
             recovered = await self.client.post(self.path, json=request_data())
             self.assertEqual(recovered.status_code, 200)
-            self.assertFalse(app.state.admission_guard.locked())
+            self.assertIsNone(app.state.active_job)
 
     async def test_unknown_routes_and_wrong_methods_keep_normal_routing(self):
         missing = await self.client.post("/not-a-route", json=request_data())

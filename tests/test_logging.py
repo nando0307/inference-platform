@@ -68,6 +68,7 @@ class LifecycleLoggingTests(unittest.IsolatedAsyncioTestCase):
             "event", "request_id", "model", "stream", "http_status", "outcome",
             "duration_ms", "producer_duration_ms", "prompt_tokens", "completion_tokens",
             "error_code", "exception_type",
+            "state", "queue_wait_ms", "cancellation_delay_ms", "cancellation_reason",
         }
         for record in self.records():
             self.assertLessEqual(record.keys(), allowed)
@@ -86,9 +87,9 @@ class LifecycleLoggingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         request_id = response.headers["X-Request-ID"]
         self.assertEqual(response.json()["id"], "chatcmpl-" + request_id)
-        self.assertEqual([r["event"] for r in self.records(request_id)], [
-            "request_accepted", "producer_finished", "request_finished",
-        ])
+        self.one("request_accepted", request_id)
+        self.one("request_started", request_id)
+        self.assertEqual(self.one("scheduling_finished", request_id)["state"], "completed")
         delivery = self.one("request_finished", request_id)
         producer = self.one("producer_finished", request_id)
         self.assertEqual(delivery["http_status"], 200)
@@ -174,11 +175,11 @@ class LifecycleLoggingTests(unittest.IsolatedAsyncioTestCase):
         self.assert_private()
 
     async def test_busy_and_unavailable_are_rejections_without_producer_events(self):
-        api.app.state.admission_guard.acquire()
-        try:
+        with (
+            patch.object(api.app.state, "active_job", object()),
+            patch.object(api.app.state, "pending_jobs", [object(), object()]),
+        ):
             busy = await self.client.post("/v1/chat/completions", json=payload(False))
-        finally:
-            api.app.state.admission_guard.release()
         with patch.object(api.app.state, "shutting_down", True):
             unavailable = await self.client.post("/v1/chat/completions", json=payload())
         for response, status, code in ((busy, 429, "server_busy"), (unavailable, 503, "not_ready")):
@@ -220,11 +221,16 @@ class LifecycleLoggingTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("exception_type", record)
         self.assert_private()
 
-    async def test_submission_failure_logs_no_accepted_or_producer_event(self):
+    async def test_submission_failure_finishes_admitted_job_without_producer_event(self):
         with patch.object(api.app.state.executor, "submit", side_effect=RuntimeError(self.marker)):
             response = await self.client.post("/v1/chat/completions", json=payload())
         self.assertEqual(response.status_code, 500)
-        self.assertEqual(len(self.records()), 1)
+        self.one("request_accepted")
+        scheduling = self.one("scheduling_finished")
+        self.assertEqual(scheduling["state"], "failed")
+        self.assertIsNone(scheduling["queue_wait_ms"])
+        self.assertIsNone(scheduling["cancellation_delay_ms"])
+        self.assertFalse(any(record["event"] == "producer_finished" for record in self.records()))
         record = self.one("request_finished")
         self.assertEqual(record["outcome"], "failed")
         self.assertEqual(record["exception_type"], "RuntimeError")
@@ -287,7 +293,11 @@ class LifecycleLoggingTests(unittest.IsolatedAsyncioTestCase):
                         streamer.on_finalized_text("", stream_end=True)
                     return self.result
 
-                with patch("src.api.perf_counter", side_effect=lambda: clock[0]), patch("src.api.generate", side_effect=generate):
+                with (
+                    patch("src.api.perf_counter", side_effect=lambda: clock[0]),
+                    patch("src.inference.perf_counter", side_effect=lambda: clock[0]),
+                    patch("src.api.generate", side_effect=generate),
+                ):
                     connection = Connection(stream, spec)
                     producer = None
                     try:
@@ -309,7 +319,7 @@ class LifecycleLoggingTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(delivery["http_status"], 200 if stream else None)
                         self.assertNotIn("completion_tokens", delivery)
                         self.assertFalse(any(r["event"] == "producer_finished" for r in self.records()))
-                        self.assertTrue(api.app.state.admission_guard.locked())
+                        self.assertIsNotNone(api.app.state.active_job)
                         self.assertFalse(producer.done())
                         clock[0] = 112.0
                     finally:
@@ -320,17 +330,24 @@ class LifecycleLoggingTests(unittest.IsolatedAsyncioTestCase):
                 worker = self.one("producer_finished")
                 self.assertEqual(worker["request_id"], delivery["request_id"])
                 self.assertEqual(worker["producer_duration_ms"], 12000.0)
-                self.assertEqual(worker["outcome"], "failed" if fail else "completed")
+                self.assertEqual(worker["outcome"], "failed" if fail else "canceled")
                 if fail:
                     self.assertEqual(worker["exception_type"], "RuntimeError")
                     self.assertNotIn("completion_tokens", worker)
                 else:
-                    self.assertEqual(worker["completion_tokens"], 2)
+                    self.assertEqual(worker["error_code"], "request_canceled")
+                    self.assertNotIn("completion_tokens", worker)
                 self.assertEqual(self.one("request_finished"), delivery)
-                self.assertEqual([r["event"] for r in self.records()], [
-                    "request_accepted", "request_finished", "producer_finished",
-                ])
-                self.assertFalse(api.app.state.admission_guard.locked())
+                self.assertEqual(worker["queue_wait_ms"], 0)
+                self.assertEqual(worker["cancellation_delay_ms"], 7000.0)
+                scheduling = self.one("scheduling_finished")
+                self.assertEqual(scheduling["state"], "failed" if fail else "canceled")
+                self.assertEqual(scheduling["cancellation_delay_ms"], 7000.0)
+                self.assertEqual(
+                    scheduling["cancellation_reason"],
+                    "request_canceled" if cancel else "client_disconnected",
+                )
+                self.assertIsNone(api.app.state.active_job)
                 self.assert_private()
 
     async def test_send_failure_is_a_single_disconnect_not_success(self):
@@ -360,6 +377,71 @@ class LifecycleLoggingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record["outcome"], "failed")
         self.assertEqual(record["exception_type"], "RuntimeError")
         self.assertEqual(record["request_id"], response.json()["error"]["request_id"])
+        self.assertEqual(self.one("producer_finished")["outcome"], "completed")
+        self.assert_private()
+
+    async def test_queue_wait_excludes_body_parsing_and_canceled_waiter_has_no_worker_metrics(self):
+        started, release = Event(), Event()
+        clock = [100.0]
+
+        def held(*args, **kwargs):
+            started.set()
+            if not release.wait(5):
+                raise TimeoutError("Producer was not released")
+            return self.result
+
+        with (
+            patch("src.api.perf_counter", side_effect=lambda: clock[0]),
+            patch("src.inference.perf_counter", side_effect=lambda: clock[0]),
+            patch("src.api.generate", side_effect=held),
+        ):
+            request = api.ChatCompletionRequest.model_validate(payload(False))
+            active_log = api._RequestLog(90.0)
+            active = api.submit_inference(api.app, request, request_log=active_log)
+            try:
+                self.assertTrue(await asyncio.to_thread(started.wait, 2))
+                clock[0] = 102.0
+                canceled_log = api._RequestLog(91.0)
+                canceled = api.submit_inference(api.app, request, request_log=canceled_log)
+                clock[0] = 103.0
+                queued_log = api._RequestLog(92.0)
+                queued = api.submit_inference(api.app, request, request_log=queued_log)
+                clock[0] = 105.0
+                api.cancel_inference(api.app, canceled)
+                api.cancel_inference(api.app, canceled)
+                canceled_record = self.one("scheduling_finished", canceled_log.request_id)
+                self.assertEqual(canceled_record["state"], "canceled")
+                self.assertEqual(canceled_record["cancellation_reason"], "client_disconnected")
+                self.assertIsNone(canceled_record["queue_wait_ms"])
+                self.assertIsNone(canceled_record["cancellation_delay_ms"])
+                self.assertFalse(any(
+                    record["event"] in {"producer_finished", "request_started"}
+                    for record in self.records(canceled_log.request_id)
+                ))
+                clock[0] = 110.0
+            finally:
+                release.set()
+                await active.result
+            await queued.result
+        queued_record = self.one("scheduling_finished", queued_log.request_id)
+        self.assertEqual(queued_record["state"], "completed")
+        self.assertEqual(queued_record["queue_wait_ms"], 7000.0)
+        self.assertIsNone(queued_record["cancellation_delay_ms"])
+        self.assertEqual(self.one("request_started", queued_log.request_id)["queue_wait_ms"], 7000.0)
+        self.assert_private()
+
+    async def test_ordinary_send_deadline_records_failure_not_success(self):
+        with (
+            patch("src.api.generate", return_value=self.result),
+            patch("src.api.STREAM_SEND_TIMEOUT", 0.05),
+        ):
+            connection = HeldDelivery(False)
+            await asyncio.wait_for(connection.final_send_entered.wait(), 2)
+            await asyncio.wait_for(connection.task, 2)
+        delivery = self.one("request_finished")
+        self.assertEqual(delivery["http_status"], 200)
+        self.assertEqual(delivery["outcome"], "failed")
+        self.assertEqual(delivery["error_code"], "slow_consumer")
         self.assertEqual(self.one("producer_finished")["outcome"], "completed")
         self.assert_private()
 

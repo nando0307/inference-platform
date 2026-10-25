@@ -14,15 +14,15 @@ prompt timing comparisons, KV tensor storage inspection, token-ID comparisons
 against Hugging Face `generate()` for token-limit and EOS stopping, and an
 initial synchronized CPU/MPS float32 comparison. Do not restart the basics.
 
-Current API state: Stage 2 Checkpoints 1-11 and Checkpoint 12 technical acceptance
-are implemented and verified, including ordinary HTTP completions, incremental
-SSE, disconnect ownership, private lifecycle logging, and graceful shutdown.
-Phase 3 benchmarks are now implemented and verified: 73 tests, 80 measured HTTP
-requests, 80 measured fixed-length generations, and a separate CPU profile.
-Next: explain the timing boundaries and interpret the measured baseline before
-starting Stage 4. The Phase 2 questions were reviewed with the learner, but
-independent understanding checks remain pending. Earlier entries describe the
-state at that time.
+Current API state: Stage 2 technical acceptance, Phase 3 benchmarks, and Phase 4
+bounded scheduling/cancellation are implemented. There are 106 passing tests.
+Real-Qwen controls verify FIFO admission, queued removal, running disconnects,
+bounded streaming pressure, request-setting isolation, and both shutdown paths.
+See [the Phase 4 entry](#phase-4-bounded-concurrency-and-cancellation) for current
+policy, measured concurrency evidence, and limitations.
+Next: explain queue wait versus model time, cancellation ownership, and why
+more connected clients do not imply parallel model execution. Independent
+understanding checks remain pending. Earlier entries describe their own time.
 Manual top-k/top-p lessons were explicitly skipped, not completed. Use the
 stable roadmap [plan.md](../plan.md), this evidence log, and actual code together.
 
@@ -67,6 +67,14 @@ stable roadmap [plan.md](../plan.md), this evidence log, and actual code togethe
 - Both scripts currently use `Reply with exactly one word: Hello`, which yields
   28 chat-formatted prompt tokens. The 34-token and 516-token prompts below are
   historical experiment inputs, not the current input.
+- `src/inference.py`: one loaded runtime, fresh generation settings per request,
+  context checks, and cooperative cancellation around real generation.
+- `src/api.py`: validated HTTP/SSE delivery, one active job, a two-slot FIFO,
+  capacity-based readiness, lifecycle logging, and shutdown ownership.
+- `src/streaming.py`: bounded Transformers text streamer with cancellation-aware
+  backpressure; no alternate decoding implementation.
+- `benchmarks/`: fixed workloads, bounded-wave HTTP clients, opt-in model and
+  scheduling measurements, reporting, and separate model-side profiling.
 
 ## Concepts covered and demonstrated
 
@@ -1393,3 +1401,235 @@ TTFT, why longer inputs mainly affect prefill, why mean TPOT differs from pooled
 inter-token percentiles, and why matrix-kernel dominance does not by itself
 prove memory-bandwidth saturation. The learner's explanations remain to be
 verified; Stage 4 implementation is not implicitly authorized.
+
+## Phase 4: bounded concurrency and cancellation
+
+### Authorization and scope
+
+The learner explicitly requested implementation after reviewing the controlled
+concurrency plan. This supersedes the earlier instruction not to start Stage 4
+implicitly. It does not authorize Stage 5 batching or a different serving stack.
+
+The CPU float32 Qwen runtime, model revision, request validation, context budget,
+generation settings, and one-model-worker baseline remain unchanged. There is no
+batching, parallel model execution, queue TTL, global generation deadline, or
+attempt to kill Python/native threads.
+
+### Implemented policy
+
+- One running job plus two event-loop-owned FIFO waiting slots. Only the active
+  job is submitted to the executor; the executor is not a second waiting queue.
+- Full capacity returns HTTP 429 `server_busy`. `/health` stays 200 while HTTP is
+  reachable. `/ready` reports running/queued/capacity fields: idle or busy with
+  space is 200, full is 503, and unavailable/shutting down is 503.
+- Scheduling transitions are `queued -> running -> completed/failed/canceled`
+  or `queued -> canceled`. Delivery outcomes are separate.
+- A queued disconnect removes the job without tokenization/model execution.
+  A running disconnect signals cooperative cancellation; only actual worker
+  completion releases ownership and promotes the next waiting job.
+- Cancellation is checked around preparation and through a Transformers
+  stopping criterion. It is not a successful truncated completion and produces
+  no invented completion usage. The first reason/timestamp wins.
+- Text buffers hold at most eight items, including the sentinel. Empty text
+  increments are skipped. A full buffer has a one-second stall limit with
+  cancellation checks at most 50 ms apart. ASGI sends have a five-second limit.
+  A writable stream can emit a safe error and `[DONE]`; a blocked/disconnected
+  transport has no such guarantee.
+- Normal Uvicorn shutdown closes the listener and drains HTTP before lifespan
+  teardown. Teardown cancels any remaining waiting jobs, signals the active job,
+  and retains runtime ownership until the worker really exits. A stuck native
+  call can still prevent shutdown.
+- Settings and stream buffers are per request. `seed` remains unsupported;
+  sampling uses serialized process RNG state without request-specific global
+  resets.
+- `request_started` records queue wait. Every admitted job has a
+  `scheduling_finished` event, including queued cancellation and submission
+  failure. Running cancellation delay is signal-to-worker-exit, not socket-close
+  time. Never-started jobs have null queue wait/cancellation delay.
+
+### Regression and real-model controls
+
+`.venv/bin/python -m unittest discover -s tests -q` passed all 106 tests. Coverage includes
+actual tiny-HF stopping, FIFO promotion after cancellation/failure, abandoned
+future observation, bounded queues, transport deadlines, iterator cleanup,
+shutdown, independent response state, and benchmark accounting.
+
+An initial benchmark regression assumed cancellation checks followed streamer
+callbacks. Installed Transformers 5.18.0 checks stopping before forwarding that
+step's token. The incidental exact callback-count/TPOT assumptions were removed;
+the test still requires canceled classification without fabricated completion
+usage. Production behavior was not changed to fit that assumption.
+
+A separate localhost Uvicorn server used the real cached Qwen revision
+`7ae557604adf67be50417f59c2c2f167def9a775`. The temporary control wrapped real
+forward calls with an event gate; it did not replace model output. Saved evidence:
+`benchmark-results/phase4/smoke.json`.
+
+| Control | Observed result |
+|---|---|
+| One held active job plus two waiting | Fourth request 429; health 200; readiness 503 `full`, running 1, queued 2 |
+| Queued TCP disconnect | Removed before worker start; readiness became 200 `busy`, queued 1; replacement admitted |
+| Running TCP disconnect during held real forward | Ownership retained; neither waiting job started before release; cancellation delay 111.57 ms, including the deliberate hold |
+| FIFO recovery and independent output caps | Remaining jobs completed in order with four and six generated tokens; queue waits 278.15 and 550.30 ms |
+| Streaming TCP close after first real content | Canceled producer; signal-to-exit delay 84.31 ms in this observation |
+| Controlled blocked ASGI send | Buffer reached eight items; producer canceled as `slow_consumer`; delivery ended after 5006.17 ms without a terminal body |
+| Normal Uvicorn graceful shutdown | Listener refused new connections; active and queued requests both finished HTTP 200 before runtime release |
+| Direct lifespan teardown with work present | Queued and active requests returned 503 `not_ready`; queued job never started; runtime retained through the held worker; active delay 112.50 ms including the hold |
+
+Peak simultaneous real model forwards was one. The slow-send case was controlled
+ASGI pressure with real Qwen, not proof of saturating the OS TCP send buffer.
+Its producer signal-to-exit delay was 0.046 ms because the streamer itself raised
+on the full-buffer deadline. The one-second stall wait precedes that signal and
+must not be confused with cancellation delay. These individual control timings
+are observations, not service-level guarantees.
+
+### Completion-boundary race correction
+
+A real-Qwen HTTP probe exposed an additional thread interleaving: the worker
+exited after `cancel_inference` checked its state but before the cancellation
+token recorded its signal. Before the correction, successful work was relabeled
+`canceled` and emitted a negative cancellation delay of -0.036 ms.
+
+Worker-exit ordering is now authoritative. A signal timestamped after worker
+exit is delivery-only: it cannot relabel the producer or create producer
+cancellation metrics. The repeated real-HTTP probe preserved `completed`, four
+actual generated tokens, and null cancellation delay, with no cancellation
+reason on terminal scheduling/producer records. A deterministic regression
+keeps this interleaving covered; all 106 tests pass.
+
+Before/after evidence is saved as `exit-race-before.json` and
+`exit-race-after.json` under `benchmark-results/phase4/`. The temporary model
+processes exited and the control script was removed.
+
+### Fixed-workload concurrency comparison
+
+The existing `benchmark-results/phase3/workload.json` was reused unchanged:
+59 or 990 prompt tokens, crossed with 32 or 128 output tokens, greedy decoding,
+and the same pinned Qwen/tokenizer revision and template hash. Each concurrency
+level used all four cases, two sequential warm-ups per case, and exactly 20
+measured requests per case. Requests arrived in bounded waves, without retries.
+
+One isolated instrumented server on localhost port 54415 served C1, C2, then C4
+sequentially. Recorded host/runtime: Apple M1 Pro, eight logical CPUs, CPU
+float32, PyTorch intra-op 6/inter-op 8, Python 3.12.13, PyTorch 2.14.1,
+Transformers 5.18.0, tokenizers 0.23.2, FastAPI 0.143.3, Uvicorn 0.54.0, and
+HTTPX 0.28.1. Cached loading took 1637.08 ms; lifespan-to-instrumentation startup
+took 1687.28 ms, excluding imports. Neither is included in request measurements.
+
+All 220 successful measured requests reached their requested cap with
+`finish_reason: length`. C1 and C2 each completed 80/80 requests. C4 completed
+60/80 and rejected 20 with HTTP 429, exactly five rejections per case. There
+were no generation/client errors or warm-up failures. The C4 client exited 1
+because it records rejections as non-success, not because evidence was lost.
+
+Times below are milliseconds. Latency percentiles describe successful requests,
+not the much faster rejected requests.
+
+| Input/output tokens | Client C | Success/requests | Queue wait p50/p95 | E2E p50/p95 | Useful output tok/s |
+|---|---:|---:|---:|---:|---:|
+| 59/32 | 1 | 20/20 | 0.15 / 0.22 | 2459.20 / 2522.83 | 12.98 |
+| 59/32 | 2 | 20/20 | 1214.84 / 2485.03 | 3731.69 / 5046.47 | 12.92 |
+| 59/32 | 4 | 15/20 | 2438.14 / 4928.92 | 4880.99 / 7400.76 | 13.05 |
+| 59/128 | 1 | 20/20 | 0.15 / 0.27 | 9805.63 / 10335.64 | 12.99 |
+| 59/128 | 2 | 20/20 | 4808.15 / 10299.49 | 15074.85 / 20108.09 | 12.94 |
+| 59/128 | 4 | 15/20 | 9739.96 / 19582.04 | 19460.92 / 29675.59 | 13.01 |
+| 990/32 | 1 | 20/20 | 0.16 / 0.23 | 3366.76 / 3755.43 | 9.43 |
+| 990/32 | 2 | 20/20 | 1557.58 / 3286.59 | 4808.26 / 6555.05 | 10.04 |
+| 990/32 | 4 | 15/20 | 3138.68 / 6444.43 | 6293.28 / 9817.34 | 10.03 |
+| 990/128 | 1 | 20/20 | 0.16 / 0.35 | 11090.29 / 11555.24 | 11.47 |
+| 990/128 | 2 | 20/20 | 5369.11 / 11421.02 | 16917.69 / 22341.25 | 11.54 |
+| 990/128 | 4 | 15/20 | 10914.14 / 22438.89 | 22060.04 / 33206.76 | 11.63 |
+
+For 59/32, model TTFT p50 stayed at 120.67 / 123.01 / 122.79 ms for C1/C2/C4,
+while client first-text p50 rose to 198.26 / 1418.81 / 2638.45 ms. Model TPOT p50
+was 75.18 / 74.85 / 74.69 ms. This separates queueing from model execution:
+more connected clients did not create parallel model calls or a proportional
+throughput gain. The 990/32 throughput variation is not enough to attribute a
+speedup to concurrency in this single fixed-order run.
+
+Recorded peak RSS ranged from 2137.27 to 2139.83 MiB. It is process-lifetime
+high-water RSS, not per-request memory or current device allocation.
+
+Raw artifacts: `http-c1.json`, `http-c2.json`, `http-c4.json`, `server.jsonl`,
+and `report-c1.json`, `report-c2.json`, `report-c4.json`, all under ignored
+`benchmark-results/phase4/`. Reports joined every successful request to model
+and scheduling records without missing-metric warnings. README documents the
+same commands and flags for a fresh output directory.
+
+The uncanceled comparison preceded the final late-signal race correction.
+That correction changes only cancellation-outcome classification/metrics;
+these uncanceled cases did not exercise it. Post-correction cancellation and
+client controls use a fresh server and separate metrics file.
+
+These are bounded-wave observations, not constant-arrival-rate or mixed-length
+queue tests. C1/C2 have 20 successful samples per case, C4 only 15; p95 remains
+exploratory. Fixed run order, thermal state, background activity, and opt-in
+instrumentation can affect the numbers. There is no hard end-to-end deadline:
+cooperative cancellation still cannot interrupt a stuck native call.
+
+### Post-correction cancellation and client controls
+
+A fresh instrumented server used `control-server.jsonl`, separate from the
+uncanceled comparison. For `short-input-long-output`, two normal warm-ups were
+followed by 20 measured C1 streams closed after their first real text event:
+
+- Client and server both recorded 20 cancellations, with no errors, rejections,
+  or missing terminal cancellation measurements.
+- Signal-to-worker-exit delay: p50 **74.51 ms**, p95 **80.63 ms**, minimum
+  **72.67 ms**, maximum **143.22 ms**.
+- Client and model cancellation records had no completion-token count; client
+  rows had no successful `stop`/`length` finish reason. Partial output was not
+  promoted into completed-request throughput.
+- Queue wait was p50 **72.76 ms**, p95 **79.01 ms**, despite client C1. Closing
+  a response lets that client issue its next request before the previous native
+  worker exits. The next job correctly waits for cancellation completion.
+- These delays begin when the server records its signal. Disconnect-detection
+  time is additional; this is not a client-close-to-idle service guarantee.
+
+Artifacts: `canceled.json`, `report-canceled.json`, and `control-server.jsonl`
+under `benchmark-results/phase4/`.
+
+Real HTTP isolation controls used two different prompts and output caps. Their
+concurrent responses exactly matched their own serial baselines: `ORANGE` and
+`violets`, each with three generated tokens. The second concurrent request waited
+261.95 ms before starting. This verifies response isolation, not correctness of
+the model's instruction following.
+
+A further concurrent greedy/sampled pair reached the actual model with separate
+configurations: greedy `do_sample:false`, cap 4; sampled `do_sample:true`,
+temperature 0.7, top-p 0.9, top-k 0, cap 8. An unsupported `seed` request returned
+422 `invalid_request`. Details and request IDs are in `isolation.json`; effective
+generation settings are in the correlated control-server records.
+
+The actual benchmark CLI was interrupted with SIGINT while one request ran and
+another waited. It saved both rows as canceled, set `interrupted:true`, and exited
+130. The server returned idle. `interrupted.json` and `report-interrupted.json`
+preserve this partial run rather than pretending all 20 planned requests ran.
+
+One interrupted client had no response request ID because it disconnected while
+queued, before headers. Its server scheduling record still proves cancellation
+before worker start. The report's generic unavailable-cancellation warning is
+therefore expected: the missing client/server join is not evidence of a worker
+still running, and no zero-valued timing was invented.
+
+### Completion and next lesson
+
+Phase 4 implementation and technical verification are complete. README covers
+the current API contract and repeatable benchmark commands; the roadmap records
+technical completion without checking off independent understanding.
+All server/control processes started for this work exited, and temporary smoke
+scripts were removed. No dependencies, generated changelogs, `.ua` files,
+staging, or commits were changed.
+
+Before batching, the learner should explain:
+
+1. Why client first text grows with queue wait while model TTFT stays similar.
+2. Why a busy model can still be ready to accept a waiting request.
+3. Why a disconnected HTTP coroutine cannot release native worker ownership.
+4. Why C1 cancellation traffic can still have queue wait.
+5. Why C4 success percentiles must be read alongside its 25% rejection rate.
+6. Why normal Uvicorn shutdown drains HTTP, while direct lifespan teardown
+   cancels work left behind.
+
+These explanations remain unverified. Stage 5 implementation is not implicitly
+authorized by completion of this phase.

@@ -106,9 +106,10 @@ def load_cached_runtime():
 
 
 @contextmanager
-def instrument_generation(runtime, emit, *, fixed_length=False):
+def instrument_generation(runtime, emit, *, fixed_length=False, get_cancellation=None):
     """Patch this runtime only; emit after stopping the model-boundary timer."""
     import torch
+    from src.inference import GenerationCancelled
 
     if runtime.model.device.type != "cpu" or runtime.model.dtype != torch.float32:
         raise ValueError("These benchmarks require the CPU float32 baseline.")
@@ -149,6 +150,13 @@ def instrument_generation(runtime, emit, *, fixed_length=False):
         try:
             output = original_generate(*args, **kwargs)
             finished = perf_counter()
+            cancellation = get_cancellation() if get_cancellation is not None else None
+            if cancellation is not None and cancellation.is_cancelled():
+                row.update(
+                    status="canceled", error_code="request_canceled",
+                    cancellation_reason=cancellation.reason,
+                )
+                return output
             count = output.shape[1] - prompt_tokens
             recorder.verify(prompt_tokens, count)
             if fixed_length and count != cap:
@@ -158,7 +166,13 @@ def instrument_generation(runtime, emit, *, fixed_length=False):
         except BaseException as error:
             if finished is None:
                 finished = perf_counter()
-            row.update(error_code="generation_failed", exception_type=type(error).__name__)
+            if isinstance(error, GenerationCancelled):
+                row.update(
+                    status="canceled", error_code="request_canceled",
+                    cancellation_reason=error.reason,
+                )
+            else:
+                row.update(error_code="generation_failed", exception_type=type(error).__name__)
             raise
         finally:
             row.update(recorder.metrics(finished))

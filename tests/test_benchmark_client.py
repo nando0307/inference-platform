@@ -1,10 +1,11 @@
+import asyncio
 import json
 import unittest
 from unittest.mock import patch
 
 import httpx
 
-from benchmarks.client import run_request
+from benchmarks.client import _run_benchmark, run_request
 
 
 CASE = {
@@ -36,31 +37,40 @@ def event(value):
     return f"data: {data}\n\n".encode()
 
 
-class TimedStream(httpx.SyncByteStream):
+class TimedStream(httpx.AsyncByteStream):
     def __init__(self, schedule, clock):
         self.schedule = schedule
         self.clock = clock
+        self.closed = False
 
-    def __iter__(self):
+    async def __aiter__(self):
         for timestamp, data in self.schedule:
             self.clock[0] = timestamp
             if isinstance(data, BaseException):
                 raise data
             yield data
 
+    async def aclose(self):
+        self.closed = True
+
 
 class BenchmarkClientTests(unittest.TestCase):
-    def request(self, schedule, status=200, content_type="text/event-stream"):
+    def request(self, schedule, status=200, content_type="text/event-stream", *, cancel_after_text=False):
         clock = [0.0]
+        self.last_stream = TimedStream(schedule, clock)
         transport = httpx.MockTransport(lambda request: httpx.Response(
             status,
             headers={"content-type": content_type, "x-request-id": "request-1"},
-            stream=TimedStream(schedule, clock),
+            stream=self.last_stream,
         ))
-        with httpx.Client(transport=transport) as client, patch(
-            "benchmarks.client.perf_counter", side_effect=lambda: clock[0]
-        ):
-            return run_request(client, "http://benchmark.invalid", WORKLOAD, CASE, "measured", 1)
+        async def send():
+            async with httpx.AsyncClient(transport=transport) as client:
+                with patch("benchmarks.client.perf_counter", side_effect=lambda: clock[0]):
+                    return await run_request(
+                        client, "http://benchmark.invalid", WORKLOAD, CASE, "measured", 1,
+                        cancel_after_text=cancel_after_text,
+                    )
+        return asyncio.run(send())
 
     def test_first_text_excludes_role_and_empty_chunks_and_usage_is_not_chunk_count(self):
         row = self.request([
@@ -201,9 +211,181 @@ class BenchmarkClientTests(unittest.TestCase):
         row = self.request([
             (0.4, json.dumps({"error": {"code": "server_busy", "message": "Private error"}}).encode())
         ], status=429, content_type="application/json")
-        self.assertEqual((row["http_status"], row["status"], row["error_code"]), (429, "error", "server_busy"))
+        self.assertEqual((row["http_status"], row["status"], row["error_code"]), (429, "rejected", "server_busy"))
         self.assertAlmostEqual(row["e2e_ms"], 400)
         self.assertNotIn("Private", json.dumps(row))
+
+    def test_intentional_cancel_closes_on_real_text_without_consuming_terminal_usage(self):
+        row = self.request([
+            (0.1, event(chunk({"role": "assistant"}))),
+            (0.2, event(chunk({"content": ""}))),
+            (0.3, event(chunk({"content": "Private output"}))),
+            (0.4, AssertionError("Must not read beyond the cancellation point")),
+        ], cancel_after_text=True)
+        self.assertEqual((row["status"], row["error_code"]), ("canceled", "cancel_after_text"))
+        self.assertAlmostEqual(row["first_text_ms"], 300)
+        self.assertIsNone(row["completion_tokens"])
+        self.assertIsNone(row["finish_reason"])
+        self.assertTrue(self.last_stream.closed)
+        self.assertNotIn("Private", json.dumps(row))
+
+    def test_server_cooperative_cancellation_is_not_a_generation_failure(self):
+        for code in ("request_canceled", "slow_consumer"):
+            with self.subTest(code=code):
+                row = self.request([
+                    (0.1, event(chunk({"content": "Partial"}))),
+                    (0.2, event({"error": {"code": code}})),
+                    (0.3, event("[DONE]")),
+                ])
+                self.assertEqual((row["status"], row["error_code"]), ("canceled", code))
+                self.assertIsNone(row["completion_tokens"])
+
+
+class BenchmarkWaveTests(unittest.IsolatedAsyncioTestCase):
+    async def test_concurrency_bounds_complete_waves_and_keeps_equal_request_counts_without_retries(self):
+        real_client = httpx.AsyncClient
+        for concurrency in (1, 2, 4):
+            with self.subTest(concurrency=concurrency):
+                calls = 0
+                active = 0
+                peak = 0
+                closed = 0
+                repeats = 7
+                gates = [asyncio.Event() for _ in range((repeats + concurrency - 1) // concurrency)]
+
+                class WaveStream(httpx.AsyncByteStream):
+                    def __init__(self, index):
+                        self.index = index
+
+                    async def __aiter__(self):
+                        await gates[self.index // concurrency].wait()
+                        yield event(chunk({"content": "Text"}))
+                        yield event(chunk(finish="stop", counts=usage()))
+                        yield event("[DONE]")
+
+                    async def aclose(self):
+                        nonlocal active, closed
+                        active -= 1
+                        closed += 1
+
+                async def handle(request):
+                    nonlocal calls, active, peak
+                    index = calls
+                    if index % concurrency == 0:
+                        self.assertEqual(active, 0, "A new wave overlapped an unfinished response")
+                    calls += 1
+                    active += 1
+                    peak = max(peak, active)
+                    wave_end = min((index // concurrency + 1) * concurrency, repeats)
+                    if calls == wave_end:
+                        gates[index // concurrency].set()
+                    return httpx.Response(
+                        200, headers={"content-type": "text/event-stream", "x-request-id": str(index)},
+                        stream=WaveStream(index),
+                    )
+
+                transport = httpx.MockTransport(handle)
+                with patch("benchmarks.client.httpx.AsyncClient", side_effect=lambda **kw: real_client(
+                    transport=transport, **kw
+                )):
+                    result = await asyncio.wait_for(_run_benchmark(
+                        "http://benchmark.invalid", WORKLOAD, [CASE],
+                        warmups=0, repeats=repeats, concurrency=concurrency,
+                    ), timeout=5)
+                self.assertEqual((calls, closed, active, peak), (repeats, repeats, 0, concurrency))
+                self.assertEqual([row["iteration"] for row in result["samples"]], list(range(1, repeats + 1)))
+                self.assertEqual(result["cases"][0]["summary"]["successes"], repeats)
+
+        calls = 0
+        async def reject(request):
+            nonlocal calls
+            calls += 1
+            return httpx.Response(429, json={"error": {"code": "server_busy"}})
+
+        with patch("benchmarks.client.httpx.AsyncClient", side_effect=lambda **kw: real_client(
+            transport=httpx.MockTransport(reject), **kw
+        )):
+            result = await _run_benchmark(
+                "http://benchmark.invalid", WORKLOAD, [CASE], warmups=0, repeats=7, concurrency=4
+            )
+        summary = result["cases"][0]["summary"]
+        self.assertEqual((calls, summary["measured_requests"], summary["rejections"]), (7, 7, 7))
+        self.assertEqual((summary["successes"], summary["errors"], summary["canceled"]), (0, 0, 0))
+
+    async def test_interrupt_closes_inflight_responses_and_preserves_partial_rows_without_next_wave(self):
+        real_client = httpx.AsyncClient
+        started = asyncio.Event()
+        calls = 0
+        closed = 0
+
+        class WaitingStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield event(chunk({"content": "Text"}))
+                await asyncio.Future()
+
+            async def aclose(self):
+                nonlocal closed
+                closed += 1
+
+        async def handle(request):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                started.set()
+            return httpx.Response(
+                200, headers={"content-type": "text/event-stream", "x-request-id": str(calls)},
+                stream=WaitingStream(),
+            )
+
+        client = real_client(transport=httpx.MockTransport(handle))
+        with patch("benchmarks.client.httpx.AsyncClient", return_value=client):
+            task = asyncio.create_task(_run_benchmark(
+                "http://benchmark.invalid", WORKLOAD, [CASE], warmups=0, repeats=6, concurrency=2
+            ))
+            await asyncio.wait_for(started.wait(), timeout=5)
+            task.cancel()
+            result = await asyncio.wait_for(task, timeout=5)
+        self.assertTrue(result["interrupted"])
+        self.assertTrue(client.is_closed)
+        self.assertEqual((calls, closed), (2, 2))
+        self.assertEqual(result["cases"][0]["summary"]["canceled"], 2)
+        self.assertEqual([row["error_code"] for row in result["samples"]], ["interrupted", "interrupted"])
+        self.assertTrue(all(row["completion_tokens"] is None for row in result["samples"]))
+
+    async def test_intentional_cancellation_runs_all_measurements_and_leaves_warmups_separate(self):
+        real_client = httpx.AsyncClient
+        calls = 0
+        closed = 0
+
+        class ContentStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield event(chunk({"content": "Text"}))
+                yield event(chunk(finish="stop", counts=usage()))
+                yield event("[DONE]")
+
+            async def aclose(self):
+                nonlocal closed
+                closed += 1
+
+        async def handle(request):
+            nonlocal calls
+            calls += 1
+            return httpx.Response(
+                200, headers={"content-type": "text/event-stream"}, stream=ContentStream()
+            )
+
+        with patch("benchmarks.client.httpx.AsyncClient", side_effect=lambda **kw: real_client(
+            transport=httpx.MockTransport(handle), **kw
+        )):
+            result = await _run_benchmark(
+                "http://benchmark.invalid", WORKLOAD, [CASE], warmups=2, repeats=5,
+                concurrency=2, cancel_after_text=True,
+            )
+        self.assertFalse(result["interrupted"])
+        self.assertEqual((calls, closed), (7, 7))
+        self.assertEqual([row["status"] for row in result["samples"][:2]], ["success", "success"])
+        summary = result["cases"][0]["summary"]
+        self.assertEqual((summary["measured_requests"], summary["canceled"], summary["warmup_errors"]), (5, 5, 0))
 
 
 if __name__ == "__main__":

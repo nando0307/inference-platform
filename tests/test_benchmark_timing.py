@@ -7,7 +7,7 @@ from tokenizers.pre_tokenizers import WhitespaceSplit
 from transformers import GPT2Config, GPT2LMHeadModel, PreTrainedTokenizerFast, TextIteratorStreamer
 
 from benchmarks.timing import TokenRecorder, TokenTimingError, instrument_generation
-from src.inference import ContextLimitError, Runtime, generate
+from src.inference import CancellationToken, ContextLimitError, GenerationCancelled, Runtime, generate
 
 
 def tiny_tokenizer():
@@ -158,6 +158,42 @@ class InstrumentedGenerationTests(unittest.TestCase):
         self.assertEqual(len(result.generated_ids), 2)
         self.assertEqual(rows[-1]["status"], "success")
         self.assertEqual(rows[-1]["completion_tokens"], 2)
+
+    def test_cooperative_stopping_and_streamer_cancellation_do_not_fabricate_completion_usage(self):
+        for raise_from_streamer in (False, True):
+            with self.subTest(raise_from_streamer=raise_from_streamer):
+                token = CancellationToken()
+
+                class CancelAfterToken:
+                    def __init__(self):
+                        self.prompt_seen = False
+
+                    def put(self, value):
+                        if not self.prompt_seen:
+                            self.prompt_seen = True
+                            return
+                        token.cancel("client_disconnected")
+                        if raise_from_streamer:
+                            token.raise_if_cancelled()
+
+                    def end(self):
+                        pass
+
+                rows = []
+                with self.assertRaises(GenerationCancelled):
+                    with instrument_generation(
+                        self.runtime, rows.append, get_cancellation=lambda: token,
+                    ):
+                        generate(
+                            self.runtime, self.messages, max_new_tokens=3, temperature=0, top_p=1,
+                            streamer=CancelAfterToken(), cancellation=token,
+                        )
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["status"], "canceled")
+                self.assertEqual(rows[0]["cancellation_reason"], "client_disconnected")
+                self.assertIsNone(rows[0]["completion_tokens"])
+                self.assertGreaterEqual(rows[0]["ttft_ms"], 0)
+                self.assertNotIn("exception_type", rows[0])
 
 
 if __name__ == "__main__":

@@ -3,19 +3,42 @@
 import argparse
 import asyncio
 import json
-from _thread import LockType
+import logging
 from contextlib import ExitStack, asynccontextmanager
 from pathlib import Path
-from threading import local
+from threading import Lock, local
 from time import perf_counter
 from unittest.mock import patch
 
 import uvicorn
-from transformers import TextIteratorStreamer
 
 from benchmarks.common import runtime_metadata
 from benchmarks.timing import instrument_generation, load_cached_runtime
 from src import api
+
+
+class SchedulingMetrics(logging.Handler):
+    """Capture only safe terminal scheduling metadata, never arbitrary log text."""
+
+    def __init__(self, write_record):
+        super().__init__()
+        self.write_record = write_record
+
+    def emit(self, record):
+        try:
+            event = json.loads(record.getMessage())
+        except (TypeError, ValueError):
+            return
+        if not isinstance(event, dict) or event.get("event") != "scheduling_finished":
+            return
+        fields = (
+            "request_id", "model", "stream", "http_status", "state", "queue_wait_ms",
+            "cancellation_delay_ms", "cancellation_reason", "error_code", "exception_type",
+        )
+        self.write_record({
+            "type": "scheduling",
+            **{key: event[key] for key in fields if key in event},
+        })
 
 
 def serve(port, metrics_path):
@@ -27,29 +50,33 @@ def serve(port, metrics_path):
 
     def correlated_worker(
         runtime: api.Runtime,
-        request: api.ChatCompletionRequest,
-        guard: LockType,
+        job: api._InferenceJob,
         loop: asyncio.AbstractEventLoop,
-        streamer: TextIteratorStreamer | None,
-        prepared: asyncio.Future[None] | None,
-        request_log: api._RequestLog | None,
     ) -> api.GenerationResult:
-        context.request_id = request_log.request_id if request_log is not None else None
+        context.job = job
         try:
-            return original_worker(runtime, request, guard, loop, streamer, prepared, request_log)
+            return original_worker(runtime, job, loop)
         finally:
-            del context.request_id
+            del context.job
 
     with metrics_path.open("x", encoding="utf-8") as metrics:
+        write_lock = Lock()
+
         def write_record(record):
-            metrics.write(json.dumps(record, allow_nan=False) + "\n")
-            metrics.flush()
+            with write_lock:
+                metrics.write(json.dumps(record, allow_nan=False) + "\n")
+                metrics.flush()
 
         def record_generation(row):
+            job = context.job
             write_record({
                 "type": "generation",
-                "request_id": context.request_id,
+                "request_id": job.request_log.request_id if job.request_log is not None else None,
                 **row,
+                "queue_wait_ms": (
+                    (job.started_at - job.admitted_at) * 1000
+                    if job.started_at is not None else None
+                ),
             })
 
         @asynccontextmanager
@@ -68,9 +95,15 @@ def serve(port, metrics_path):
             with ExitStack() as hooks:
                 hooks.enter_context(patch.object(api, "load_runtime", cached_loader))
                 hooks.enter_context(patch.object(api, "_run_inference", correlated_worker))
+                handler = SchedulingMetrics(write_record)
+                api.logger.addHandler(handler)
+                hooks.callback(handler.close)
+                hooks.callback(api.logger.removeHandler, handler)
                 async with original_lifespan(app):
                     runtime = app.state.runtime
-                    hooks.enter_context(instrument_generation(runtime, record_generation))
+                    hooks.enter_context(instrument_generation(
+                        runtime, record_generation, get_cancellation=lambda: context.job.cancellation
+                    ))
                     metadata = runtime_metadata(runtime)
                     write_record({
                         "type": "startup",
@@ -82,6 +115,9 @@ def serve(port, metrics_path):
                         "cache_only": True,
                         "workers": 1,
                         "concurrency": 1,
+                        "model_concurrency": 1,
+                        "queue_capacity": api.QUEUE_CAPACITY,
+                        "scheduling_boundary": "validated admission to worker start; cancellation signal to actual worker exit",
                         "generation_settings_source": "actual per-call settings in generation records",
                         "timing_boundary": "model.generate call; excludes tokenization and final decoding",
                         "instrumentation": "CPU token callbacks; includes downstream streamer work",

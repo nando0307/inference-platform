@@ -1,5 +1,7 @@
 from collections.abc import Callable
 from dataclasses import dataclass
+from threading import Event, Lock
+from time import perf_counter
 from typing import Literal
 
 import torch
@@ -9,6 +11,8 @@ from transformers import (
     GenerationConfig,
     PreTrainedModel,
     PreTrainedTokenizerBase,
+    StoppingCriteria,
+    StoppingCriteriaList,
     TextIteratorStreamer,
 )
 
@@ -76,6 +80,48 @@ class ContextLimitError(ValueError):
     """The formatted prompt and requested output exceed the supported context."""
 
 
+class GenerationCancelled(RuntimeError):
+    """Cooperative cancellation is not a successful truncated completion."""
+
+    def __init__(self, reason: str):
+        super().__init__("Generation was canceled.")
+        self.reason = reason
+
+
+class CancellationToken:
+    """First cancellation reason/time wins across the HTTP and producer threads."""
+
+    def __init__(self):
+        self._event = Event()
+        self._lock = Lock()
+        self.reason: str | None = None
+        self.requested_at: float | None = None
+
+    def cancel(self, reason: str = "request_canceled") -> None:
+        with self._lock:
+            if not self._event.is_set():
+                self.reason = reason
+                self.requested_at = perf_counter()
+                self._event.set()
+
+    def is_cancelled(self) -> bool:
+        return self._event.is_set()
+
+    def raise_if_cancelled(self) -> None:
+        if self._event.is_set():
+            assert self.reason is not None
+            raise GenerationCancelled(self.reason)
+
+
+class _CancellationCriteria(StoppingCriteria):
+    def __init__(self, cancellation: CancellationToken):
+        self.cancellation = cancellation
+
+    def __call__(self, input_ids, scores, **kwargs):
+        # A scalar boolean broadcasts across the single supported sequence.
+        return self.cancellation.is_cancelled()
+
+
 @torch.inference_mode()
 def generate(
     runtime: Runtime,
@@ -86,10 +132,13 @@ def generate(
     top_p: float,
     streamer: TextIteratorStreamer | None = None,
     on_prepared: Callable[[], None] | None = None,
+    cancellation: CancellationToken | None = None,
 ) -> GenerationResult:
     """Generate one completion using caller-owned shared model resources."""
     if temperature == 0 and top_p != 1.0:
         raise ValueError("Greedy decoding requires top_p=1.0.")
+    if cancellation is not None:
+        cancellation.raise_if_cancelled()
 
     text = runtime.tokenizer.apply_chat_template(
         messages,
@@ -104,6 +153,8 @@ def generate(
         truncation=False,
     ).to(runtime.model.device)
     prompt_tokens = model_inputs["input_ids"].shape[1]
+    if cancellation is not None:
+        cancellation.raise_if_cancelled()
     if prompt_tokens + max_new_tokens > runtime.context_limit:
         raise ContextLimitError(
             f"Prompt tokens ({prompt_tokens}) plus requested output tokens "
@@ -132,12 +183,20 @@ def generate(
     )
     if on_prepared is not None:
         on_prepared()
+    if cancellation is not None:
+        cancellation.raise_if_cancelled()
 
     output_ids = runtime.model.generate(
         **model_inputs,
         generation_config=generation_config,
         streamer=streamer,
+        stopping_criteria=(
+            StoppingCriteriaList([_CancellationCriteria(cancellation)])
+            if cancellation is not None else None
+        ),
     )
+    if cancellation is not None:
+        cancellation.raise_if_cancelled()
     generated_ids = output_ids[0, prompt_tokens:].tolist()
     completion = runtime.tokenizer.decode(
         generated_ids,

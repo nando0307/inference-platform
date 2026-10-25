@@ -12,12 +12,14 @@ Read [the session handoff in logs/practice.md](logs/practice.md) before continui
 with a new mentor. It records inference experiments, verified API checkpoints,
 and the next task. Use [plan.md](plan.md) for the broader roadmap.
 
-Stage 2 technical acceptance and the Phase 3 benchmark implementation are
-verified. The suite has 73 passing tests; real-Qwen evidence includes 80 measured
-HTTP requests, 80 measured fixed-length generations, and a separate CPU profile.
-Next: interpret the [benchmark results](logs/practice.md#phase-3-reproducible-inference-benchmarks)
-before changing performance settings or starting Stage 4. Independent learning
-checks remain pending; automated verification does not prove understanding.
+The implementation now includes Phase 4 controlled concurrency: one inference
+worker, two FIFO waiting slots, cooperative cancellation, and bounded streaming.
+The suite has 106 passing tests, with real-Qwen lifecycle and HTTP smoke evidence.
+See the [Phase 4 evidence](logs/practice.md#phase-4-bounded-concurrency-and-cancellation)
+for the fixed-workload comparison and its limitations. Next: explain queue wait,
+latency, throughput, and cancellation ownership before introducing batching.
+Independent learning checks remain pending; automated verification does not
+prove understanding.
 
 ## Explore the codebase with Understand Anything
 
@@ -99,18 +101,22 @@ curl -i http://127.0.0.1:8000/ready
 | Endpoint/state | Status | Body |
 |---|---|---|
 | `/health`, serving HTTP | 200 | `{"status":"alive"}` |
-| `/ready`, initialized and idle | 200 | `{"ready":true,"status":"ready"}` |
-| `/ready`, admission guard occupied | 503 | `{"ready":false,"status":"busy"}` |
-| `/ready`, uninitialized, if reachable | 503 | `{"ready":false,"status":"not_ready"}` |
-| `/ready`, shutting down, if reachable | 503 | `{"ready":false,"status":"shutting_down"}` |
+| `/ready`, initialized and idle | 200 | `{"ready":true,"status":"ready","running":0,"queued":0,"queue_capacity":2}` |
+| `/ready`, running with waiting capacity | 200 | `{"ready":true,"status":"busy","running":1,"queued":0,"queue_capacity":2}`; `queued` may also be 1 |
+| `/ready`, both waiting slots occupied | 503 | `{"ready":false,"status":"full","running":1,"queued":2,"queue_capacity":2}` |
+| `/ready`, uninitialized, if reachable | 503 | `ready:false`, `status:"not_ready"`, plus the same capacity fields |
+| `/ready`, shutting down, if reachable | 503 | `ready:false`, `status:"shutting_down"`, plus the same capacity fields |
 
-Readiness is a snapshot, not a reservation. Uvicorn may refuse connections until
-startup completes; connection refusal is not an HTTP 503 response.
+Readiness describes admission capacity, not whether the model is idle. It is a
+snapshot, not a reservation. Uvicorn may refuse connections until startup
+completes; connection refusal is not an HTTP 503 response.
 
-Press Ctrl-C to stop normally. Shutdown marks the application unavailable,
-waits for executor work off the event loop, then releases the runtime. It does
-not cancel native model computation; a permanently stuck worker can prevent
-graceful shutdown.
+Press Ctrl-C to stop normally. Uvicorn closes its listener and drains admitted
+HTTP requests before lifespan teardown. At teardown, the application rejects new
+work, removes any remaining queued jobs, signals running cancellation, and waits
+off the event loop for the actual worker to exit before releasing the runtime.
+A cancellation flag cannot interrupt a stuck native call; such a call can still
+prevent graceful shutdown and require process termination.
 
 ## Request an ordinary chat completion
 
@@ -166,8 +172,10 @@ field names; unexpected failures do not expose exception text or tracebacks.
 | 422 | `invalid_request` | Invalid JSON, schema, types, ranges, model, or fields |
 | 422 | `invalid_parameter_combination` | Greedy decoding with non-default top-p |
 | 400 | `context_length_exceeded` | Formatted prompt plus requested output exceeds the supported context |
-| 429 | `server_busy` | Another producer owns inference; no waiting queue |
+| 429 | `server_busy` | One producer is active and both FIFO waiting slots are occupied |
 | 503 | `not_ready` | Application unavailable or shutting down |
+| 503 | `request_canceled` | Generation was canceled before response headers |
+| 503 | `slow_consumer` | Streaming could not keep up before response headers |
 | 500 | `generation_failed` | Submission, preparation, or generation failed unexpectedly |
 
 The combined budget is at most 2048 tokens, further bounded by the model's
@@ -210,31 +218,45 @@ It does not send a successful finish reason or fabricated usage.
 
 ### Execution ownership
 
-The internal execution path is `submit_inference(app, validated_request)` in
-`src/api.py`. Call it on the running application's event loop with an already
-validated `ChatCompletionRequest`, then await the returned future. It rejects
-unavailable state with `InferenceUnavailable` and an occupied slot with
-`InferenceBusy`; excess work is not queued.
+Call `submit_inference(app, validated_request)` in `src/api.py` on the
+application's event loop with an already validated `ChatCompletionRequest`.
+It returns an internal job with a `result` future, cancellation token, timestamps,
+and scheduling state. It raises `InferenceUnavailable` when unavailable and
+`InferenceBusy` only when the two waiting slots are full.
 
-The dedicated worker performs formatting, tokenization, context validation, and
-generation, releasing the guard only when its work exits. The returned result
-is already shielded: canceling its consumer does not cancel the retained producer
-or free the slot early. Completion callbacks observe errors even when delivery
-is abandoned; they do not log raw exception text. Shutdown drains producer
-completion before clearing the runtime.
+The event loop owns the FIFO queue. Only the active job enters the single-worker
+executor; waiting jobs do not accumulate in the executor's hidden queue. The
+worker performs formatting, tokenization, context validation, and generation.
+Its actual completion callback releases ownership and starts the oldest waiting
+job, even after an error or abandoned delivery.
 
-For both response modes, a detected disconnect ends delivery, not inference.
-The finite producer keeps running under the requested cap, and new requests
-still receive 429 until it exits. Undelivered output is discarded. A disconnected
-client is not promised a terminal event or `[DONE]`. Canceling a Python future
-cannot safely kill a stuck native call: inference remains occupied, and process
-restart is required rather than launching a replacement over the same model.
+Job transitions are `queued -> running -> completed/failed/canceled`, or
+`queued -> canceled`. Context rejection and failed submission are scheduling
+failures; delivery/error codes retain their more specific meanings. There is no
+queue TTL or overall inference deadline.
 
-The library streamer queue is not intrinsically bounded. This stage permits
-only one producer and at most 512 generated tokens; explicit slow-consumer
-backpressure and cooperative stopping remain later work. Real TCP disconnects
-and controlled forward failures have been verified with Qwen, alongside
-deterministic ASGI ownership regressions.
+Use `cancel_inference(app, job, reason)` for internal cancellation. Removing a
+queued job immediately frees waiting capacity without tokenizing or running it.
+A running job receives a cooperative signal, checked around preparation and
+between generation steps through a Transformers stopping criterion. HTTP
+cancellation does not cancel the retained producer future or free the worker
+early. Abandoned future exceptions are observed without logging their text.
+
+Disconnected clients are not promised a terminal event or `[DONE]`. Cancellation
+is not a successful `stop`/`length` completion and does not fabricate usage.
+A late delivery failure cannot relabel already completed producer work.
+
+`src/streaming.py` preserves Transformers' incremental text decoding but bounds
+the queue to eight items, including its terminal sentinel. Empty text increments
+do not consume capacity. A full queue waits at most one second, checking
+cancellation at intervals no longer than 50 ms, then cancels as `slow_consumer`.
+Each ASGI chat send has a five-second deadline. A writable stream can send a safe
+error event and `[DONE]`; a blocked transport is terminated without that promise.
+Uvicorn may report an incomplete response when it closes such a transport.
+
+Generation configuration and stream buffers are per request. `seed` remains
+unsupported; sampling uses the process RNG in serialized execution order.
+The server does not reset global random state to emulate per-request seeds.
 
 ## Private request lifecycle logs
 
@@ -249,21 +271,25 @@ error envelopes, and every lifecycle event. Incoming identifiers are ignored.
 
 | Event | Meaning |
 |---|---|
-| `request_accepted` | The guard was acquired and producer submission succeeded; generation has not necessarily succeeded |
+| `request_accepted` | A running or queued job was admitted; submission/generation may still fail |
+| `request_started` | The worker actually entered the job, with its measured queue wait |
 | `request_finished` | Delivery completed, was rejected/failed, or ended on a detected disconnect/cancellation |
-| `producer_finished` | Admitted worker computation exited, even if its client already disconnected |
+| `producer_finished` | A started worker exited, even if its client already disconnected |
+| `scheduling_finished` | Every admitted job reached a terminal state, including queued cancellation and submission failure |
 
 Each event includes `request_id`, the configured `model`, `stream`, and
 `http_status`. Unknown stream mode or HTTP status is `null`, not guessed.
-Invalid client-supplied model names are never logged. Terminal events include
-an `outcome`: `completed`, `rejected`, `failed`, or `disconnected` for delivery;
-the producer independently reports `completed`, `rejected`, or `failed`.
+Invalid client-supplied model names are never logged. Delivery reports
+`completed`, `rejected`, `failed`, or `disconnected`. Producers report `completed`,
+`rejected`, `failed`, or `canceled`. `scheduling_finished.state` is `completed`,
+`failed`, or `canceled`, independently of delivery.
 
-Validation, busy, and availability rejections have a `request_finished` event
-without admission/producer events. A context rejection occurs inside an admitted
-worker, so it also has acceptance and producer events. Submission failure is
-`failed` without a producer event. A stream can have `http_status: 200` and
-`outcome: "failed"` because its headers were sent before generation failed.
+Validation, full-queue, and availability rejections have a `request_finished`
+event without admission/scheduling events. Context rejection happens in an
+admitted worker, so it also has acceptance, producer, and scheduling events.
+Submission failure and queued cancellation have scheduling but no producer
+event. A stream can have HTTP 200 with failed delivery because headers were
+already sent.
 
 Timing fields use a monotonic clock:
 - `request_finished.duration_ms` starts before validation/admission and ends after
@@ -272,9 +298,16 @@ Timing fields use a monotonic clock:
 - `producer_finished.producer_duration_ms` measures the worker separately,
   including formatting, tokenization, context validation, generation, and output
   extraction. It excludes request-body reading and executor handoff.
+- `request_started.queue_wait_ms` measures validated admission to actual worker
+  entry, separately from model TTFT. Terminal records use null for jobs canceled before
+  starting.
+- `scheduling_finished.cancellation_delay_ms` measures the first cancellation
+  signal to actual worker exit. It is null for never-started jobs and jobs without
+  an in-flight cancellation signal. Signals after worker exit are delivery-only.
+  The first cancellation reason and timestamp win.
 
-On disconnect, the delivery event is not changed into success when inference
-later finishes. Correlate the later producer event using the same request ID.
+Delivery may end before authoritative scheduling and cancellation measurements
+exist. Correlate the later scheduling/producer events using the same request ID.
 These durations are lifecycle measurements, not TTFT/TPOT benchmarks.
 
 Actual `prompt_tokens` and `completion_tokens` are included when a successful
@@ -326,10 +359,11 @@ HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false \
   --metrics benchmark-results/run-1/server.jsonl
 ```
 
-This opt-in server loads the actual runtime once, preserves the existing admission
-and shutdown paths, and records one model-timing row per generation. Scoped
-wrappers correlate rows with the server-generated `X-Request-ID`; they restore
-the original methods at shutdown. No extra inference worker is introduced.
+This opt-in server loads the actual runtime once and preserves production
+scheduling and shutdown. It records model timing for executed generations and
+safe terminal scheduling metadata, including jobs canceled before starting.
+Scoped wrappers correlate rows through the server-generated `X-Request-ID` and
+restore original methods at shutdown. No extra inference worker is introduced.
 
 After startup completes, run terminal B:
 
@@ -346,9 +380,40 @@ After startup completes, run terminal B:
   --output benchmark-results/run-1/report.json
 ```
 
-Requests are sequential. Each case has its own warm-up and measured window.
-Errors are recorded without retries, and the client saves evidence before
-returning a nonzero exit status. Ctrl-C saves collected samples and returns 130.
+The default client concurrency is one. `--concurrency N` issues bounded waves of
+at most N requests; `--repeats` remains the total measured request count per case,
+not a count per client. Each case has separate sequential warm-ups and its own
+measured window. Errors and HTTP 429 rejections are recorded without retries.
+The client saves evidence before returning nonzero for unexpected failures or
+rejections. Ctrl-C saves collected samples and returns 130.
+
+Compare concurrency without changing the manifest, repetition count, server, or
+generation settings. Run these sequentially, with the same instrumented server:
+
+```bash
+.venv/bin/python -m benchmarks.client --url http://127.0.0.1:8001 \
+  --workload benchmark-results/run-1/workload.json --warmups 2 --repeats 20 \
+  --concurrency 1 --output benchmark-results/run-1/http-c1.json
+.venv/bin/python -m benchmarks.client --url http://127.0.0.1:8001 \
+  --workload benchmark-results/run-1/workload.json --warmups 2 --repeats 20 \
+  --concurrency 2 --output benchmark-results/run-1/http-c2.json
+.venv/bin/python -m benchmarks.client --url http://127.0.0.1:8001 \
+  --workload benchmark-results/run-1/workload.json --warmups 2 --repeats 20 \
+  --concurrency 4 --output benchmark-results/run-1/http-c4.json
+```
+
+With one running plus two waiting slots, a simultaneous wave of four can reject
+one request. That is expected admission control, not a reason to retry it during
+the measurement. Generate a report for each client file using the same server
+JSONL. Record success counts alongside latency percentiles and useful throughput.
+
+For a separate cancellation control, add `--cancel-after-text`: measured streams
+close after their first real content event, while warm-ups complete normally.
+These intentional cancellations are not CLI failures and have no completion
+usage. Wait for server scheduling completion before joining cancellation-delay
+metrics. A client disconnected before headers has no response request ID;
+server logs still account for it, but client/server correlation is unavailable.
+
 Stop the benchmark server normally with Ctrl-C before running model-side
 experiments; do not benchmark competing model processes simultaneously.
 
@@ -399,6 +464,11 @@ timings are excluded from the repeated-run headline statistics.
   events do not count.
 - **Model TTFT:** immediately before `model.generate()` to its first generated
   token callback. Includes generation setup/prefill, excludes our tokenization.
+- **Queue wait:** validated admission to actual worker entry. Client first-text
+  and E2E include this wait; model TTFT does not.
+- **Cancellation delay:** first server cancellation signal to worker exit,
+  not the client's socket-close duration. Queued cancellations have no worker
+  delay. Missing or historical metrics remain unavailable, never assumed zero.
 - **Mean TPOT:** `(last_token_time - first_token_time) / (N - 1)`, unavailable for
   zero or one output token. Inter-token intervals are reported separately.
 - **Useful output throughput:** successfully delivered generated IDs divided by
@@ -430,18 +500,20 @@ Measured evidence and bottleneck interpretation are recorded in
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-The suite covers request validation, context budgets, lifecycle transitions,
-busy admission, consumer cancellation, SSE progress and terminal metadata,
-preparation/producer failures, disconnect ownership, and lifecycle log privacy,
-correlation, and timing boundaries. A tiny offline model exercises context
-limits and EOS-at-cap precedence, including invisible EOS token accounting.
-Other offline fixtures hold or fail producers to expose lifecycle transitions.
-HTTPX covers ordinary
-requests; direct ASGI connections expose streaming frames without buffering.
-Real-Qwen HTTP smoke evidence is recorded separately in `logs/practice.md`.
-Benchmark regressions additionally cover completion timing boundaries, malformed
-or truncated SSE, token/usage accounting, warm-up exclusion, cancellation,
-request-ID correlation, and fixed-length configuration isolation.
+The suite covers validation, context budgets, FIFO capacity and promotion,
+readiness, queued removal, retained worker ownership, cooperative cancellation,
+bounded-buffer pressure, send deadlines, shutdown, and request isolation.
+It also covers SSE progress/terminal metadata, preparation/producer failures,
+and lifecycle log privacy, correlation, and timing boundaries. Tiny offline
+models exercise real decoding, cancellation, context limits, and EOS-at-cap
+precedence, including invisible EOS token accounting. Controlled ASGI connections
+expose frames and send pressure without HTTPX response buffering.
+
+Real-Qwen HTTP and controlled-ASGI smoke evidence is recorded separately in
+`logs/practice.md`. Benchmark regressions cover bounded waves, equal request
+counts, no retries, interruption cleanup, malformed/truncated SSE, usage
+accounting, authoritative scheduling joins, historical metric availability,
+and fixed-length configuration isolation.
 
 
 ## Inspect tokenization and two-token generation

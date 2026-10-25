@@ -1228,18 +1228,30 @@ What happens when requests arrive faster than inference can finish them?
 Extend Stage 2's single-worker baseline with a bounded queue. Do not introduce
 parallel model calls merely because several HTTP clients are connected.
 
+Implemented policy: one active worker plus two FIFO waiting slots; HTTP 429
+when full. Readiness describes remaining admission capacity. Queued cancellation
+removes work, while running cancellation retains ownership until actual exit.
+Streaming uses an eight-item buffer, a one-second buffer-stall limit, and a
+five-second ASGI send limit. Normal Uvicorn shutdown drains HTTP before lifespan;
+lifespan cancels any remaining work and waits for the native worker.
+
+Technical verification: 106 passing regressions plus real-Qwen FIFO, disconnect,
+slow-send, and shutdown controls. See the
+[Phase 4 evidence](logs/practice.md#phase-4-bounded-concurrency-and-cancellation).
+The learner's explanation of throughput/latency changes remains unverified.
+
 ## Assignments
 
-- [ ] Keep the event loop responsive while inference runs.
-- [ ] Introduce a bounded request queue.
-- [ ] Define behavior when the queue is full.
-- [ ] Measure queue wait separately from generation time.
-- [ ] Remove canceled requests that have not started.
-- [ ] Define how running generation stops after cancellation.
-- [ ] Handle shutdown without accepting work that cannot finish.
-- [ ] Test with multiple simultaneous clients.
-- [ ] Define request transitions: queued, running, completed, failed, or canceled.
-- [ ] Preserve per-request settings and document how seeded sampling behaves
+- [x] Keep the event loop responsive while inference runs.
+- [x] Introduce a bounded request queue.
+- [x] Define behavior when the queue is full.
+- [x] Measure queue wait separately from generation time.
+- [x] Remove canceled requests that have not started.
+- [x] Define how running generation stops after cancellation.
+- [x] Handle shutdown without accepting work that cannot finish.
+- [x] Test with multiple simultaneous clients.
+- [x] Define request transitions: queued, running, completed, failed, or canceled.
+- [x] Preserve per-request settings and document how seeded sampling behaves
   without accidentally sharing or resetting random state across requests.
 
 An `async def` endpoint does not automatically make model computation
@@ -1267,6 +1279,15 @@ stream buffers and define what happens when a client consumes output too slowly.
 
 Compare concurrency levels such as 1, 2, and 4 while holding the workload
 constant.
+
+Measured all four fixed Phase 3 cases at C1/C2/C4, with 20 requests per case
+and two separate warm-ups. C1/C2 completed 80/80 each; C4 completed 60/80 and
+returned 20 expected HTTP 429 rejections. For 59-input/32-output tokens, useful
+throughput stayed near 13 tokens/s while E2E p95 rose from 2.52 to 5.05 to
+7.40 seconds. Twenty post-fix streaming cancellations had signal-to-worker-exit
+delay p50/p95 74.51/80.63 ms. These are single-run, bounded-wave observations,
+not production latency guarantees. Full tables, cancellation/isolation controls,
+shutdown evidence, and limitations are in the linked practice entry.
 
 ## Suggested commit
 

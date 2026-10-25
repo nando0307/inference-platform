@@ -1,12 +1,11 @@
 import asyncio
 import json
 import logging
-from _thread import LockType
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from queue import Empty
-from threading import Lock
 from time import perf_counter, time
 from typing import Literal, Self
 from uuid import uuid4
@@ -20,16 +19,22 @@ from pydantic_core import PydanticCustomError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import ClientDisconnect
 from starlette.types import ASGIApp, Receive, Scope, Send
-from transformers import TextIteratorStreamer
 
 from .inference import (
     MODEL_ID,
+    CancellationToken,
     ContextLimitError,
+    GenerationCancelled,
     GenerationResult,
     Runtime,
     generate,
     load_runtime,
 )
+from .streaming import BoundedTextIteratorStreamer
+
+
+QUEUE_CAPACITY = 2
+STREAM_SEND_TIMEOUT = 5.0
 
 
 logger = logging.getLogger("inference.lifecycle")
@@ -52,6 +57,8 @@ class _RequestLog:
     exception_type: str | None = None
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+    queue_wait_ms: float | None = None
+    cancellation_delay_ms: float | None = None
     finished: bool = False
 
     def emit(self, event: str, **fields) -> None:
@@ -65,7 +72,10 @@ class _RequestLog:
         }))
 
     def error(self, code: str, error: BaseException | None = None) -> None:
-        self.outcome = "failed" if code == "generation_failed" else "rejected"
+        self.outcome = (
+            "failed" if code in {"generation_failed", "slow_consumer", "request_canceled"}
+            else "rejected"
+        )
         self.error_code = code
         self.exception_type = type(error).__name__ if error is not None else None
 
@@ -84,29 +94,56 @@ class _RequestLog:
         if self.prompt_tokens is not None:
             fields["prompt_tokens"] = self.prompt_tokens
             fields["completion_tokens"] = self.completion_tokens
+        if self.queue_wait_ms is not None:
+            fields["queue_wait_ms"] = self.queue_wait_ms
+        if self.cancellation_delay_ms is not None:
+            fields["cancellation_delay_ms"] = self.cancellation_delay_ms
         self.emit("request_finished", **fields)
 
-    def producer_finished(
-        self,
-        outcome: str,
-        duration_ms: float,
-        prompt_tokens: int | None,
-        completion_tokens: int | None,
-        error_code: str | None,
-        exception_type: str | None,
+    def scheduling_finished(
+        self, job: "_InferenceJob", result: GenerationResult | None,
+        error: BaseException | None,
     ) -> None:
-        # Called on the event loop after worker exit, independently of delivery.
-        self.prompt_tokens = prompt_tokens
-        self.completion_tokens = completion_tokens
-        fields = {"outcome": outcome, "producer_duration_ms": duration_ms}
-        if prompt_tokens is not None:
-            fields["prompt_tokens"] = prompt_tokens
-            fields["completion_tokens"] = completion_tokens
-        if error_code is not None:
-            fields["error_code"] = error_code
-        if exception_type is not None:
-            fields["exception_type"] = exception_type
-        self.emit("producer_finished", **fields)
+        self.queue_wait_ms = (
+            (job.started_at - job.admitted_at) * 1000
+            if job.started_at is not None else None
+        )
+        requested_at = job.cancellation.requested_at
+        if requested_at is not None and requested_at > job.finished_at:
+            requested_at = None
+        self.cancellation_delay_ms = (
+            (job.finished_at - requested_at) * 1000
+            if job.started_at is not None and requested_at is not None else None
+        )
+        metrics = {
+            "queue_wait_ms": self.queue_wait_ms,
+            "cancellation_delay_ms": self.cancellation_delay_ms,
+        }
+        if requested_at is not None:
+            metrics["cancellation_reason"] = job.cancellation.reason
+        if job.started_at is not None:
+            fields = {
+                **metrics,
+                "outcome": "completed",
+                "producer_duration_ms": (job.finished_at - job.started_at) * 1000,
+            }
+            if result is not None:
+                self.prompt_tokens = result.prompt_tokens
+                self.completion_tokens = len(result.generated_ids)
+                fields.update(
+                    prompt_tokens=self.prompt_tokens, completion_tokens=self.completion_tokens,
+                )
+            if error is not None:
+                _, code, _ = _generation_error(error)
+                fields["outcome"] = (
+                    "canceled" if isinstance(error, GenerationCancelled)
+                    else "rejected" if isinstance(error, ContextLimitError) else "failed"
+                )
+                fields["error_code"] = code
+                if not isinstance(error, (GenerationCancelled, ContextLimitError)):
+                    fields["exception_type"] = type(error).__name__
+            self.emit("producer_finished", **fields)
+        self.emit("scheduling_finished", state=job.state, **metrics)
 
 
 class _RequestLoggingMiddleware:
@@ -125,11 +162,19 @@ class _RequestLoggingMiddleware:
             return
 
         request_log = _RequestLog(perf_counter())
-        scope.setdefault("state", {})["request_log"] = request_log
+        scope_state = scope.setdefault("state", {})
+        scope_state["request_log"] = request_log
+
+        def cancel_job(reason):
+            job = scope_state.get("inference_job")
+            if job is not None:
+                cancel_inference(scope["app"], job, reason)
 
         async def receive_logged():
             message = await receive()
             if message["type"] == "http.disconnect":
+                scope_state["disconnected"] = True
+                cancel_job("client_disconnected")
                 request_log.finish("disconnected")
             return message
 
@@ -144,21 +189,31 @@ class _RequestLoggingMiddleware:
                     ] + [(b"x-request-id", request_log.request_id.encode("ascii"))],
                 }
             try:
-                await send(message)
+                await asyncio.wait_for(send(message), timeout=STREAM_SEND_TIMEOUT)
+            except TimeoutError:
+                cancel_job("slow_consumer")
+                request_log.error("slow_consumer")
+                request_log.finish("failed")
+                # A transport that cannot send is not a place to send an error frame.
+                raise OSError("Chat transport send deadline exceeded.") from None
             except OSError:
+                cancel_job("client_disconnected")
                 request_log.finish("disconnected")
-                raise
+                raise ClientDisconnect() from None
             if message["type"] == "http.response.body" and not message.get("more_body", False):
                 request_log.finish()
 
         try:
             await self.app(scope, receive_logged, send_logged)
         except (ClientDisconnect, OSError):
+            cancel_job("client_disconnected")
             request_log.finish("disconnected")
         except asyncio.CancelledError:
+            cancel_job("request_canceled")
             request_log.finish("disconnected")
             raise
         except Exception as error:
+            cancel_job("request_canceled")
             request_log.error("generation_failed", error)
             if request_log.http_status is None:
                 response = _error_response(
@@ -170,7 +225,6 @@ class _RequestLoggingMiddleware:
                 # Do not let Uvicorn print the original exception's private message.
                 raise RuntimeError("Chat response failed after headers.") from None
         finally:
-            # Normal completion was logged by send; disconnect by receive/cancellation.
             if not request_log.finished:
                 request_log.error_code = request_log.error_code or "generation_failed"
                 request_log.finish("failed")
@@ -227,113 +281,170 @@ class InferenceUnavailable(RuntimeError):
 
 
 class InferenceBusy(RuntimeError):
-    """Another producer owns the inference slot."""
+    """Both waiting slots are occupied."""
+
+
+@dataclass(eq=False)
+class _InferenceJob:
+    request: ChatCompletionRequest
+    request_log: _RequestLog | None
+    streamer: BoundedTextIteratorStreamer | None
+    prepared: asyncio.Future[None] | None
+    result: asyncio.Future[GenerationResult]
+    cancellation: CancellationToken
+    admitted_at: float
+    state: str = "queued"
+    started_at: float | None = None
+    finished_at: float | None = None
+    producer: asyncio.Future[GenerationResult] | None = None
+
+
+def _observe_result(future: asyncio.Future) -> None:
+    if not future.cancelled():
+        future.exception()
 
 
 def submit_inference(
     app: FastAPI,
     request: ChatCompletionRequest,
     *,
-    streamer: TextIteratorStreamer | None = None,
+    streamer: BoundedTextIteratorStreamer | None = None,
     prepared: asyncio.Future[None] | None = None,
     request_log: _RequestLog | None = None,
-) -> asyncio.Future[GenerationResult]:
-    """Admit a validated request on the event loop and return a protected result."""
+) -> _InferenceJob:
+    """Admit on the event loop; waiting jobs never enter the executor."""
     loop = asyncio.get_running_loop()
     state = app.state
     if not getattr(state, "initialized", False) or state.shutting_down:
         raise InferenceUnavailable("Inference is not available.")
-    if not state.admission_guard.acquire(blocking=False):
-        raise InferenceBusy("Another inference request is running.")
-    if prepared is not None:
-        prepared.add_done_callback(lambda future: _observe_completion(app, future))
-
-    try:
-        producer = loop.run_in_executor(
-            state.executor, _run_inference, state.runtime, request, state.admission_guard,
-            loop, streamer, prepared, request_log,
+    if state.active_job is not None and len(state.pending_jobs) >= QUEUE_CAPACITY:
+        raise InferenceBusy("The inference request queue is full.")
+    admitted_at = perf_counter()
+    cancellation = streamer.cancellation if streamer is not None else CancellationToken()
+    if request.stream and streamer is None:
+        streamer = BoundedTextIteratorStreamer(
+            state.runtime.tokenizer, cancellation=cancellation,
+            skip_prompt=True, skip_special_tokens=True,
+            clean_up_tokenization_spaces=False, timeout=0.1,
         )
-    except Exception as error:
-        state.admission_guard.release()
-        if prepared is not None:
-            _resolve_preparation(prepared, error)
-        raise
-
-    state.producer_futures.add(producer)
-    producer.add_done_callback(lambda future: _observe_completion(app, future))
+    result = loop.create_future()
+    result.add_done_callback(_observe_result)
+    if prepared is not None:
+        prepared.add_done_callback(_observe_result)
+    job = _InferenceJob(
+        request, request_log, streamer, prepared, result, cancellation, admitted_at,
+    )
+    if state.active_job is None:
+        job.state = "running"
     if request_log is not None:
-        request_log.emit("request_accepted")
-    # Cancellation of the consumer must not cancel queued/running producer work.
-    result = asyncio.shield(producer)
-    # Also observe an abandoned result, including callers that add another shield.
-    result.add_done_callback(lambda future: _observe_completion(app, future))
-    return result
+        request_log.emit("request_accepted", state=job.state)
+    if job.state == "running":
+        _start_job(app, job)
+    else:
+        state.pending_jobs.append(job)
+    return job
 
 
-def _run_inference(
-    runtime: Runtime,
-    request: ChatCompletionRequest,
-    guard: LockType,
-    loop: asyncio.AbstractEventLoop,
-    streamer: TextIteratorStreamer | None,
-    prepared: asyncio.Future[None] | None,
-    request_log: _RequestLog | None,
-) -> GenerationResult:
-    started = perf_counter()
-    result = None
-    outcome = "completed"
-    error_code = None
-    exception_type = None
+def _start_job(app: FastAPI, job: _InferenceJob) -> None:
+    state = app.state
+    state.active_job = job
+    job.state = "running"
+    loop = asyncio.get_running_loop()
+    try:
+        producer = loop.run_in_executor(state.executor, _run_inference, state.runtime, job, loop)
+    except Exception as error:
+        _finish_job(job, None, error)
+        state.active_job = None
+        _promote_next(app)
+        return
+    job.producer = producer
+    state.producer_futures.add(producer)
+    producer.add_done_callback(lambda future: _producer_done(app, job, future))
+
+
+def _request_started(job: _InferenceJob) -> None:
+    if job.request_log is not None:
+        job.request_log.queue_wait_ms = (job.started_at - job.admitted_at) * 1000
+        job.request_log.emit(
+            "request_started", state="running", queue_wait_ms=job.request_log.queue_wait_ms,
+        )
+
+
+def _run_inference(runtime: Runtime, job: _InferenceJob, loop) -> GenerationResult:
+    job.started_at = perf_counter()
+    loop.call_soon_threadsafe(_request_started, job)
 
     def on_prepared():
-        loop.call_soon_threadsafe(_resolve_preparation, prepared, None)
+        loop.call_soon_threadsafe(_resolve_preparation, job.prepared, None)
 
     try:
+        job.cancellation.raise_if_cancelled()
         result = generate(
-            runtime,
-            [message.model_dump() for message in request.messages],
-            max_new_tokens=request.max_tokens,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            streamer=streamer,
-            on_prepared=on_prepared if prepared is not None else None,
+            runtime, [message.model_dump() for message in job.request.messages],
+            max_new_tokens=job.request.max_tokens,
+            temperature=job.request.temperature, top_p=job.request.top_p,
+            streamer=job.streamer,
+            on_prepared=on_prepared if job.prepared is not None else None,
+            cancellation=job.cancellation,
         )
+        job.cancellation.raise_if_cancelled()
         return result
-    except BaseException as error:
-        if isinstance(error, ContextLimitError):
-            outcome, error_code = "rejected", "context_length_exceeded"
-        else:
-            outcome, error_code = "failed", "generation_failed"
-            exception_type = type(error).__name__
-        if prepared is not None:
-            loop.call_soon_threadsafe(_resolve_preparation, prepared, error)
-        raise
     finally:
-        duration_ms = (perf_counter() - started) * 1000
-        guard.release()
-        if request_log is not None:
-            loop.call_soon_threadsafe(
-                request_log.producer_finished, outcome, duration_ms,
-                result.prompt_tokens if result is not None else None,
-                len(result.generated_ids) if result is not None else None,
-                error_code, exception_type,
-            )
+        job.finished_at = perf_counter()
 
 
-def _resolve_preparation(future: asyncio.Future[None], error: BaseException | None):
-    # Runs on the event loop; failure may follow an already-signaled preparation.
-    if not future.done():
+def _resolve_preparation(future: asyncio.Future[None] | None, error: BaseException | None):
+    if future is not None and not future.done():
         if error is None:
             future.set_result(None)
         else:
             future.set_exception(error)
 
 
-def _observe_completion(app: FastAPI, future: asyncio.Future) -> None:
-    app.state.producer_futures.discard(future)
-    if not future.cancelled():
-        # Observing does not consume the exception for other awaiters.
-        future.exception()
+def _finish_job(
+    job: _InferenceJob, result: GenerationResult | None, error: BaseException | None,
+) -> None:
+    job.finished_at = job.finished_at if job.finished_at is not None else perf_counter()
+    job.state = (
+        "canceled" if isinstance(error, GenerationCancelled)
+        else "failed" if error is not None else "completed"
+    )
+    _resolve_preparation(job.prepared, error)
+    if not job.result.done():
+        if error is None:
+            job.result.set_result(result)
+        else:
+            job.result.set_exception(error)
+    if job.request_log is not None:
+        job.request_log.scheduling_finished(job, result, error)
+
+
+def _producer_done(app: FastAPI, job: _InferenceJob, producer: asyncio.Future) -> None:
+    # Only actual worker completion releases ownership, never HTTP cancellation.
+    app.state.producer_futures.discard(producer)
+    error = producer.exception()
+    # Worker exit can race the check in cancel_inference, before its token signal.
+    requested_at = job.cancellation.requested_at
+    if error is None and requested_at is not None and requested_at <= job.finished_at:
+        error = GenerationCancelled(job.cancellation.reason)
+    _finish_job(job, producer.result() if error is None else None, error)
+    app.state.active_job = None
+    _promote_next(app)
+
+
+def _promote_next(app: FastAPI) -> None:
+    state = app.state
+    if not state.shutting_down and state.pending_jobs:
+        _start_job(app, state.pending_jobs.popleft())
+
+
+def cancel_inference(app: FastAPI, job: _InferenceJob, reason="client_disconnected") -> None:
+    if job.state == "queued":
+        app.state.pending_jobs.remove(job)
+        job.cancellation.cancel(reason)
+        _finish_job(job, None, GenerationCancelled(job.cancellation.reason))
+    elif job.state == "running" and job.finished_at is None:
+        job.cancellation.cancel(reason)
 
 
 @asynccontextmanager
@@ -343,24 +454,31 @@ async def lifespan(app: FastAPI):
     state.shutting_down = False
     state.runtime = None
     state.executor = None
-    state.admission_guard = Lock()
+    state.active_job = None
+    state.pending_jobs = deque()
     state.producer_futures = set()
 
     try:
-        # Startup must finish before requests can use the model.
         state.runtime = load_runtime()
         state.executor = ThreadPoolExecutor(max_workers=1)
         state.initialized = True
         yield
     finally:
+        # Uvicorn normally drains HTTP first. This handles any jobs left at teardown.
         state.initialized = False
         state.shutting_down = True
+        for job in tuple(state.pending_jobs):
+            cancel_inference(app, job, "shutdown")
+        if state.active_job is not None:
+            cancel_inference(app, state.active_job, "shutdown")
         if state.executor is not None:
-            # Retain the runtime until all worker computation has actually ended.
             await asyncio.to_thread(state.executor.shutdown, wait=True)
             state.executor = None
         if state.producer_futures:
-            await asyncio.gather(*state.producer_futures, return_exceptions=True)
+            await asyncio.gather(
+                *(asyncio.shield(future) for future in state.producer_futures),
+                return_exceptions=True,
+            )
         state.runtime = None
 
 
@@ -459,7 +577,31 @@ class _DisconnectedResponse(Response):
         return
 
 
+class _ClosingStreamingResponse(StreamingResponse):
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # Starlette does not close an iterator suspended at a failed send.
+            cancel_inference(scope["app"], scope["state"]["inference_job"], "request_canceled")
+            await self.body_iterator.aclose()
+
+
+def _generation_error(error: BaseException) -> tuple[int, str, str]:
+    if isinstance(error, ContextLimitError):
+        return 400, "context_length_exceeded", str(error)
+    if isinstance(error, GenerationCancelled):
+        if error.reason == "shutdown":
+            return 503, "not_ready", "Inference is shutting down."
+        if error.reason == "slow_consumer":
+            return 503, "slow_consumer", "The client could not consume the completion in time."
+        return 503, "request_canceled", "The completion was canceled."
+    return 500, "generation_failed", "The completion could not be generated."
+
+
 async def _is_disconnected(request: Request) -> bool:
+    if getattr(request.state, "disconnected", False):
+        return True
     disconnected = await request.is_disconnected()
     # Starlette's AnyIO probe can consume a concurrent Task.cancel(). Preserve it.
     if asyncio.current_task().cancelling():
@@ -467,22 +609,28 @@ async def _is_disconnected(request: Request) -> bool:
     return disconnected
 
 
-async def _await_connected(request: Request, future: asyncio.Future):
+async def _await_connected(request: Request, job: _InferenceJob, future: asyncio.Future):
+    protected = asyncio.shield(future)
+    protected.add_done_callback(_observe_result)
     try:
-        while not future.done():
+        while not protected.done():
             if await _is_disconnected(request):
                 raise ClientDisconnect()
-            await asyncio.wait({future}, timeout=0.1)
+            await asyncio.wait({protected}, timeout=0.1)
         if await _is_disconnected(request):
             raise ClientDisconnect()
-        return future.result()
-    except (ClientDisconnect, asyncio.CancelledError):
-        # All result futures passed here are shielded; producer ownership stays intact.
-        future.cancel()
+        return protected.result()
+    except ClientDisconnect:
+        cancel_inference(request.app, job, "client_disconnected")
         raise
+    except asyncio.CancelledError:
+        cancel_inference(request.app, job, "request_canceled")
+        raise
+    finally:
+        protected.cancel()
 
 
-def _next_text(streamer: TextIteratorStreamer) -> tuple[str, str]:
+def _next_text(streamer: BoundedTextIteratorStreamer) -> tuple[str, str]:
     # StopIteration must not cross an asyncio Future boundary.
     try:
         return "text", next(streamer)
@@ -498,11 +646,11 @@ def _sse(data: dict) -> str:
 
 async def _stream_completion(
     request: Request,
-    streamer: TextIteratorStreamer,
-    future: asyncio.Future[GenerationResult],
+    job: _InferenceJob,
     request_id: str,
     created: int,
 ):
+    future = job.result
     base = {
         "id": f"chatcmpl-{request_id}",
         "object": "chat.completion.chunk",
@@ -529,14 +677,14 @@ async def _stream_completion(
             producer_done = future.done()
             if producer_done:
                 future.result()  # Detect failure even without a streamer sentinel.
-            outcome, text = await asyncio.to_thread(_next_text, streamer)
+            outcome, text = await asyncio.to_thread(_next_text, job.streamer)
             if await _is_disconnected(request):
                 return
             if outcome == "text":
                 if text:
                     yield chunk({"content": text})
             elif outcome == "end":
-                result = await _await_connected(request, future)
+                result = await _await_connected(request, job, future)
                 break
             elif producer_done:
                 # Work was complete before the empty queue read, so no text is lost.
@@ -546,17 +694,21 @@ async def _stream_completion(
         yield "data: [DONE]\n\n"
     except ClientDisconnect:
         return
+    except asyncio.CancelledError:
+        cancel_inference(request.app, job, "request_canceled")
+        raise
     except Exception as error:
-        request.state.request_log.error("generation_failed", error)
+        if isinstance(error, GenerationCancelled) and error.reason == "client_disconnected":
+            return
+        _, code, message = _generation_error(error)
+        request.state.request_log.error(code, error)
         if await _is_disconnected(request):
             return
-        yield _sse(_error_payload(
-            "generation_failed", "The completion could not be generated.", request_id
-        ))
+        yield _sse(_error_payload(code, message, request_id))
         yield "data: [DONE]\n\n"
     finally:
-        # This is the shielded delivery future, never the retained producer.
-        future.cancel()
+        reason = "client_disconnected" if getattr(request.state, "disconnected", False) else "request_canceled"
+        cancel_inference(request.app, job, reason)
 
 
 @app.post("/v1/chat/completions")
@@ -566,49 +718,33 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     request_id = request_log.request_id
     created = int(time())
     try:
+        prepared = asyncio.get_running_loop().create_future() if body.stream else None
+        job = submit_inference(request.app, body, prepared=prepared, request_log=request_log)
+        request.state.inference_job = job
         if body.stream:
-            state = request.app.state
-            if not getattr(state, "initialized", False) or state.shutting_down:
-                raise InferenceUnavailable("Inference is not available.")
-            streamer = TextIteratorStreamer(
-                state.runtime.tokenizer,
-                skip_prompt=True,
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=False,
-                timeout=0.1,
-            )
-            prepared = asyncio.get_running_loop().create_future()
-            future = submit_inference(
-                request.app, body, streamer=streamer, prepared=prepared,
-                request_log=request_log,
-            )
-            await _await_connected(request, asyncio.shield(prepared))
-            if future.done():
-                future.result()  # A failure already known before headers is still HTTP.
-            return StreamingResponse(
-                _stream_completion(request, streamer, future, request_id, created),
+            await _await_connected(request, job, prepared)
+            if job.result.done():
+                job.result.result()
+            return _ClosingStreamingResponse(
+                _stream_completion(request, job, request_id, created),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache"},
             )
-        result = await _await_connected(
-            request, submit_inference(request.app, body, request_log=request_log)
-        )
+        result = await _await_connected(request, job, job.result)
     except ClientDisconnect:
         return _DisconnectedResponse()
     except InferenceUnavailable:
         return _error_response(503, "not_ready", "Inference is not available.", request_log)
     except InferenceBusy:
         return _error_response(
-            429, "server_busy", "Another inference request is running.", request_log
+            429, "server_busy", "The inference request queue is full.", request_log
         )
-    except ContextLimitError as error:
-        # This exception is constructed from token counts, never prompt content.
-        return _error_response(400, "context_length_exceeded", str(error), request_log)
     except Exception as error:
-        return _error_response(
-            500, "generation_failed", "The completion could not be generated.",
-            request_log, error,
-        )
+        if isinstance(error, GenerationCancelled) and error.reason == "client_disconnected":
+            return _DisconnectedResponse()
+        status, code, message = _generation_error(error)
+        logged_error = None if isinstance(error, (ContextLimitError, GenerationCancelled)) else error
+        return _error_response(status, code, message, request_log, logged_error)
 
     return JSONResponse(
         content={
@@ -636,16 +772,23 @@ async def health():
 @app.get("/ready")
 async def ready(request: Request):
     state = request.app.state
+    running = int(getattr(state, "active_job", None) is not None)
+    queued = len(getattr(state, "pending_jobs", ()))
     if getattr(state, "shutting_down", False):
         status = "shutting_down"
     elif not getattr(state, "initialized", False):
         status = "not_ready"
-    elif state.admission_guard.locked():
+    elif queued >= QUEUE_CAPACITY:
+        status = "full"
+    elif running:
         status = "busy"
     else:
         status = "ready"
-    available = status == "ready"
+    available = status in {"ready", "busy"}
     return JSONResponse(
         status_code=200 if available else 503,
-        content={"ready": available, "status": status},
+        content={
+            "ready": available, "status": status, "running": running,
+            "queued": queued, "queue_capacity": QUEUE_CAPACITY,
+        },
     )
