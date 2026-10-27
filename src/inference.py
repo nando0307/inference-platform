@@ -30,11 +30,12 @@ class Runtime:
 device = "cpu"
 
 
-def load_runtime() -> Runtime:
+def load_runtime(*, revision: str | None = None) -> Runtime:
     """Load shared inference resources; the caller owns their lifetime."""
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, revision=revision)
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
+        revision=revision,
         dtype=torch.float32,
     ).to(device)
     model.eval()

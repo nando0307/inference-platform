@@ -91,6 +91,12 @@ CPU in float32. Model files must be cached locally or downloadable. Importing
 `src.api` does not load weights; failed loading aborts startup. Avoid reload
 mode and multiple workers when checking model lifetime.
 
+For an explicit model/tokenizer snapshot, call
+`src.inference.load_runtime(revision="7ae557604adf67be50417f59c2c2f167def9a775")`.
+The keyword-only revision applies to both artifacts; a commit hash pins their
+version, not the Python dependencies or device. Omitting it preserves the
+default Hugging Face revision behavior. Loading still uses CPU float32.
+
 From another terminal:
 
 ```bash
