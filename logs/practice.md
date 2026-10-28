@@ -15,7 +15,7 @@ against Hugging Face `generate()` for token-limit and EOS stopping, and an
 initial synchronized CPU/MPS float32 comparison. Do not restart the basics.
 
 Current API state: Stage 2 technical acceptance, Phase 3 benchmarks, and Phase 4
-bounded scheduling/cancellation are implemented. There are 106 passing tests.
+bounded scheduling/cancellation are implemented. There are 110 passing tests.
 Real-Qwen controls verify FIFO admission, queued removal, running disconnects,
 bounded streaming pressure, request-setting isolation, and both shutdown paths.
 See [the Phase 4 entry](#phase-4-bounded-concurrency-and-cancellation) for current
@@ -25,6 +25,10 @@ more connected clients do not imply parallel model execution. Independent
 understanding checks remain pending. Earlier entries describe their own time.
 Manual top-k/top-p lessons were explicitly skipped, not completed. Use the
 stable roadmap [plan.md](../plan.md), this evidence log, and actual code together.
+The latest checkpoint is the separate [Modal GPU experiment](#gpu-exploration-modal-and-warm-inference):
+the learner completed the first bounded warm T4 run, with five successful
+measurements. Results and qualified CPU comparisons are recorded below.
+Do not rerun merely to confirm this supplied evidence.
 
 ## Mentoring and edit permissions
 
@@ -41,6 +45,15 @@ stable roadmap [plan.md](../plan.md), this evidence log, and actual code togethe
 - Move toward the minimal local API next; do not jump to vLLM, CUDA,
   multi-worker infrastructure, or a larger architecture yet.
 - This project runs Qwen locally, not through an OpenAI inference API.
+- Standing request (2026-10-27): record future experiment numbers and results
+  so progress can be compared at the end of the project. Preserve available
+  per-run data under fresh local `benchmark-results/` paths and summarize
+  observed evidence here with configuration, timing boundaries, sample counts,
+  failures, and limitations. Treat learner-supplied output as evidence; do not
+  rerun merely to confirm it or invent missing measurements. Separate functional
+  success from performance evidence. Compare matching workloads and boundaries,
+  reporting improvements, regressions, or inconclusive results honestly.
+  This authorizes recording evidence, not unapproved code changes or cloud runs.
 
 ## Current scripts
 
@@ -1633,3 +1646,232 @@ Before batching, the learner should explain:
 
 These explanations remain unverified. Stage 5 implementation is not implicitly
 authorized by completion of this phase.
+
+## GPU exploration: Modal and warm inference
+
+### Authorization and position
+
+On 2026-10-27, the learner approved a bounded warm GPU experiment and requested
+ongoing recording of numbers and results. This is an exploration after Phase 4,
+not Phase 5 batching or API deployment. The local CPU service, its generation
+implementation, and CPU-only token instrumentation remain unchanged. Cloud
+execution remains a separate learner action; no always-warm GPU is configured.
+
+### User-reported CUDA functionality
+
+The learner ran the initial tensor check on a Tesla T4 with Torch 2.6.0+cu124
+and CUDA 12.4. Its CUDA tensor returned squares `[0, 1, 4, 9, 16, 25, 36, 49]`;
+reported device capacity was 14.57080078125 GiB, not memory consumption.
+
+The first Qwen invocation built the image and downloaded seven artifact files.
+Model placement and generation succeeded, but result reporting failed because
+`importlib.metadata.version("modal")` could not find distribution metadata for
+Modal's injected runtime. Removing that lookup fixed the reporting assumption,
+without changing inference or installing another SDK in the container.
+
+The learner's subsequent successful run:
+https://modal.com/apps/lenando0307/main/ap-bfypt22VLnBnj9tpKOQjkh
+
+| Field | Observed value |
+|---|---|
+| Model | Qwen/Qwen2.5-0.5B-Instruct |
+| Revision | `7ae557604adf67be50417f59c2c2f167def9a775` |
+| Template SHA-256 | `cd8e9439f0570856fd70470bf8889ebd8b5d1107207f67a5efb46e342330527f` |
+| Device / dtype | Tesla T4, `cuda:0`, `torch.float32` |
+| Python / CUDA | 3.12.10 / 12.4 |
+| Torch / Transformers | 2.6.0+cu124 / 4.57.6 |
+| NumPy / Hub / tokenizers / safetensors | 2.2.6 / 0.36.0 / 0.22.1 / 0.6.2 |
+| Generation settings | Output cap 16, temperature 0, top-p 1 |
+| Completion | `4` |
+| Prompt / completion tokens | 43 / 2 |
+| Finish reason | `stop` |
+
+Preserved as ignored local evidence:
+`benchmark-results/modal/qwen-check-user-reported.json`.
+This is learner-supplied output, not an assistant rerun. No model latency or
+speedup was measured, and the shell prompt's elapsed time is not an inference
+measurement. This establishes functionality, not independent understanding.
+
+### Implemented warm experiment
+
+- `modal_inference.py` loads one pinned CPU float32 runtime, moves its weights
+  to CUDA once, and invokes the helper loop on the same runtime.
+- New `benchmarks/gpu.py` reuses `benchmarks.model.validate_workload` to check the
+  recorded revisions, template, actual tokenization, and context budget. It
+  selects only `short-input-long-output`: 59 prompt tokens and a 128-token cap.
+- Two warm-ups precede five sequential measured calls. Each call has separate
+  generation state and KV cache. Natural EOS stopping is unchanged.
+- `warm_inference_ms` brackets the complete `src.inference.generate()` call
+  with CUDA synchronization before the starting clock read and before the
+  ending clock read. It includes formatting, tokenization, transfers, prefill,
+  decoding, and text decoding. It excludes loading, warm-ups, network invocation,
+  and gaps between calls. No per-token instrumentation is added.
+- The JSON retains environment metadata, the full workload, phase/iteration,
+  status, actual counts, and finish reason for each returned sample. Warm-up
+  duration is null. Summary statistics exclude warm-ups and failed calls.
+- Throughput is total successful measured output tokens divided by their summed
+  warm inference seconds. It is not decode-only throughput or whole-run
+  throughput. Five observations do not support a stable p95 or production SLO.
+- An ordinary sample failure aborts subsequent calls, returns earlier rows, and
+  records only the exception type with null failed completion usage and timing.
+  The local CLI saves incomplete results and exits 1; handled Ctrl-C exits 130.
+- A transport, setup, or process failure before results return leaves remote
+  history unknown: `remote_results_received=false`, no available samples, and
+  `summary=null`. No zero-valued remote execution counts are invented. Forced
+  local termination or build failure before entrypoint execution cannot be
+  saved by the entrypoint; preserve those CLI logs separately.
+- Existing paths are refused, and the shared `write_json` helper creates files
+  exclusively. Benchmark modules are mounted after the cached download layer;
+  only the workload JSON is sent, not the result directory.
+
+Prediction recorded before any remote timing run: keeping one loaded model
+excludes repeated model initialization from the measured calls. It does not
+establish a numerical GPU speedup. The remote software stack differs from the
+historical CPU stack, and GPU warm function duration cannot be compared
+directly with CPU HTTP E2E duration.
+
+### Local verification and numbers
+
+The full existing environment suite passed **110 tests**. Four new deterministic
+tests cover workload mismatches, leading/trailing synchronization timing,
+warm-up and generation failures, and token-weighted throughput with warm-ups
+and errors excluded. The asynchronous timing test models pending GPU work;
+it is not evidence of real CUDA timing behavior.
+
+A real pinned-Qwen CPU smoke exercised the actual two-warm-up/five-measurement
+loop and selected workload. Only CUDA synchronization was replaced with a no-op
+for this local verification; the Modal worker itself still rejects a CPU host.
+This is **CPU validation, not the GPU benchmark or a speedup comparison**.
+
+Environment: Apple M1 Pro, eight logical CPUs, Python 3.12.13, Torch 2.14.1,
+Transformers 5.18.0, float32, intra-op threads 6 and inter-op threads 8.
+Both warm-ups succeeded; all five measured calls used 59 prompt tokens and
+generated 128 tokens with `finish_reason: length`. No generation failures.
+
+| Measured iteration | CPU validation duration (ms) |
+|---|---:|
+| 0 | 9422.451042 |
+| 1 | 9267.304792 |
+| 2 | 9222.209834 |
+| 3 | 9695.879542 |
+| 4 | 10477.113125 |
+
+Median: **9422.451042 ms**. Sum of measured durations: **48084.958335 ms**.
+Actual measured output: **640 tokens**, yielding **13.309775 tok/s** at the
+defined successful-call boundary. These numbers are preserved because the
+learner requested recording all observed results, not because they establish
+an optimization.
+
+Raw artifact: `benchmark-results/modal/local-cpu-validation-b262b6e5.json`.
+Its kind and verification limit explicitly identify CPU execution and the
+replaced synchronization. Local artifacts are ignored and may be absent in
+a fresh clone.
+
+The real local entrypoint and writer also passed controlled transport-boundary
+checks: successful JSON persistence, byte-for-byte preservation on overwrite
+refusal, partial generation failure preservation, transport failure, and
+interruption exit 130. Network calls were replaced in those checks; they are
+not remote lifecycle evidence. Temporary persistence-check files were removed.
+Modal SDK 1.6.2 CLI help confirms required `--output` and optional `--workload`.
+
+### First warm GPU invocation (completed)
+
+From the repository root, only when ready to consume cloud credits:
+
+```bash
+~/.venvs/modal/bin/modal run modal_inference.py \
+  --workload benchmark-results/phase3/workload.json \
+  --output benchmark-results/modal/warm-t4-001.json
+```
+
+Choose another fresh output filename if it already exists. The GPU allocation
+is billed during loading, warm-ups, measured work, and any remaining container
+lifetime. One allowed container, no configured input retries or minimum warm
+capacity, and timeouts are not hard spending caps.
+
+At implementation handoff, remote timing was still pending. No cloud computation,
+deployment, dependency changes, generated-file edits, staging, or commits were
+performed by the assistant during that implementation. The learner subsequently
+ran the command successfully; its evidence follows.
+
+### First warm T4 measurements: 2026-10-27
+
+Source: learner-provided terminal output and the saved local artifact
+`benchmark-results/modal/warm-t4-001.json`. The assistant did not rerun it.
+Recorded start: `2026-10-27T23:53:18.465258+00:00`.
+Modal run: https://modal.com/apps/lenando0307/main/ap-iktRlOMFzQ62SxDC3YJt4t
+The CLI reported the result saved and the ephemeral app completed.
+
+Configuration: the same pinned model/tokenizer revision and template hash as
+above; Tesla T4, CUDA float32, Python 3.12.10, Torch 2.6.0+cu124,
+Transformers 4.57.6, NumPy 2.2.6, Hub 0.36.0, tokenizers 0.22.1, safetensors
+0.6.2. Batch size and concurrency were one. One model load, two warm-ups,
+five sequential measured calls; greedy temperature 0/top-p 1, natural EOS
+stopping, 128-token output cap, and 2048-token context limit.
+
+Both warm-ups and all five measured calls succeeded. Each used 59 prompt
+tokens and produced 128 completion tokens with `finish_reason: length`.
+There were zero warm-up errors and zero measured errors. The full workload
+manifest contains four cases, but only `short-input-long-output` ran.
+
+| Measured iteration | Warm T4 inference duration (ms) |
+|---|---:|
+| 0 | 3126.420059 |
+| 1 | 3924.504596 |
+| 2 | 3890.214294 |
+| 3 | 3397.125489 |
+| 4 | 3025.067633 |
+
+- Median: **3397.125489 ms**.
+- Observed range: **3025.067633 to 3924.504596 ms**.
+- Sum of measured inference durations: **17363.332071 ms**.
+- Measured output: **640 tokens**.
+- Aggregate successful measured throughput: **36.859285 output tokens/s**,
+  calculated as `640 / 17.363332071`.
+
+The measured boundary includes formatting, tokenization, transfers, prefill,
+decoding, and text decoding, with CUDA synchronization at the outer boundaries.
+It excludes loading, warm-ups, network invocation, and gaps between calls.
+The sum is neither total command duration nor billable GPU allocation duration.
+The workload's `baseline.device: cpu` describes its original manifest; the
+actual execution device is `runtime.device: cuda:0`.
+
+#### Exploratory cross-environment comparison
+
+The earlier CPU validation used the same fixed workload, revision, float32
+precision, two/five sample structure, and analogous whole-function timing
+boundary. Both runs generated 128 tokens on every measured call, so shorter
+output does not explain the observed difference. The CPU synchronization
+replacement was a no-op because those operations executed on CPU.
+
+| Metric | Local M1 Pro CPU validation | Modal T4 |
+|---|---:|---:|
+| Measured successes | 5/5 | 5/5 |
+| Median warm inference (ms) | 9422.451042 | 3397.125489 |
+| Aggregate output tokens/s | 13.309775 | 36.859285 |
+| Sum of measured durations (ms) | 48084.958335 | 17363.332071 |
+| Torch / Transformers | 2.14.1 / 5.18.0 | 2.6.0+cu124 / 4.57.6 |
+
+Arithmetic on these observed summaries:
+
+- CPU median / T4 median: **2.773654x**, or **63.946478% lower median duration**.
+- T4 aggregate throughput / CPU aggregate throughput: **2.769339x**.
+
+These are observed cross-environment ratios, not a hardware-isolated GPU
+speedup claim. Python/package versions, host CPUs, operating systems, kernels,
+and execution conditions differ; the CPU run was originally a functional
+validation smoke, not a controlled matched-stack benchmark. There are only
+five measured samples in each single run. Timing variation is observed, but
+its cause is not established by these records. No stable p95, TTFT, TPOT,
+cold-start latency, quality improvement, or service-level speedup is established.
+Do not compare against Phase 4 HTTP E2E figures or infer GPU billing from the
+summed warm durations.
+
+A defensible statement is: on the fixed 59/128 workload, this T4 environment
+observed a 3.40-second median warm inference duration and 36.86 output tokens/s,
+versus 9.42 seconds and 13.31 tokens/s in the earlier local CPU validation,
+with software and platform differences explicitly disclosed.
+
+Before attributing the difference specifically to hardware, run a deliberately
+matched software-stack CPU control and collect more observations, with separate
+approval for new computation. The current result needs no confirmation rerun.

@@ -14,12 +14,14 @@ and the next task. Use [plan.md](plan.md) for the broader roadmap.
 
 The implementation now includes Phase 4 controlled concurrency: one inference
 worker, two FIFO waiting slots, cooperative cancellation, and bounded streaming.
-The suite has 106 passing tests, with real-Qwen lifecycle and HTTP smoke evidence.
+The suite has 110 passing tests, with real-Qwen lifecycle and HTTP smoke evidence.
 See the [Phase 4 evidence](logs/practice.md#phase-4-bounded-concurrency-and-cancellation)
 for the fixed-workload comparison and its limitations. Next: explain queue wait,
 latency, throughput, and cancellation ownership before introducing batching.
 Independent learning checks remain pending; automated verification does not
 prove understanding.
+The current GPU exploration has a completed five-sample warm T4 run:
+3397.13 ms median inference duration and 36.86 output tokens/s for the 59/128 case.
 
 ## Explore the codebase with Understand Anything
 
@@ -75,6 +77,106 @@ The viewer is local and read-only; no LLM/API key is needed. Stop it with Ctrl-C
 Commit the graph, config, metadata, fingerprints, and ignore rules in `.ua/` to
 share the analysis; scratch output is ignored by Git. Review generated summaries
 before sharing them outside the project.
+
+## Bounded warm Qwen measurements on Modal
+
+`modal_inference.py` is a GPU exploration checkpoint after Phase 4, not an API
+deployment. It loads the pinned Qwen runtime once onto a T4 in float32, then
+reuses `src.inference.generate()` sequentially for two warm-ups and five measured
+generations. Model weights are shared; generation state and KV caches are not.
+The local CPU service and CPU-only token instrumentation remain unchanged.
+
+The experiment uses `short-input-long-output` from the existing
+`benchmark-results/phase3/workload.json`: 59 formatted prompt tokens, a 128-token
+output cap, temperature 0, and top-p 1. Shared benchmark validation checks the
+model/tokenizer revisions, template hash, actual prompt count, and context
+budget. EOS stopping remains enabled; the cap does not guarantee output length.
+The workload's `baseline` describes its original CPU experiment, not the
+actual device of this run, which is recorded separately under `runtime`.
+
+The remote image pins Torch 2.6.0+cu124, Transformers 4.57.6, NumPy 2.2.6,
+Hugging Face Hub 0.36.0, tokenizers 0.22.1, and safetensors 0.6.2 on Python 3.12.
+These differ from the recorded local benchmark stack; differences cannot be
+attributed solely to hardware. Transitive dependencies are not fully locked.
+
+A CPU-only image build step downloads inference artifacts at revision
+`7ae557604adf67be50417f59c2c2f167def9a775` into `/opt/huggingface`.
+Modal caches that layer; GPU invocations load with `HF_HUB_OFFLINE=1`.
+Benchmark helpers are mounted after the download layer so their edits do not
+invalidate it. Only the runner, inference module, and required benchmark modules
+are included from the project. The workload JSON is passed as an argument;
+result directories, virtual environments, local model caches, and credentials
+are not uploaded.
+
+With the separate Modal SDK environment installed and authenticated, run from
+the repository root **only when ready to consume cloud resources**:
+
+```bash
+~/.venvs/modal/bin/modal run modal_inference.py \
+  --workload benchmark-results/phase3/workload.json \
+  --output benchmark-results/modal/warm-t4-001.json
+```
+
+`--workload` defaults to the path above; `--output` is required. Choose a fresh
+output path each time. The local entrypoint refuses existing files and uses the
+shared exclusive JSON writer, never overwriting prior evidence.
+
+For each measured call, CUDA is synchronized before starting the wall clock
+and again before stopping it. `warm_inference_ms` includes formatting,
+tokenization, input transfer, prefill, decoding, output transfer, and final text
+decoding. It excludes image build/download, container startup, model loading,
+warm-ups, network invocation, and time between calls. There is no per-token
+instrumentation or synchronization added inside the generation loop.
+This is not GPU-kernel-only latency, TTFT, TPOT, or HTTP end-to-end latency.
+
+The saved JSON includes UTC recording time, the workload, actual GPU/device/dtype,
+package versions, model revision, template hash, settings, two warm-up rows,
+and up to five measured rows. Each row has phase, zero-based iteration, status,
+actual prompt/completion counts, and finish reason. Warm-ups have null timing.
+The summary reports successful measured median latency and total successful
+measured output tokens divided by their summed inference seconds, not the mean
+of individual rates or decode-only throughput. It excludes warm-ups and failed
+calls, whose counts remain visible. Five samples do not establish a stable p95
+or a production SLO. Do not compare this boundary with CPU HTTP E2E latency.
+
+An ordinary generation/synchronization error stops further calls, records its
+exception type without private exception text or fabricated completion usage,
+and returns earlier rows for saving. An incomplete run exits 1. Ctrl-C handled
+inside the local entrypoint saves an interrupted record and exits 130.
+If loading, validation, transport, or the remote process fails before results
+return, `remote_results_received` is false and `summary` is null: the empty local
+sample list does not establish that no remote work ran. Undelivered rows are
+unavailable. A forced local termination or image-build failure before the
+entrypoint starts cannot be recorded by it; retain the CLI output separately.
+Local interruption does not prove that native remote computation has stopped.
+
+This is one ephemeral experiment, with one allowed container, no configured
+input retries or minimum warm capacity, and a 180-second function timeout.
+The download build step has a separate 600-second timeout. GPU allocation during
+loading, warm-ups, generation, and remaining container lifetime consumes
+resources. These limits are not hard spending caps; check available credits
+and current [Modal pricing](https://modal.com/pricing) before running.
+
+The learner already demonstrated a successful single-completion CUDA run:
+Tesla T4, float32, matching revision/template hash, answer `4`, 43 prompt tokens,
+two completion tokens, and `stop`. That established functionality, not speed.
+The timing loop also passed deterministic boundary/failure tests and a real
+CPU Qwen smoke with CUDA synchronization replaced only for local validation.
+The learner's first remote timing run is saved in
+`benchmark-results/modal/warm-t4-001.json`: two successful warm-ups followed by
+five successful measured calls, all producing 128 tokens from 59 prompt tokens.
+Median warm inference duration was **3397.13 ms**; 640 measured output tokens
+over **17.3633 summed inference seconds** yielded **36.86 output tokens/s**.
+There were no warm-up or measured errors.
+
+The earlier local CPU validation observed 9422.45 ms median and 13.31 tokens/s
+at the analogous function boundary. The observed median ratio is **2.77x**
+(63.95% lower median duration), but this is an exploratory cross-environment
+comparison: Torch/Transformers versions, host hardware, and operating systems
+differ, and there are only five samples per run. It does not isolate the GPU's
+effect, measure HTTP latency or cold starts, or establish a production SLO.
+See [the GPU experiment log](logs/practice.md#gpu-exploration-modal-and-warm-inference)
+for all measurements and limits.
 
 ## Run the local application
 
