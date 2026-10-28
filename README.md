@@ -14,7 +14,7 @@ and the next task. Use [plan.md](plan.md) for the broader roadmap.
 
 The implementation now includes Phase 4 controlled concurrency: one inference
 worker, two FIFO waiting slots, cooperative cancellation, and bounded streaming.
-The suite has 110 passing tests, with real-Qwen lifecycle and HTTP smoke evidence.
+The suite has 113 passing tests, with real-Qwen lifecycle and HTTP smoke evidence.
 See the [Phase 4 evidence](logs/practice.md#phase-4-bounded-concurrency-and-cancellation)
 for the fixed-workload comparison and its limitations. Next: explain queue wait,
 latency, throughput, and cancellation ownership before introducing batching.
@@ -22,6 +22,9 @@ Independent learning checks remain pending; automated verification does not
 prove understanding.
 The current GPU exploration has a completed five-sample warm T4 run:
 3397.13 ms median inference duration and 36.86 output tokens/s for the 59/128 case.
+The matched-library CPU control observed 11604.62 ms and 10.96 output tokens/s.
+The resulting 3.42x median ratio is cross-platform evidence, not an isolated
+hardware-speedup claim.
 
 ## Explore the codebase with Understand Anything
 
@@ -96,8 +99,9 @@ actual device of this run, which is recorded separately under `runtime`.
 
 The remote image pins Torch 2.6.0+cu124, Transformers 4.57.6, NumPy 2.2.6,
 Hugging Face Hub 0.36.0, tokenizers 0.22.1, and safetensors 0.6.2 on Python 3.12.
-These differ from the recorded local benchmark stack; differences cannot be
-attributed solely to hardware. Transitive dependencies are not fully locked.
+These differ from the earlier local validation stack; that comparison cannot
+isolate hardware. The CPU control below matches these six package releases,
+but transitive dependencies are not fully locked.
 
 A CPU-only image build step downloads inference artifacts at revision
 `7ae557604adf67be50417f59c2c2f167def9a775` into `/opt/huggingface`.
@@ -177,6 +181,74 @@ differ, and there are only five samples per run. It does not isolate the GPU's
 effect, measure HTTP latency or cold starts, or establish a production SLO.
 See [the GPU experiment log](logs/practice.md#gpu-exploration-modal-and-warm-inference)
 for all measurements and limits.
+
+### Matched-library CPU control
+
+`benchmarks/warm.py` now contains the shared measurement loop formerly in
+`benchmarks/gpu.py`. CPU calls run synchronously without touching CUDA;
+CUDA calls retain both synchronization boundaries. Other accelerators are
+rejected, and the Modal entrypoint still requires CUDA and float32.
+The local API, project dependencies, and CPU token instrumentation are unchanged.
+
+The control uses a separate environment, not the project's `.venv` or the Modal
+SDK environment. One-time setup on this Apple Silicon Mac:
+
+```bash
+.venv/bin/python -m venv ~/.venvs/inference-cpu-control
+~/.venvs/inference-cpu-control/bin/python -m pip install \
+  torch==2.6.0 transformers==4.57.6 numpy==2.2.6 \
+  huggingface-hub==0.36.0 tokenizers==0.22.1 safetensors==0.6.2
+```
+
+The macOS Torch wheel has the same release version as the GPU's `2.6.0+cu124`,
+but is not the CUDA build. The runner requires offline mode and already-cached
+artifacts at the workload's revision. It loads CPU float32 once, sets six
+intra-op threads, records the actual inter-op thread count, and executes the
+same two warm-ups and five sequential measurements without CUDA mocks.
+
+Recorded invocation from the repository root:
+
+```bash
+HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false \
+  ~/.venvs/inference-cpu-control/bin/python -m benchmarks.warm \
+  --workload benchmark-results/phase3/workload.json \
+  --output benchmark-results/modal/cpu-matched-001.json
+```
+
+Output paths are exclusive: choose a fresh path for any separately approved
+future run. The CPU JSON records host/thread metadata, all returned rows,
+actual counts and finish reasons, and the same whole-function timing summary.
+An ordinary sample failure retains earlier rows and stops. If loading,
+validation, or interruption prevents the loop from returning, `samples_available`
+is false and `summary` is null; an empty list does not prove no local work ran.
+Handled failures exit 1 and Ctrl-C exits 130. Forced termination cannot save
+a result. This command launches no Modal job.
+
+
+The approved control completed on 2026-10-28 UTC, using Apple M1 Pro CPU float32,
+Python 3.12.13, six intra-op threads and eight inter-op threads. All seven calls
+succeeded with 59 prompt tokens, 128 completion tokens, and `length` stopping.
+
+| Metric | Matched-library CPU | Saved T4 run |
+|---|---:|---:|
+| Measured calls | 5 | 5 |
+| Median warm inference | 11604.62 ms | 3397.13 ms |
+| Summed measured duration | 58.3692 s | 17.3633 s |
+| Aggregate output tokens/s | 10.96 | 36.86 |
+
+The observed CPU/T4 median ratio is **3.416x**, or **70.73% lower T4 median
+duration**. The T4/CPU aggregate-throughput ratio is **3.362x**. This reuses
+`warm-t4-001.json`; no new cloud run was launched. The CPU median is **23.16%
+higher** than the earlier, unmatched CPU validation, not an improvement.
+
+Matching the six core package releases removes that particular confound, not
+all software or platform differences: Python patch versions, Torch builds,
+OS/architecture, kernels, transitive dependencies, and execution conditions
+remain different or uncontrolled. Five samples in one run per environment do
+not isolate a hardware-only effect or establish a stable SLO. The results do
+not establish why the CPU runs differ or whether their generated text is identical.
+See [the matched-control evidence](logs/practice.md#matched-library-cpu-control-2026-10-28)
+for every measured duration and the verification commands.
 
 ## Run the local application
 

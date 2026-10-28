@@ -15,7 +15,7 @@ against Hugging Face `generate()` for token-limit and EOS stopping, and an
 initial synchronized CPU/MPS float32 comparison. Do not restart the basics.
 
 Current API state: Stage 2 technical acceptance, Phase 3 benchmarks, and Phase 4
-bounded scheduling/cancellation are implemented. There are 110 passing tests.
+bounded scheduling/cancellation are implemented. There are 113 passing tests.
 Real-Qwen controls verify FIFO admission, queued removal, running disconnects,
 bounded streaming pressure, request-setting isolation, and both shutdown paths.
 See [the Phase 4 entry](#phase-4-bounded-concurrency-and-cancellation) for current
@@ -25,10 +25,10 @@ more connected clients do not imply parallel model execution. Independent
 understanding checks remain pending. Earlier entries describe their own time.
 Manual top-k/top-p lessons were explicitly skipped, not completed. Use the
 stable roadmap [plan.md](../plan.md), this evidence log, and actual code together.
-The latest checkpoint is the separate [Modal GPU experiment](#gpu-exploration-modal-and-warm-inference):
-the learner completed the first bounded warm T4 run, with five successful
-measurements. Results and qualified CPU comparisons are recorded below.
-Do not rerun merely to confirm this supplied evidence.
+The latest checkpoint is the [matched-library CPU control](#matched-library-cpu-control-2026-10-28)
+against the learner's saved warm T4 run: five successful measurements per run,
+with an observed 3.416x CPU/T4 median ratio and platform limitations recorded
+below. No new cloud job was launched. Do not rerun merely to confirm this evidence.
 
 ## Mentoring and edit permissions
 
@@ -1696,9 +1696,10 @@ measurement. This establishes functionality, not independent understanding.
 
 - `modal_inference.py` loads one pinned CPU float32 runtime, moves its weights
   to CUDA once, and invokes the helper loop on the same runtime.
-- New `benchmarks/gpu.py` reuses `benchmarks.model.validate_workload` to check the
-  recorded revisions, template, actual tokenization, and context budget. It
-  selects only `short-input-long-output`: 59 prompt tokens and a 128-token cap.
+- The original `benchmarks/gpu.py` (now `benchmarks/warm.py`) reuses
+  `benchmarks.model.validate_workload` to check the recorded revisions, template,
+  actual tokenization, and context budget. It selects only
+  `short-input-long-output`: 59 prompt tokens and a 128-token cap.
 - Two warm-ups precede five sequential measured calls. Each call has separate
   generation state and KV cache. Natural EOS stopping is unchanged.
 - `warm_inference_ms` brackets the complete `src.inference.generate()` call
@@ -1872,6 +1873,148 @@ observed a 3.40-second median warm inference duration and 36.86 output tokens/s,
 versus 9.42 seconds and 13.31 tokens/s in the earlier local CPU validation,
 with software and platform differences explicitly disclosed.
 
-Before attributing the difference specifically to hardware, run a deliberately
-matched software-stack CPU control and collect more observations, with separate
-approval for new computation. The current result needs no confirmation rerun.
+This motivated the separately approved matched-library CPU control below.
+It removes the six core-package release mismatches, but does not by itself
+isolate hardware. The supplied GPU result needs no confirmation rerun.
+
+### Matched-library CPU control: 2026-10-28
+
+After committing the bounded GPU experiment as `828a39e`, the learner approved
+the proposed runner changes, separate local environment, and bounded CPU run.
+The project `.venv`, requirements, and Modal SDK environment were not changed.
+No Modal job or image build was launched; the comparison reuses the existing
+`benchmark-results/modal/warm-t4-001.json`.
+
+#### Implementation and reproducible command
+
+- Renamed `benchmarks/gpu.py` to `benchmarks/warm.py` and migrated the Modal
+  imports/mount and tests. The shared loop uses synchronous CPU execution or
+  device-specific CUDA synchronization around the same `src.inference.generate()`
+  boundary. Unsupported accelerators are rejected. The Modal CUDA/float32
+  guards remain mandatory.
+- Shared runtime metadata records the six core packages, revision/template,
+  generation settings, device/dtype, host, and Torch thread counts.
+- The CPU CLI requires `HF_HUB_OFFLINE=1`, loads the pinned model once in CPU
+  float32, sets six intra-op threads, validates the fixed case, then performs
+  two warm-ups and five sequential measurements with natural EOS enabled.
+  It uses real CPU execution, not a CUDA synchronization mock.
+- Existing evidence cannot be overwritten. Ordinary sample failures retain
+  earlier rows; failure before the loop returns leaves `samples_available=false`
+  and a null summary, not fabricated measurements. Handled failures exit 1
+  and interruption exits 130; forced termination cannot save a record.
+
+Created `/Users/nando/.venvs/inference-cpu-control` with the project's Python
+3.12.13, then installed exactly:
+
+```bash
+~/.venvs/inference-cpu-control/bin/python -m pip install \
+  torch==2.6.0 transformers==4.57.6 numpy==2.2.6 \
+  huggingface-hub==0.36.0 tokenizers==0.22.1 safetensors==0.6.2
+```
+
+The local Torch wheel is the native macOS CPU/MPS-capable build, not
+`2.6.0+cu124`. Its release version matches; the runner explicitly uses CPU.
+All six installed release versions were checked against the saved GPU metadata,
+and `pip check` reported no broken requirements.
+
+Executed from the repository root after regression checks had finished:
+
+```bash
+HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false \
+  ~/.venvs/inference-cpu-control/bin/python -m benchmarks.warm \
+  --workload benchmark-results/phase3/workload.json \
+  --output benchmark-results/modal/cpu-matched-001.json
+```
+
+Saved local evidence: `benchmark-results/modal/cpu-matched-001.json`, recorded
+at `2026-10-28T00:30:38.754763+00:00`. The command completed successfully.
+Raw benchmark files remain ignored local artifacts, not committed fixtures.
+
+#### Observed CPU environment and samples
+
+- Host: Apple M1 Pro, arm64, eight logical CPUs; recorded platform
+  `macOS-26.6.2-arm64-arm-64bit`.
+- Python 3.12.13; Torch 2.6.0, Transformers 4.57.6, NumPy 2.2.6,
+  Hugging Face Hub 0.36.0, tokenizers 0.22.1, safetensors 0.6.2.
+- Device `cpu`, dtype `torch.float32`, no CUDA runtime, six intra-op threads,
+  eight inter-op threads.
+- Model `Qwen/Qwen2.5-0.5B-Instruct`, revision
+  `7ae557604adf67be50417f59c2c2f167def9a775`; chat-template SHA-256
+  `cd8e9439f0570856fd70470bf8889ebd8b5d1107207f67a5efb46e342330527f`.
+- Same complete workload manifest and selected 59/128 case as the saved T4 run;
+  float32, temperature 0, top-p 1, context limit 2048, batch/concurrency one.
+- Both warm-ups and all five measured calls succeeded. Every call reported
+  59 prompt tokens, 128 completion tokens, and `length`. Warm-up timing is null.
+  There were zero warm-up or measured errors.
+
+| Measured iteration | Warm inference (ms) | Prompt tokens | Completion tokens | Finish |
+|---|---:|---:|---:|---|
+| 0 | 11604.624167 | 59 | 128 | length |
+| 1 | 12106.442000 | 59 | 128 | length |
+| 2 | 11430.556500 | 59 | 128 | length |
+| 3 | 11536.932000 | 59 | 128 | length |
+| 4 | 11690.637875 | 59 | 128 | length |
+
+Median warm inference: **11604.624167 ms**. The 640 measured completion tokens
+over **58369.192542 ms** of summed successful inference time yielded
+**10.964688 output tokens/s**. This includes the entire generation function,
+not just decoding; it excludes loading, warm-ups, gaps between calls, and
+network invocation.
+
+#### Comparison without rerunning the GPU
+
+| Metric | Matched-library M1 Pro CPU | Existing Modal T4 |
+|---|---:|---:|
+| Measured successes | 5/5 | 5/5 |
+| Median warm inference (ms) | 11604.624167 | 3397.125489 |
+| Aggregate output tokens/s | 10.964688 | 36.859285 |
+| Summed measured duration (ms) | 58369.192542 | 17363.332071 |
+| Measured completion tokens | 640 | 640 |
+| Torch | 2.6.0 | 2.6.0+cu124 |
+| Transformers | 4.57.6 | 4.57.6 |
+| Python | 3.12.13 | 3.12.10 |
+
+Arithmetic from the saved, unrounded values:
+
+- CPU median / T4 median: **3.416013x**.
+- T4 median duration reduction relative to CPU: **70.726105%**.
+- T4 aggregate throughput / CPU aggregate throughput: **3.361635x**.
+- Relative to the earlier CPU validation, this CPU median is **23.159294%
+  higher**, and aggregate throughput is **17.619285% lower**. Preserve that
+  regression in the observations; do not assume matching versions improves speed.
+
+The six core release versions now match, and the workload, revision, template,
+precision, generation settings, sample structure, actual counts, and finish
+reasons were checked for equality. The CPU and CUDA branches bracket the same
+whole generation function. Both runs reached the cap, so shorter completion
+length does not explain the duration difference. Matching counts does not
+establish identical generated token IDs or text; those were not retained.
+
+This remains a cross-platform, single-run comparison, not a hardware-only
+causal measurement. Torch builds, Python patch versions, CPU/GPU kernels,
+host hardware and operating systems differ; transitive dependencies and
+execution conditions were not fully controlled. The prior CPU run also used
+different core versions and was collected at a different time, so these records
+do not establish why its latency was lower. Five samples per run do not establish
+a stable p95, HTTP latency, TTFT, TPOT, cold-start time, quality change, cost,
+or production SLO. No extra run is needed merely to confirm these observations.
+
+#### Verification
+
+- `.venv/bin/python -m unittest discover -s tests -v`: **113 passed**.
+- `~/.venvs/inference-cpu-control/bin/python -m unittest discover -s tests -p test_benchmark_warm.py -v`:
+  **7 passed** under the matched core versions.
+- New checks exercise real tiny-model CPU generation with CUDA access forbidden,
+  reject unsupported accelerators, and verify safe failure evidence and
+  overwrite refusal. Existing CUDA clock-boundary, failure, workload, and
+  token-weighted throughput checks remain passing.
+- The actual offline Qwen command above completed two warm-ups plus five
+  measurements and saved its result; this is the runtime smoke, not just unit tests.
+- The Modal function was invoked only via `.local()` on the actual CPU runtime:
+  it rejected execution with `This experiment requires CUDA.` before loading.
+  `modal run modal_inference.py --help` also succeeded without a cloud invocation.
+- A second CLI invocation against the existing output path exited 2 before
+  model loading; its SHA-256 stayed unchanged. This exercised overwrite refusal,
+  not another benchmark run.
+- GPU hardware execution of the refactored runner was not repeated. The GPU
+  performance reference remains the learner's previously completed run.

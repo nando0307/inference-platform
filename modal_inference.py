@@ -48,7 +48,7 @@ image = (
 )
 
 # Add benchmark code after the cached download layer, without uploading result directories.
-for module in ("common", "model", "timing", "gpu"):
+for module in ("common", "model", "timing", "warm"):
     image = image.add_local_file(
         Path(__file__).parent / "benchmarks" / f"{module}.py",
         f"/root/benchmarks/{module}.py",
@@ -65,13 +65,9 @@ for module in ("common", "model", "timing", "gpu"):
     retries=0,
 )
 def run_inference(manifest):
-    import hashlib
-    import platform
-    from importlib.metadata import version
-
     import torch
-    from benchmarks.gpu import run_samples, select_case
-    from src.inference import MODEL_ID, load_runtime
+    from benchmarks.warm import describe_runtime, run_samples, select_case
+    from src.inference import load_runtime
 
     assert torch.cuda.is_available(), "This experiment requires CUDA."
     runtime = load_runtime(revision=REVISION)
@@ -81,38 +77,14 @@ def run_inference(manifest):
     runtime.benchmark_model_revision = REVISION
     case = select_case(manifest, runtime)
 
-    metadata = {
-        "model": MODEL_ID,
-        "revision": REVISION,
-        "chat_template_sha256": hashlib.sha256(
-            runtime.tokenizer.chat_template.encode("utf-8")
-        ).hexdigest(),
-        "gpu": torch.cuda.get_device_name(0),
-        "device": str(runtime.model.device),
-        "dtype": str(runtime.model.dtype),
-        "python_version": platform.python_version(),
-        "torch_cuda_version": torch.version.cuda,
-        "package_versions": {
-            name: version(name)
-            for name in (
-                "torch", "transformers", "numpy", "huggingface-hub",
-                "tokenizers", "safetensors",
-            )
-        },
-        "generation_settings": {"max_new_tokens": case["max_tokens"], "temperature": 0, "top_p": 1},
-        "context_limit": runtime.context_limit,
-        "batch_size": 1,
-        "concurrency": 1,
-        "eos_counted": True,
-        "stopping": "natural EOS or output cap",
-    }
+    metadata = describe_runtime(runtime, case)
     return {"runtime": metadata, "samples": run_samples(runtime, case)}
 
 
 @app.local_entrypoint()
 def main(output: str, workload: str = "benchmark-results/phase3/workload.json"):
     from benchmarks.common import write_json
-    from benchmarks.gpu import CASE, REPEATS, TIMING_BOUNDARY, WARMUPS, summarize
+    from benchmarks.warm import CASE, REPEATS, TIMING_BOUNDARY, WARMUPS, summarize
 
     output_path = Path(output)
     if output_path.exists():

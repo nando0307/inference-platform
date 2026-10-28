@@ -1,11 +1,20 @@
 import copy
 import hashlib
+import io
+import json
+import os
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from benchmarks.gpu import CASE, run_samples, select_case, summarize
-from src.inference import GenerationResult, MODEL_ID
+import torch
+from transformers import GPT2Config, GPT2LMHeadModel
+
+from benchmarks.warm import CASE, main, run_samples, select_case, summarize
+from src.inference import GenerationResult, MODEL_ID, Runtime
 from test_benchmark_timing import tiny_tokenizer
 
 
@@ -52,6 +61,32 @@ class WorkloadTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     select_case(manifest, self.runtime)
 
+    def test_cpu_cli_saves_failure_and_refuses_overwrite(self):
+        self.addCleanup(torch.set_num_threads, torch.get_num_threads())
+        with (
+            TemporaryDirectory() as directory,
+            patch.dict(os.environ, HF_HUB_OFFLINE="1"),
+            patch("src.inference.load_runtime", side_effect=RuntimeError("private failure detail")),
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(io.StringIO()),
+        ):
+            workload = Path(directory) / "workload.json"
+            output = Path(directory) / "result.json"
+            workload.write_text(json.dumps(self.manifest), encoding="utf-8")
+            args = ["--workload", str(workload), "--output", str(output)]
+            self.assertEqual(main(args), 1)
+            saved = output.read_bytes()
+            result = json.loads(saved)
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["exception_type"], "RuntimeError")
+            self.assertFalse(result["samples_available"])
+            self.assertIsNone(result["summary"])
+            self.assertNotIn(b"private failure detail", saved)
+            with self.assertRaises(SystemExit) as raised:
+                main(args)
+            self.assertEqual(raised.exception.code, 2)
+            self.assertEqual(output.read_bytes(), saved)
+
 
 class WarmMeasurementTests(unittest.TestCase):
     case = {
@@ -59,12 +94,13 @@ class WarmMeasurementTests(unittest.TestCase):
         "prompt_tokens": 59, "max_tokens": 128,
     }
     result = GenerationResult("answer", 59, [10, 2], "stop")
+    cuda_runtime = SimpleNamespace(model=SimpleNamespace(device=torch.device("cuda:0")))
 
     def test_clock_excludes_leading_fence_and_includes_pending_gpu_work(self):
         now = 0.0
         pending = 100.0  # Earlier initialization must never enter a measured interval.
 
-        def synchronize():
+        def synchronize(device):
             nonlocal now, pending
             now += pending + 0.25
             pending = 0.0
@@ -77,10 +113,10 @@ class WarmMeasurementTests(unittest.TestCase):
 
         with (
             patch("torch.cuda.synchronize", side_effect=synchronize),
-            patch("benchmarks.gpu.perf_counter", side_effect=lambda: now),
+            patch("benchmarks.warm.perf_counter", side_effect=lambda: now),
             patch("src.inference.generate", side_effect=generate),
         ):
-            rows = run_samples(object(), self.case)
+            rows = run_samples(self.cuda_runtime, self.case)
         self.assertEqual([row["phase"] for row in rows], ["warmup"] * 2 + ["measured"] * 5)
         self.assertEqual([row["warm_inference_ms"] for row in rows], [None, None] + [3250.0] * 5)
         summary = summarize(rows)
@@ -96,7 +132,7 @@ class WarmMeasurementTests(unittest.TestCase):
                     [self.result] * successes_before_failure + [RuntimeError("private failure")]
                 )),
             ):
-                rows = run_samples(object(), self.case)
+                rows = run_samples(self.cuda_runtime, self.case)
             self.assertEqual(len(rows), successes_before_failure + 1)
             self.assertEqual(rows[-1]["status"], "error")
             for key in ("warm_inference_ms", "prompt_tokens", "completion_tokens", "finish_reason"):
@@ -122,6 +158,36 @@ class WarmMeasurementTests(unittest.TestCase):
         empty = summarize([])
         self.assertIsNone(empty["median_warm_inference_ms"])
         self.assertIsNone(empty["completion_tokens_per_second"])
+
+    def test_cpu_runs_real_generation_without_touching_cuda(self):
+        tokenizer = tiny_tokenizer()
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(0)
+            model = GPT2LMHeadModel(GPT2Config(
+                vocab_size=len(tokenizer), n_positions=128, n_embd=8, n_layer=1,
+                n_head=1, bos_token_id=None, eos_token_id=2, pad_token_id=0,
+            )).eval()
+        runtime = Runtime(model, tokenizer, {2}, context_limit=2048)
+        case = {**self.case, "messages": [{"role": "user", "content": "answer " * 57}]}
+
+        def prefer_eos(model, args, output):
+            output.logits.fill_(-10)
+            output.logits[..., 2] = 10
+
+        hook = model.register_forward_hook(prefer_eos)
+        try:
+            with patch("torch.cuda.synchronize", side_effect=AssertionError("CPU touched CUDA")):
+                rows = run_samples(runtime, case)
+        finally:
+            hook.remove()
+        self.assertTrue(summarize(rows)["complete"])
+        self.assertTrue(all(row["prompt_tokens"] == 59 for row in rows))
+        self.assertTrue(all(row["completion_tokens"] == 1 and row["finish_reason"] == "stop" for row in rows))
+
+    def test_other_accelerators_cannot_silently_use_cpu_timing(self):
+        runtime = SimpleNamespace(model=SimpleNamespace(device=torch.device("mps")))
+        with self.assertRaises(ValueError):
+            run_samples(runtime, self.case)
 
 
 if __name__ == "__main__":
