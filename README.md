@@ -14,13 +14,13 @@ and the next task. Use [plan.md](plan.md) for the broader roadmap.
 
 The implementation now includes Phase 4 controlled concurrency: one inference
 worker, two FIFO waiting slots, cooperative cancellation, and bounded streaming.
-The suite has 113 passing tests, with real-Qwen lifecycle and HTTP smoke evidence.
+The suite has 121 passing tests, with real-Qwen lifecycle and HTTP smoke evidence.
 See the [Phase 4 evidence](logs/practice.md#phase-4-bounded-concurrency-and-cancellation)
-for the fixed-workload comparison and its limitations. Next: explain queue wait,
-latency, throughput, and cancellation ownership before introducing batching.
+for the fixed-workload comparison and its limitations. Stage 5 now includes CPU
+and T4 static-batching measurements at sizes 1/2/4; the API remains sequential.
 Independent learning checks remain pending; automated verification does not
 prove understanding.
-The current GPU exploration has a completed five-sample warm T4 run:
+The earlier GPU exploration completed a five-sample warm T4 run:
 3397.13 ms median inference duration and 36.86 output tokens/s for the 59/128 case.
 The matched-library CPU control observed 11604.62 ms and 10.96 output tokens/s.
 The resulting 3.42x median ratio is cross-platform evidence, not an isolated
@@ -249,6 +249,197 @@ not isolate a hardware-only effect or establish a stable SLO. The results do
 not establish why the CPU runs differ or whether their generated text is identical.
 See [the matched-control evidence](logs/practice.md#matched-library-cpu-control-2026-10-28)
 for every measured duration and the verification commands.
+
+## Static batching: CPU correctness
+
+`src/batched_generation.py` is a standalone Stage 5 experiment, not an API
+scheduler change or a performance benchmark. It reuses `load_runtime()`,
+`Runtime`, and `GenerationResult`. Its new `generate_batch()` formats each
+conversation, left-pads the inputs without changing the tokenizer's shared
+padding configuration, checks the context budget, and makes one greedy
+`model.generate()` call for the batch.
+
+Results stay in input order. Actual prompt counts come from attention masks;
+completion extraction skips the common padded input width. Each result retains
+its first generated EOS in the token count and excludes subsequent padding,
+including when a padding ID is also an EOS ID. A sequence reaching the output
+cap without EOS reports `length`.
+
+The CLI uses the existing matched-library CPU environment and cached revision
+`7ae557604adf67be50417f59c2c2f167def9a775`. It loads CPU float32 once with six
+intra-op threads, runs the two prompts individually using the unchanged
+`src.inference.generate()`, then together as one batch of two.
+
+Recorded invocation:
+
+```bash
+HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false \
+  ~/.venvs/inference-cpu-control/bin/python -m src.batched_generation \
+  --max-new-tokens 32 \
+  --output benchmark-results/batching/cpu-correctness-001.json
+```
+
+The approved run completed on 2026-11-02 UTC:
+
+| Input | Actual prompt tokens | Sequential completion tokens | Batched completion tokens | Finish in both |
+|---|---:|---:|---:|---|
+| `Reply with exactly one word: Hello` | 36 | 10 | 10 | stop |
+| Explain inference-server request processing | 59 | 32 | 32 | length |
+
+Both generated token-ID lists matched their individual references exactly.
+The first response was `Hello! How can I assist you today?`, not one word:
+this is model instruction-following behavior shared by both paths, not a
+batching discrepancy. These cases establish mixed-length CPU correctness,
+not universal output equivalence, GPU correctness, or improved speed.
+
+The JSON preserves synthetic inputs, generated IDs/text/counts, finish reasons,
+runtime metadata, and equality checks. `status=completed` means the comparison
+ran; inspect `all_token_ids_equal` separately. Ordinary failures save their type
+and any already-returned individual results; interrupted or failed calls have
+no fabricated result. Handled failures exit 1 and Ctrl-C exits 130. Existing
+output paths are refused before model loading; choose a fresh path for any
+future run. Forced termination cannot save evidence.
+
+This correctness script does not measure timing, throughput, or memory. The
+separate benchmark below now measures batch sizes 1/2/4 locally; GPU execution
+still requires separate approval.
+See [the Stage 5 evidence](logs/practice.md#stage-5-static-batching-cpu-correctness)
+for verification and the remaining learning goals.
+
+## Static batching benchmark
+
+`benchmarks/batching.py` reuses the existing single-request `generate()` at
+batch size 1 and `generate_batch()` at sizes 2 and 4. One loaded model processes
+the same four synthetic prompts in fixed input order:
+
+1. Reply with exactly one word: Hello.
+2. The inference-server explanation prompt used above.
+3. What is 2 + 2? Reply with just the number.
+4. Explain in two sentences why attention uses a KV cache during autoregressive decoding.
+
+Each configuration has its own warm-up of the complete workload. One measured
+workload means four individual calls, two calls of two prompts, or one call of
+four prompts. The model revision, float32 precision, greedy settings, output cap,
+and natural EOS policy stay fixed within a run. The first sequential warm-up
+supplies the output reference; later warm-ups and measurements retain actual
+IDs, text, counts, finish reasons, and reference comparisons. Differences are
+reported, not hidden or automatically treated as numerical correctness failures.
+
+### Measurement boundaries
+
+- `workload_ms`: wall time to finish all four prompts, including dispatch,
+  per-call timing and loop bookkeeping. Loading, warm-ups, serialization, and
+  output comparisons are outside this interval.
+- `call_ms`: whole `generate()` or `generate_batch()` call, including tokenization,
+  transfers, prefill, decoding, and text decoding. CUDA fences bracket each call;
+  an outer fence excludes earlier GPU work from the workload clock.
+- Throughput: actual output tokens from complete successful measured workloads
+  divided by their summed workload seconds. Partial failed workloads are excluded.
+- `median_call_ms` is a median of single-call or batch-call durations, depending
+  on configuration. It is not per-request latency or batch time divided by size,
+  and calls contain different prompts. Neither timer measures HTTP latency,
+  queue wait, TTFT, or TPOT.
+- CUDA peak allocated/reserved bytes are absolute PyTorch allocator peaks within
+  each measured workload, reset before timing after warm-up. They include model
+  weights, not just KV cache, and exclude non-PyTorch allocations. Reserved memory
+  can include cached blocks from earlier configurations; no cache flush is used.
+  CPU memory fields are null, not zero.
+
+### Completed CPU smoke benchmark
+
+```bash
+HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false \
+  ~/.venvs/inference-cpu-control/bin/python -m benchmarks.batching \
+  --device cpu --max-new-tokens 16 --warmups 1 --repeats 2 \
+  --output benchmark-results/batching/cpu-benchmark-001.json
+```
+
+On 2026-11-02 UTC, both measured workloads per configuration completed. Each
+workload generated 44 actual tokens, with counts `[10, 16, 2, 16]` and finish
+reasons `[stop, length, stop, length]`. All returned outputs matched the reference.
+
+| Batch size | Calls per workload | Median workload (ms) | Median call (ms) | Aggregate output tokens/s |
+|---|---:|---:|---:|---:|
+| 1, sequential | 4 | 4483.37 | 1199.98 | 9.81 |
+| 2 | 2 | 4154.56 | 2072.48 | 10.59 |
+| 4 | 1 | 2193.14 | 2193.14 | 20.06 |
+
+Batch size 4 observed **2.044x** the sequential throughput in this CPU smoke.
+Two repeats, short outputs, fixed configuration order, and uncontrolled host
+conditions do not establish a stable speedup, p95, production SLO, or GPU result.
+These four-prompt/16-cap numbers are not comparable to the earlier one-prompt
+59/128 GPU benchmark. Raw workloads, calls, and outputs are preserved locally.
+
+The CLI requires a fresh output path and offline cached weights. It supports
+local `--device cpu` or `--device cuda`; CUDA availability and float32/device
+placement are checked. Limits: 1-128 output tokens, 1-2 warm-ups, 1-5 measured
+workloads per configuration. Defaults are 32/1/3 respectively.
+
+An ordinary failure or handled interruption stops further work. Completed calls
+remain visible, the failed call has no fabricated usage/timing, and unstarted
+calls are marked `not_run`. Summaries exclude incomplete workloads. Execution
+success does not imply zero output mismatches. Forced termination cannot save
+local evidence.
+
+### Completed GPU batching run
+
+`modal_batching.py` reuses the existing pinned image and CPU download layer,
+mounting only the additional source files after that layer. It leaves
+`modal_inference.py` and its original command unchanged.
+
+The learner executed this command and supplied the completed run output:
+
+```bash
+~/.venvs/modal/bin/modal run modal_batching.py \
+  --max-new-tokens 16 --warmups 1 --repeats 3 \
+  --output benchmark-results/batching/t4-benchmark-001.json
+```
+
+This requests one T4, 4096 MiB host RAM (not GPU VRAM), at most one container,
+zero minimum warm containers, no function retries, and a 300-second function
+timeout. The inherited CPU download step has a 600-second timeout. This command
+performs 28 generation calls covering 48 completions including warm-ups, with at
+most 16 new tokens per completion, matching the CPU smoke's output cap.
+
+These are workload/resource bounds, not a hard spending cap. Image work,
+GPU loading, warm-ups, measurements, and remaining container lifetime can consume
+resources. Check credits and current [Modal pricing](https://modal.com/pricing)
+before approval; stop the app through Modal if abandoning a run.
+Local interruption does not prove remote computation stopped. If no result is
+returned, `remote_results_received=false`, summaries remain null, and empty
+local samples do not mean no remote work happened.
+
+The run recorded at `2026-11-04T00:45:23.031925+00:00` completed on a Tesla T4,
+CUDA 12.4, float32. Each configuration completed one warm-up and three measured
+workloads, with no failures or output mismatches. Every workload produced
+44 actual tokens, with per-input counts `[10, 16, 2, 16]` and finishes
+`[stop, length, stop, length]`. The first reference's null comparisons mean
+"reference itself", not a failure. All later results matched it.
+
+| Batch size | Median four-prompt workload (ms) | Output tokens/s | Throughput / sequential | Peak allocated (MiB) | Peak reserved (MiB) |
+|---|---:|---:|---:|---:|---:|
+| 1 | 1062.62 | 41.17 | 1.000x | 1899.75 | 2024 |
+| 2 | 927.17 | 47.41 | 1.151x | 1904.42 | 2024 |
+| 4 | 465.15 | 94.26 | 2.289x | 1915.43 | 2050 |
+
+Batch size 4 observed **2.289x sequential throughput** and **56.23% lower median
+workload duration**. Peak allocated memory increased by **15.69 MiB (0.83%)**;
+reserved memory increased by 26 MiB. One set of model weights is shared across
+the batch. These total peaks do not isolate KV-cache memory, and retained
+allocator reservations are not the same as live tensor allocations.
+
+This verifies real GPU batched execution for these inputs. Three measured
+workloads, short contexts/outputs, and fixed configuration order do not establish
+a stable SLO, universal speedup, or lower latency for every individual request.
+No profiling established which low-level mechanism caused the timing changes.
+The CPU and GPU records share prompts/settings and reference IDs, but differ in
+platform, Python patch, Torch build, thread settings, and measured repeat count.
+
+Evidence: `benchmark-results/batching/t4-benchmark-001.json` and
+[the learner's Modal run](https://modal.com/apps/lenando0307/main/ap-JXmGJQET81U3bwbbZPH2YC).
+No assistant confirmation rerun was performed. The path now exists; future
+separately approved runs must use a fresh output path.
+See [the GPU batching result](logs/practice.md#first-t4-batching-result-2026-11-04).
 
 ## Run the local application
 
