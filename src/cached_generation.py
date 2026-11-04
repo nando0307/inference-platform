@@ -1,185 +1,200 @@
-import torch
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    GenerationConfig,
-)
+"""Manual greedy generation with dynamic KV-cache inspection."""
+
 from time import perf_counter
 
-device = "cpu"  # Change to "cpu" for CPU execution.
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
-print("Loading Model... ")
-model_name = "Qwen/Qwen2.5-0.5B-Instruct"
-model = AutoModelForCausalLM.from_pretrained(
-    model_name,
-    dtype=torch.float32,
-).to(device)
-model.eval()
 
-print("Model device:", model.device)
-print("Model dtype:", model.dtype)
+def _synchronize(device):
+    if device.type == "mps":
+        torch.mps.synchronize()
+    elif device.type == "cuda":
+        torch.cuda.synchronize(device)
 
-print("Loading tokenizer...")
-tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-prompt = "Reply with exactly one word: Hello"
+def _cache_snapshot(cache, config):
+    """Count logical tensor bytes, not allocator memory or physical storage."""
+    first_layer = cache.layers[0]
+    keys = first_layer.keys
+    positions = int(cache.get_seq_length())
+    head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+    return {
+        "cache_type": type(cache).__name__,
+        "cached_positions": positions,
+        "cached_layers": len(cache.layers),
+        "first_key_shape": list(keys.shape),
+        "first_value_shape": list(first_layer.values.shape),
+        "dtype": str(keys.dtype),
+        "bytes_per_element": keys.element_size(),
+        "predicted_bytes": (
+            2 * config.num_hidden_layers * keys.shape[0] * config.num_key_value_heads
+            * positions * head_dim * keys.element_size()
+        ),
+        "measured_bytes": sum(
+            tensor.numel() * tensor.element_size()
+            for layer in cache.layers for tensor in (layer.keys, layer.values)
+        ),
+    }
 
-messages = [
-    {"role": "system", "content": "You are Qwen, a helpful assistant"},
-    {"role": "user", "content": prompt},
-]
 
-text = tokenizer.apply_chat_template(
-    messages,
-    tokenize=False,
-    add_generation_prompt=True,
-)
-model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+@torch.inference_mode()
+def generate_cached(model, model_inputs, *, max_new_tokens, pad_token_id):
+    """Reuse the Stage 1 loop for full-context Qwen batches with left padding."""
+    if type(max_new_tokens) is not int or not 1 <= max_new_tokens <= 512:
+        raise ValueError("max_new_tokens must be an integer between 1 and 512.")
+    if pad_token_id is None:
+        raise ValueError("A padding token is required for finished batch rows.")
+    input_ids = model_inputs["input_ids"]
+    attention_mask = model_inputs["attention_mask"]
+    if input_ids.ndim != 2 or not all(input_ids.shape) or attention_mask.shape != input_ids.shape:
+        raise ValueError("Provide nonempty batched input IDs and a matching attention mask.")
+    if (
+        not torch.all((attention_mask == 0) | (attention_mask == 1))
+        or not torch.all(attention_mask[:, -1] == 1)
+        or torch.any(attention_mask[:, :-1] > attention_mask[:, 1:])
+    ):
+        raise ValueError("Attention masks must describe nonempty, left-padded sequences.")
+    if input_ids.shape[1] + max_new_tokens > model.config.max_position_embeddings:
+        raise ValueError("Prompt width plus output cap exceeds the model context limit.")
 
-input_ids = model_inputs["input_ids"]
-attention_mask = model_inputs["attention_mask"]
+    eos_token_ids = model.generation_config.eos_token_id
+    if eos_token_ids is None:
+        eos_token_ids = []
+    elif isinstance(eos_token_ids, int):
+        eos_token_ids = [eos_token_ids]
+    eos = torch.tensor(eos_token_ids, device=input_ids.device, dtype=input_ids.dtype)
+    finished = torch.zeros(input_ids.shape[0], device=input_ids.device, dtype=torch.bool)
+    generated = []
+    # Masked positions do not advance a sequence's rotary position, as in generate().
+    position_ids = attention_mask.long().cumsum(-1) - 1
+    position_ids.masked_fill_(attention_mask == 0, 1)
 
-max_new_tokens = 100
-generated_ids = []
-
-eos_token_ids = model.generation_config.eos_token_id
-if eos_token_ids is None:
-    eos_token_ids = []
-elif isinstance(eos_token_ids, int):
-    eos_token_ids = [eos_token_ids]
-
-with torch.inference_mode():
     # Warm up the prompt-forward path. Do not reuse this run's cache.
     warmup_outputs = model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        use_cache=True,
+        input_ids=input_ids, attention_mask=attention_mask,
+        position_ids=position_ids, use_cache=True,
     )
     del warmup_outputs
-    # Prefill: process the entire prompt once.
-    # Wait for GPU completion at timing boundaries, not every forward pass.
-    if device == "mps":
-        torch.mps.synchronize()
+    _synchronize(model.device)
     prefill_start = perf_counter()
-
+    # Prefill: process the entire prompt once.
     outputs = model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        use_cache=True,
+        input_ids=input_ids, attention_mask=attention_mask,
+        position_ids=position_ids, use_cache=True,
     )
-
-    if device == "mps":
-        torch.mps.synchronize()
+    _synchronize(model.device)
     prefill_seconds = perf_counter() - prefill_start
     past_key_values = outputs.past_key_values
-
-    print("Input IDs shape:", input_ids.shape)
-    print("Logits shape:", outputs.logits.shape)
-    print("Cache type:", type(past_key_values).__name__)
-    print("Cached sequence length:", past_key_values.get_seq_length())
-
-    first_layer = past_key_values.layers[0]
-
-    print("First-layer keys shape:", first_layer.keys.shape)
-    print("First-layer values shape:", first_layer.values.shape)
-    print("Cache dtype:", first_layer.keys.dtype)
-    print("Bytes per element:", first_layer.keys.element_size())
-    print("Cached layers:", len(past_key_values.layers))
-
-    prefill_cache_bytes = 0
-
-    for layer in past_key_values.layers:
-        prefill_cache_bytes += layer.keys.numel() * layer.keys.element_size()
-        prefill_cache_bytes += layer.values.numel() * layer.values.element_size()
-
-    print(f"KV storage after prefill: {prefill_cache_bytes / 1024**2:.2f} MiB")
-
+    prefill = _cache_snapshot(past_key_values, model.config)
     decode_start = None
     decode_seconds = 0.0
-    stop_reason = "maximum new tokens"
 
     for step in range(max_new_tokens):
         # Select from prefill logits first, then from the previous decode step.
-        next_token = torch.argmax(
-            outputs.logits[:, -1, :],
-            dim=-1,
-            keepdim=True,
-        )
-        token_id = next_token.item()
-        generated_ids.append(token_id)
+        next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+        next_token = torch.where(finished[:, None], pad_token_id, next_token)
+        generated.append(next_token)
+        finished |= torch.isin(next_token[:, 0], eos)
 
         # Selection does not grow the cache. Stop before an unnecessary forward pass.
-        if token_id in eos_token_ids:
-            stop_reason = "end-of-sequence token"
+        if bool(finished.all()) or step + 1 == max_new_tokens:
             break
-        if step + 1 == max_new_tokens:
-            break
-
         # Start after selecting token 1, only if another token is needed.
         if step == 0:
-            if device == "mps":
-                torch.mps.synchronize()
+            _synchronize(model.device)
             decode_start = perf_counter()
-
-        attention_mask = torch.cat(
-            [attention_mask, torch.ones_like(next_token)],
-            dim=1,
-        )
-
-        # Decode: process only the selected token, reusing the previous K/V state.
+        attention_mask = torch.cat([attention_mask, torch.ones_like(next_token)], dim=1)
+        position_ids = position_ids[:, -1:] + 1
+        # Dense batches keep finished rows; their EOS/padding still occupies cache positions.
         outputs = model(
-            input_ids=next_token,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            use_cache=True,
+            input_ids=next_token, attention_mask=attention_mask,
+            position_ids=position_ids, past_key_values=past_key_values, use_cache=True,
         )
         past_key_values = outputs.past_key_values
 
     if decode_start is not None:
-        if device == "mps":
-            torch.mps.synchronize()
+        _synchronize(model.device)
         decode_seconds = perf_counter() - decode_start
+    final = _cache_snapshot(past_key_values, model.config)
+    generated_ids = []
+    finish_reasons = []
+    for row in torch.cat(generated, dim=1).tolist():
+        finish = "length"
+        for index, token_id in enumerate(row):
+            if token_id in eos_token_ids:
+                row = row[:index + 1]
+                finish = "stop"
+                break
+        generated_ids.append(row)
+        finish_reasons.append(finish)
+    return {
+        "prompt_tokens": model_inputs["attention_mask"].sum(dim=1).tolist(),
+        "generated_ids": generated_ids,
+        "finish_reasons": finish_reasons,
+        "prefill": prefill,
+        "final": final,
+        "prefill_ms": prefill_seconds * 1000,
+        "decode_ms": decode_seconds * 1000,
+    }
 
-print(f"Prompt forward-pass time: {prefill_seconds * 1000:.2f} ms")
-print(f"Subsequent generation time: {decode_seconds * 1000:.2f} ms")
-print(f"Tokens generated after the first: {max(0, len(generated_ids) - 1)}")
-print(f"Final cache length: {past_key_values.get_seq_length()}")
-print(f"Stopped: {stop_reason}.")
-print("\nResponse:")
-print(tokenizer.decode(generated_ids, skip_special_tokens=True))
-final_cache_bytes = 0
 
-for layer in past_key_values.layers:
-    final_cache_bytes += layer.keys.numel() * layer.keys.element_size()
-    final_cache_bytes += layer.values.numel() * layer.values.element_size()
-
-print(f"KV storage after generation: {final_cache_bytes / 1024**2:.2f} MiB")
-
-comparison_config = GenerationConfig(
-    do_sample=False,
-    num_beams=1,
-    repetition_penalty=1.0,
-    max_new_tokens=max_new_tokens,
-    use_cache=True,
-    eos_token_id=model.generation_config.eos_token_id,
-    pad_token_id=tokenizer.pad_token_id,
-    temperature=1.0,
-    top_p=1.0,
-    top_k=50,
-)
-
-with torch.inference_mode():
-    reference_output = model.generate(
-        **model_inputs,
-        generation_config=comparison_config,
+def main():
+    device = "cpu"  # Change to "mps" for the original Apple GPU comparison.
+    model_name = "Qwen/Qwen2.5-0.5B-Instruct"
+    print("Loading Model...")
+    model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.float32).to(device)
+    model.eval()
+    print("Model device:", model.device)
+    print("Model dtype:", model.dtype)
+    print("Loading tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    messages = [
+        {"role": "system", "content": "You are Qwen, a helpful assistant"},
+        {"role": "user", "content": "Reply with exactly one word: Hello"},
+    ]
+    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+    max_new_tokens = 100
+    result = generate_cached(
+        model, model_inputs, max_new_tokens=max_new_tokens, pad_token_id=tokenizer.pad_token_id,
     )
+    generated_ids = result["generated_ids"][0]
+    prefill = result["prefill"]
+    final = result["final"]
+    print("Input IDs shape:", model_inputs["input_ids"].shape)
+    print("Cache type:", prefill["cache_type"])
+    print("Cached sequence length:", prefill["cached_positions"])
+    print("First-layer keys shape:", prefill["first_key_shape"])
+    print("First-layer values shape:", prefill["first_value_shape"])
+    print("Cache dtype:", prefill["dtype"])
+    print("Bytes per element:", prefill["bytes_per_element"])
+    print("Cached layers:", prefill["cached_layers"])
+    print(f"KV storage after prefill: {prefill['measured_bytes'] / 1024**2:.2f} MiB")
+    print(f"Prompt forward-pass time: {result['prefill_ms']:.2f} ms")
+    print(f"Subsequent generation time: {result['decode_ms']:.2f} ms")
+    print(f"Tokens generated after the first: {max(0, len(generated_ids) - 1)}")
+    print("Final cache length:", final["cached_positions"])
+    stop_reason = "end-of-sequence token" if result["finish_reasons"][0] == "stop" else "maximum new tokens"
+    print(f"Stopped: {stop_reason}.")
+    print("\nResponse:")
+    print(tokenizer.decode(generated_ids, skip_special_tokens=True))
+    print(f"KV storage after generation: {final['measured_bytes'] / 1024**2:.2f} MiB")
+    comparison_config = GenerationConfig(
+        do_sample=False, num_beams=1, repetition_penalty=1.0,
+        max_new_tokens=max_new_tokens, use_cache=True,
+        eos_token_id=model.generation_config.eos_token_id, pad_token_id=tokenizer.pad_token_id,
+        temperature=1.0, top_p=1.0, top_k=50,
+    )
+    with torch.inference_mode():
+        reference_output = model.generate(**model_inputs, generation_config=comparison_config)
+    prompt_length = model_inputs["input_ids"].shape[1]
+    reference_ids = reference_output[0, prompt_length:].tolist()
+    print("\nManual generated tokens:", len(generated_ids))
+    print("Hugging Face generated tokens:", len(reference_ids))
+    print("Exact token-ID match:", generated_ids == reference_ids)
+    assert generated_ids == reference_ids, "Manual and Hugging Face token IDs differ."
 
-# generate() returns the prompt followed by the generated tokens.
-prompt_length = model_inputs["input_ids"].shape[1]
-reference_ids = reference_output[0, prompt_length:].tolist()
 
-print("\nManual generated tokens:", len(generated_ids))
-print("Hugging Face generated tokens:", len(reference_ids))
-print("Exact token-ID match:", generated_ids == reference_ids)
-
-assert generated_ids == reference_ids, "Manual and Hugging Face token IDs differ."
+if __name__ == "__main__":
+    main()

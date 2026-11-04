@@ -15,20 +15,20 @@ against Hugging Face `generate()` for token-limit and EOS stopping, and an
 initial synchronized CPU/MPS float32 comparison. Do not restart the basics.
 
 Current API state: Stage 2 technical acceptance, Phase 3 benchmarks, and Phase 4
-bounded scheduling/cancellation are implemented. There are 121 passing tests.
+bounded scheduling/cancellation are implemented. There are 126 passing tests.
 Real-Qwen controls verify FIFO admission, queued removal, running disconnects,
 bounded streaming pressure, request-setting isolation, and both shutdown paths.
 See [the Phase 4 entry](#phase-4-bounded-concurrency-and-cancellation) for current
 policy, measured concurrency evidence, and limitations.
 Stage 5 now has completed CPU and T4 static-batching measurements.
-Next: explain workload versus individual latency, and allocated versus reserved
-GPU memory, using these results. Earlier entries describe their own time.
+Stage 6 now has a completed five-case CPU dynamic KV-cache scaling study.
+Next: explain its memory growth and admission-budget implications, then compare
+dynamic and static allocation. GPU cache measurements require separate approval.
 Manual top-k/top-p lessons were explicitly skipped, not completed. Use the
 stable roadmap [plan.md](../plan.md), this evidence log, and actual code together.
-The latest checkpoint is the [first T4 batching run](#first-t4-batching-result-2026-11-04):
-the learner completed sizes 1/2/4 with no failures or output mismatches.
-Batch size 4 observed 2.289x sequential throughput across three measured workloads.
-The assistant recorded the supplied evidence without rerunning computation.
+The latest checkpoint is [Stage 6 dynamic KV-cache scaling](#stage-6-dynamic-kv-cache-scaling):
+all five cases matched predicted logical bytes and Hugging Face token IDs.
+The earlier T4 batching evidence remains recorded below without rerunning it.
 
 ## Mentoring and edit permissions
 
@@ -68,13 +68,12 @@ The assistant recorded the supplied evidence without rerunning computation.
   separate prompt/subsequent-generation timers and a greedy `generate()`
   token-ID comparison. Choose menu option `1` for that comparison; the appended
   reference is greedy even if the manual path's sampling option is chosen.
-- `src/cached_generation.py`: greedy generation; full-prompt prefill followed
-  by single-token forwards passing `past_key_values`, with a full growing
-  attention mask. Includes matching warm-up and timing boundaries, first-layer
-  K/V shape/dtype inspection, and total KV tensor bytes before and after generation.
-  It now selects `device = "cpu"` or `"mps"` while retaining float32, synchronizes
-  MPS at timer boundaries, and compares output IDs against cached `generate()`.
-  The current saved device is `"cpu"`.
+- `src/cached_generation.py`: import-safe `generate_cached` reuses the manual
+  prefill/decode loop for left-padded Qwen batches with independent EOS stopping.
+  Returns generated IDs, finish reasons, and predicted/measured cache snapshots.
+  The standalone Hello demonstration retains CPU/MPS selection, float32,
+  discarded prefill warm-up, synchronized timings, and Hugging Face ID parity.
+  Dense finished rows stay in the cache until the whole batch finishes.
 - Both generation scripts use a 100-new-token limit and the model's configured
   EOS IDs, decode the generated IDs together, and print outside the timed loop.
 - Both scripts currently use `Reply with exactly one word: Hello`, which yields
@@ -92,7 +91,9 @@ The assistant recorded the supplied evidence without rerunning computation.
   offline CPU comparison against individual calls, with preserved JSON evidence.
 - `benchmarks/batching.py`: fixed four-prompt batch-size 1/2/4 timing, actual-token
   throughput, output comparisons, and CUDA allocator peaks when running on CUDA.
-- `modal_batching.py`: separate bounded T4 entrypoint; prepared but not run remotely.
+- `modal_batching.py`: separate bounded T4 entrypoint; the first run is recorded below.
+- `benchmarks/cache_scaling.py`: offline pinned CPU float32 study of three prompt
+  lengths and batch sizes 1/2/4, with HF comparisons and fresh JSON evidence.
 
 ## Concepts covered and demonstrated
 
@@ -2483,3 +2484,144 @@ unchanged while allocated memory grows. Do not mark independent mastery from
 successful execution alone. Three measurements do not establish a stable p95,
 production SLO, universal speedup, larger-context memory behavior, or cloud cost.
 No additional run is needed merely to confirm this supplied result.
+
+## Stage 6: dynamic KV-cache scaling
+
+### Implementation and scope
+
+The learner approved implementation after inspection and a file-level proposal.
+The existing `src/cached_generation.py` loop is now callable and import-safe;
+it was not replaced with a second decoder. Batch rows stop independently,
+left-padding masks determine rotary positions, and cache snapshots preserve
+the prefill state rather than retaining a mutable cache reference.
+The original standalone demonstration still runs through `main()`.
+
+`benchmarks/cache_scaling.py` loads the pinned model once and runs five cases.
+Each uses one discarded prefill warm-up, one manual generation, and one
+Hugging Face reference through the existing `generate_batch` helper. Existing
+metadata and exclusive JSON-writing helpers are reused. Errors/interruption
+retain completed case data; a mismatch is a failed experiment, not a pass.
+The API, scheduler, streaming code, and prior batching benchmarks are unchanged.
+No dependencies or cloud jobs were added.
+
+### Recorded CPU experiment: 2026-11-04
+
+Local evidence: `benchmark-results/cache-scaling/cpu-dynamic-001.json`.
+The record timestamp is `2026-11-04T04:35:03.304182+00:00`, not an exact
+completion timestamp. Status: `completed`, with five successful cases.
+
+```bash
+HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false \
+  ~/.venvs/inference-cpu-control/bin/python -m benchmarks.cache_scaling \
+  --max-new-tokens 16 \
+  --output benchmark-results/cache-scaling/cpu-dynamic-001.json
+```
+
+The file already exists; choose a fresh path for any separately approved repeat.
+
+- Model: `Qwen/Qwen2.5-0.5B-Instruct`.
+- Revision: `7ae557604adf67be50417f59c2c2f167def9a775`.
+- Chat-template SHA-256:
+  `cd8e9439f0570856fd70470bf8889ebd8b5d1107207f67a5efb46e342330527f`.
+- CPU float32; Apple M1 Pro, arm64, eight logical CPUs.
+- Recorded platform: `macOS-26.6.2-arm64-arm-64bit`.
+- Python 3.12.13; Torch 2.6.0; Transformers 4.57.6; NumPy 2.2.6;
+  huggingface-hub 0.36.0; tokenizers 0.22.1; safetensors 0.6.2.
+- Six intra-op threads, eight inter-op threads; context limit 2048.
+- Greedy decoding, natural EOS stopping, output cap 16.
+- DynamicCache; 24 layers, 14 query heads, 2 KV heads, head dimension 64,
+  float32 cache elements of four bytes.
+
+The prompt repeats `An inference server tokenizes prompts and retains attention
+keys and values. ` either 1, 8, or 32 times, followed by a newline and
+`Explain how the cache grows during decoding.` Chat formatting produces 52, 143,
+and 455 input tokens. Multi-row cases repeat the same 143-token prompt, without
+padding or prefix-cache sharing.
+
+### Observed logical KV storage
+
+Predicted and measured bytes matched exactly at both snapshots in every case.
+K/V shapes are `[batch, 2, cached_positions, 64]` in each of 24 layers.
+
+| Batch | Prompt positions | Final positions | Prefill bytes | Final bytes | Growth bytes |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 52 | 67 | 1,277,952 | 1,646,592 | 368,640 |
+| 1 | 143 | 158 | 3,514,368 | 3,883,008 | 368,640 |
+| 1 | 455 | 470 | 11,182,080 | 11,550,720 | 368,640 |
+| 2 | 143 | 158 | 7,028,736 | 7,766,016 | 737,280 |
+| 4 | 143 | 158 | 14,057,472 | 15,532,032 | 1,474,560 |
+
+| Batch | Prompt positions | Prefill MiB | Final MiB |
+|---:|---:|---:|---:|
+| 1 | 52 | 1.2187500 | 1.5703125 |
+| 1 | 143 | 3.3515625 | 3.7031250 |
+| 1 | 455 | 10.6640625 | 11.0156250 |
+| 2 | 143 | 6.7031250 | 7.4062500 |
+| 4 | 143 | 13.4062500 | 14.8125000 |
+
+All nine manual completions selected 16 tokens and stopped at the length cap.
+Each matched its same-batch Hugging Face reference exactly in token IDs, prompt
+counts, and finish reason. There were no execution failures or mismatches.
+Six checks per case passed, including prefill/final byte predictions and
+`final_cached_positions = padded_prompt_width + longest_output_count - 1`.
+
+The results demonstrate:
+
+- Logical cache bytes scale with processed context positions at fixed batch.
+- At the same 143/158 positions, batches 2 and 4 use exactly 2x and 4x the
+  batch-1 cache bytes. Shared weights do not imply shared request caches.
+- Every row adds 15 positions, not 16: the final selected token is not fed back.
+  Growth is `15 * 24,576` bytes per row, or 360 KiB.
+- Batch 4 adds 96 KiB per further processed position across its four rows.
+  A budget equal to the current cache size leaves no room for continued growth.
+
+### Diagnostic timing and limits
+
+| Batch | Prompt positions | Prefill ms | Subsequent generation ms |
+|---:|---:|---:|---:|
+| 1 | 52 | 187.130250 | 2992.071166 |
+| 1 | 143 | 248.643875 | 1261.868125 |
+| 1 | 455 | 533.097833 | 1368.886917 |
+| 2 | 143 | 329.665208 | 1955.046959 |
+| 4 | 143 | 812.439625 | 2257.320542 |
+
+These are single-run diagnostics, not a speed or throughput study. The prefill
+timer covers the prompt forward; subsequent generation starts after selecting
+token 1 and includes the remaining forwards, selections, and loop overhead.
+Loading, tokenization, discarded prefill warm-up, cache inspection, serialization,
+and reference generation are outside both timers. The decode path has no separate
+warm-up, case order is fixed, and a separate import-safety probe ran while this
+experiment was in progress. Do not infer performance scaling from this table.
+
+Both GPU peak fields are `null`. The byte counts exclude model weights,
+intermediates, allocator reservations, and process overhead; they are not a
+measurement of physical allocation or total memory. The real-model cases use
+equal-length rows and reach the cap. Mixed-length padding and unequal EOS
+stopping are covered by tiny-model regressions, not claimed from this run.
+
+### Verification and next lesson
+
+- Matched CPU environment: all five new cache regression tests passed.
+- Project environment: all 126 tests passed.
+- Real tiny-Qwen checks cover unmodified greedy parity with left padding,
+  independent EOS, secondary EOS at the cap, pad/EOS aliasing, no decode after
+  all rows finish, GQA byte accounting, and retained dense rows.
+- Runner checks cover five-case scaling, mismatch failure status, preserved
+  measurements when reference generation fails, and overwrite refusal.
+- A fresh-process import smoke blocked model/tokenizer loading and imported
+  both new callable modules successfully.
+- The preserved standalone command also ran in the project environment:
+  `HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false OMP_NUM_THREADS=6 .venv/bin/python src/cached_generation.py`.
+  It observed 28 prompt positions, 10 generated tokens including EOS, 37 final
+  cache positions, and exact Hugging Face token-ID parity. Output:
+  `Hello! How can I assist you today?` Printed cache storage was 0.66 MiB
+  after prefill and 0.87 MiB after generation; diagnostic times were 90.66 ms
+  and 690.32 ms respectively. This separate smoke used the demonstration's
+  existing unpinned loader and is not part of the pinned five-case result.
+
+Next, ask the learner to explain the measured 15-position growth and the
+batch-4 memory budget before comparing dynamic and static allocation.
+GPU allocator measurements require separate approval. Paged allocation stays
+conceptual; no custom allocator or continuous scheduler was implemented.
+Collection-window microbatching remains deferred, not completed. Automated
+verification does not establish independent learner mastery.

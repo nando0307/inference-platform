@@ -14,10 +14,12 @@ and the next task. Use [plan.md](plan.md) for the broader roadmap.
 
 The implementation now includes Phase 4 controlled concurrency: one inference
 worker, two FIFO waiting slots, cooperative cancellation, and bounded streaming.
-The suite has 121 passing tests, with real-Qwen lifecycle and HTTP smoke evidence.
+The suite has 126 passing tests, with real-Qwen lifecycle and HTTP smoke evidence.
 See the [Phase 4 evidence](logs/practice.md#phase-4-bounded-concurrency-and-cancellation)
 for the fixed-workload comparison and its limitations. Stage 5 now includes CPU
 and T4 static-batching measurements at sizes 1/2/4; the API remains sequential.
+Stage 6 adds a [CPU dynamic-cache scaling experiment](#dynamic-kv-cache-scaling)
+that reuses the manual generation loop.
 Independent learning checks remain pending; automated verification does not
 prove understanding.
 The earlier GPU exploration completed a five-sample warm T4 run:
@@ -974,6 +976,13 @@ Keep `src/uncached_generation.py` as the uncached comparison, with matching prom
 and greedy settings. Matching tokens checks generation mechanics, not factual
 accuracy or speed.
 
+The module is import-safe. `generate_cached(model, model_inputs, max_new_tokens=...,
+pad_token_id=...)` also accepts left-padded batches, handles each row's EOS
+independently, and returns generated IDs, finish reasons, and prefill/final cache
+snapshots. Rotary positions follow each row's attention mask. Dense cache rows
+are not reclaimed when a sequence finishes: batch cache length is padded prompt
+width + the longest generated token count - 1, including EOS in that count.
+
 On CPU, the script reports one prompt forward-pass time after an untimed prompt
 warm-up, whose outputs and cache are discarded. It separately times subsequent
 generation, starting after selecting token 1 and ending after selecting the last
@@ -985,3 +994,49 @@ and final text decoding are outside both timed intervals.
 These are single-run observations, not repeated benchmark estimates. The prompt
 forward-pass time is not full time to first token, and the prompt-only warm-up
 does not separately warm up the single-token decode path.
+
+## Dynamic KV-cache scaling
+
+Run from the repository root with the matched CPU environment and cached model
+artifacts. The command loads the same pinned Qwen revision as the batching
+experiments, uses float32 and six intra-op threads, and never launches a GPU job:
+
+```bash
+HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false \
+  ~/.venvs/inference-cpu-control/bin/python -m benchmarks.cache_scaling \
+  --max-new-tokens 16 \
+  --output benchmark-results/cache-scaling/cpu-dynamic-001.json
+```
+
+Choose a fresh output filename when repeating; existing evidence is never
+overwritten. The output cap defaults to 16 and accepts integers from 1 to 128.
+Natural EOS can stop a sequence earlier.
+
+The five cases vary one dimension at a time:
+
+- Batch 1 with a fixed sentence repeated 1, 8, and 32 times before the same
+  question: 52, 143, and 455 chat-formatted tokens with the pinned tokenizer.
+- Batches 2 and 4 using the same 143-token prompt in every row. These batches
+  need no padding and do not share cache tensors across identical prompts.
+
+Each case runs the existing manual loop, then compares its IDs, prompt counts,
+and finish reasons against Hugging Face `generate()` through `generate_batch`.
+The JSON records actual per-row counts, cache shapes, dtype, cached positions,
+and both predicted and measured logical K/V bytes after prefill and final decode:
+
+```text
+predicted bytes = 2 * layers * batch * KV heads * cached positions * head dimension * bytes/element
+measured bytes  = sum(tensor.numel() * tensor.element_size() for every K and V tensor)
+```
+
+The prediction uses model configuration and the observed cache dtype/length.
+Checks also verify that cache growth counts processed positions, not the final
+selected token. A mismatch returns failure and preserves the evidence; execution
+errors or interruption preserve completed case data and stop remaining work.
+
+These are logical tensor bytes, not CPU RSS or GPU allocator measurements.
+Allocated/reserved GPU peaks are `null`. Timings are diagnostic single-run values,
+not throughput comparisons; the prefill warm-up and reference generation are
+outside both timers. Dynamic-versus-static allocation and GPU measurements are
+separate, not implemented by this experiment. Results and limitations are recorded
+in [the Stage 6 evidence](logs/practice.md#stage-6-dynamic-kv-cache-scaling).
