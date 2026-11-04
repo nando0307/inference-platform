@@ -14,12 +14,13 @@ and the next task. Use [plan.md](plan.md) for the broader roadmap.
 
 The implementation now includes Phase 4 controlled concurrency: one inference
 worker, two FIFO waiting slots, cooperative cancellation, and bounded streaming.
-The suite has 126 passing tests, with real-Qwen lifecycle and HTTP smoke evidence.
+The suite has 128 passing tests, with real-Qwen lifecycle and HTTP smoke evidence.
 See the [Phase 4 evidence](logs/practice.md#phase-4-bounded-concurrency-and-cancellation)
 for the fixed-workload comparison and its limitations. Stage 5 now includes CPU
 and T4 static-batching measurements at sizes 1/2/4; the API remains sequential.
-Stage 6 adds a [CPU dynamic-cache scaling experiment](#dynamic-kv-cache-scaling)
-that reuses the manual generation loop.
+Stage 6 has completed [CPU and T4 dynamic-cache scaling experiments](#dynamic-kv-cache-scaling).
+All five T4 cases matched the CPU logical-cache bytes and passed same-device
+Hugging Face token-ID comparisons. Dynamic/static allocation comparison is next.
 Independent learning checks remain pending; automated verification does not
 prove understanding.
 The earlier GPU exploration completed a five-sample warm T4 run:
@@ -982,6 +983,9 @@ independently, and returns generated IDs, finish reasons, and prefill/final cach
 snapshots. Rotary positions follow each row's attention mask. Dense cache rows
 are not reclaimed when a sequence finishes: batch cache length is padded prompt
 width + the longest generated token count - 1, including EOS in that count.
+On CUDA this experiment helper also resets the device's peak-memory counters
+after its discarded warm-up and returns synchronized allocated/reserved peaks.
+Do not run other CUDA workloads concurrently when interpreting those counters.
 
 On CPU, the script reports one prompt forward-pass time after an untimed prompt
 warm-up, whose outputs and cache are discarded. It separately times subsequent
@@ -1034,9 +1038,88 @@ Checks also verify that cache growth counts processed positions, not the final
 selected token. A mismatch returns failure and preserves the evidence; execution
 errors or interruption preserve completed case data and stop remaining work.
 
-These are logical tensor bytes, not CPU RSS or GPU allocator measurements.
-Allocated/reserved GPU peaks are `null`. Timings are diagnostic single-run values,
-not throughput comparisons; the prefill warm-up and reference generation are
-outside both timers. Dynamic-versus-static allocation and GPU measurements are
-separate, not implemented by this experiment. Results and limitations are recorded
-in [the Stage 6 evidence](logs/practice.md#stage-6-dynamic-kv-cache-scaling).
+These logical tensor bytes are not CPU RSS or GPU allocator measurements.
+Allocated/reserved GPU peaks remain `null` on CPU. Timings are diagnostic
+single-run values, not throughput comparisons; the prefill warm-up and reference
+generation are outside both timers. Dynamic-versus-static allocation is not yet
+implemented. CPU and GPU results and limitations are recorded in
+[the Stage 6 evidence](logs/practice.md#stage-6-dynamic-kv-cache-scaling).
+
+### Completed GPU cache-scaling run
+
+`benchmarks.cache_scaling` accepts `--device cpu|cuda` (CPU by default). CUDA
+requests fail rather than fall back to CPU when CUDA is unavailable. Both paths
+require float32 and keep the same five cases, revision, and correctness checks.
+
+`modal_cache_scaling.py` reuses the existing pinned T4 image and CPU model-download
+layer. Only the additional source modules are mounted; local result directories
+are not uploaded. Importing the module and displaying help submit no remote work
+and require no local Torch installation.
+
+The learner executed this command and supplied the completed result:
+
+```bash
+~/.venvs/modal/bin/modal run modal_cache_scaling.py \
+  --max-new-tokens 16 \
+  --output benchmark-results/cache-scaling/t4-dynamic-001.json
+```
+
+This requests one T4, 4096 MiB host RAM (not GPU VRAM), at most one container,
+zero minimum warm containers, no function retries, and a 300-second function
+timeout. The inherited CPU model-download step has a 600-second timeout.
+There are five manual generations, five HF reference generations, and five
+discarded prefill warm-ups. The output cap of 16 matches the original
+CPU study; it is validated locally before remote submission.
+
+These bounds are not a hard spending cap. Image work, GPU model loading, warm-ups,
+generation, and remaining container lifetime can consume resources. Check current
+[Modal pricing](https://modal.com/pricing) and credits before approval. A local
+interruption does not prove remote computation stopped; stop the app through
+Modal if abandoning it. If no result returns, `remote_results_received=false`
+means no remote evidence was received, not that no remote work occurred.
+
+For each CUDA case, the existing manual helper:
+
+1. Runs prefill warm-up, releases its outputs/cache, then synchronizes CUDA.
+2. Resets peak allocated/reserved counters before measured prefill.
+3. Runs prefill and decode with synchronized timing boundaries.
+4. Synchronizes and captures both peaks after manual generation and result
+   preparation, before returning to the runner.
+5. The runner preserves these peaks, then executes the HF correctness reference.
+
+The per-case peaks are **absolute PyTorch allocator bytes**, including weights,
+K/V, logits, and temporary tensors, not KV-only bytes or total device usage.
+No `empty_cache()` is used. Reservations from warm-ups and earlier cases,
+including their reference generations, can remain in subsequent reserved peaks.
+Resetting peak counters does not release reservations. The current case's
+reference allocation is excluded from its measured interval.
+
+The result recorded at `2026-11-04T18:56:43.964478+00:00` completed on a
+Tesla T4, CUDA 12.4, float32, with `remote_results_received=true`.
+All five cases passed all six checks. Each of nine manual completions selected
+16 tokens and matched its same-device HF reference. Comparison of the saved
+files also found exact CPU/GPU token-ID and logical-cache snapshot agreement.
+Cross-device output equality is an observation for these cases, not a guarantee.
+
+| Batch | Prompt positions per row | Final logical KV (MiB) | Peak allocated (MiB) | Peak reserved (MiB) |
+|---:|---:|---:|---:|---:|
+| 1 | 52 | 1.5703 | 1925.80 | 2056 |
+| 1 | 143 | 3.7031 | 1981.16 | 2142 |
+| 1 | 455 | 11.0156 | 2173.02 | 2414 |
+| 2 | 143 | 7.4063 | 2068.92 | 2416 |
+| 4 | 143 | 14.8125 | 2244.92 | 2752 |
+
+The final KV column is a snapshot; allocator columns are maxima over the manual
+run, not necessarily taken at that snapshot or at the same instant as each other.
+Do not subtract these columns to infer weight size or instantaneous unused memory.
+The drop from 2173.02 to 2068.92 MiB allocated while reserved stays near 2414 MiB
+illustrates why retained reservations are not the same as live tensor demand.
+It does not establish a leak or identify an exact allocation breakdown.
+
+This is one observation per fixed-order case, not a stable performance benchmark.
+The original 16-token CPU study is the matching control, not the later two-token
+compatibility smoke. No experiment was rerun to record this supplied result.
+The local artifact is `benchmark-results/cache-scaling/t4-dynamic-001.json`;
+choose a fresh output path and obtain separate approval for any additional run.
+See the [Modal run](https://modal.com/apps/lenando0307/main/ap-3u0we2FS5gqQLYux4Deuy2)
+and [recorded T4 cache evidence](logs/practice.md#first-t4-dynamic-cache-result-2026-11-04).

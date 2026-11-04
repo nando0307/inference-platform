@@ -40,7 +40,7 @@ def _cache_snapshot(cache, config):
 
 @torch.inference_mode()
 def generate_cached(model, model_inputs, *, max_new_tokens, pad_token_id):
-    """Reuse the Stage 1 loop for full-context Qwen batches with left padding."""
+    """Reuse the Stage 1 loop; on CUDA, own peak counters for this measured run."""
     if type(max_new_tokens) is not int or not 1 <= max_new_tokens <= 512:
         raise ValueError("max_new_tokens must be an integer between 1 and 512.")
     if pad_token_id is None:
@@ -77,6 +77,8 @@ def generate_cached(model, model_inputs, *, max_new_tokens, pad_token_id):
     )
     del warmup_outputs
     _synchronize(model.device)
+    if model.device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(model.device)
     prefill_start = perf_counter()
     # Prefill: process the entire prompt once.
     outputs = model(
@@ -128,7 +130,7 @@ def generate_cached(model, model_inputs, *, max_new_tokens, pad_token_id):
                 break
         generated_ids.append(row)
         finish_reasons.append(finish)
-    return {
+    result = {
         "prompt_tokens": model_inputs["attention_mask"].sum(dim=1).tolist(),
         "generated_ids": generated_ids,
         "finish_reasons": finish_reasons,
@@ -136,7 +138,15 @@ def generate_cached(model, model_inputs, *, max_new_tokens, pad_token_id):
         "final": final,
         "prefill_ms": prefill_seconds * 1000,
         "decode_ms": decode_seconds * 1000,
+        "peak_allocated_bytes": None,
+        "peak_reserved_bytes": None,
     }
+    if model.device.type == "cuda":
+        # Capture before the caller can run a reference or another workload.
+        _synchronize(model.device)
+        result["peak_allocated_bytes"] = torch.cuda.max_memory_allocated(model.device)
+        result["peak_reserved_bytes"] = torch.cuda.max_memory_reserved(model.device)
+    return result
 
 
 def main():

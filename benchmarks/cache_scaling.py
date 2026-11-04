@@ -1,4 +1,4 @@
-"""Compare predicted and measured dynamic KV bytes across five CPU workloads."""
+"""Compare predicted and measured dynamic KV bytes across five CPU/CUDA workloads."""
 
 import argparse
 import json
@@ -7,13 +7,8 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-import torch
-
 from benchmarks.common import write_json
 from benchmarks.warm import describe_runtime
-from src.batched_generation import REVISION, generate_batch
-from src.cached_generation import generate_cached
-from src.inference import ContextLimitError, load_runtime
 
 
 def new_result(max_new_tokens=16):
@@ -29,13 +24,18 @@ def new_result(max_new_tokens=16):
         "memory_boundary": (
             "Sum of numel * element_size for every layer's K/V tensors after prefill and "
             "final decode; includes dense padding and finished rows; not allocator memory "
-            "or process RSS. GPU allocated/reserved peaks are not measured on CPU."
+            "or process RSS. CUDA peaks are absolute PyTorch allocated/reserved bytes, "
+            "including weights and temporary tensors: synchronize/reset after releasing "
+            "each prefill warm-up, synchronize/read after manual generation, before the "
+            "reference. No empty_cache; reservations from warm-ups and earlier cases, "
+            "including their reference calls, can persist. GPU peaks are null on CPU."
         ),
         "timing_boundary": (
             "Diagnostic single-run timings, not a performance benchmark: one discarded "
             "prefill warm-up per case; prefill_ms covers the prompt forward only; decode_ms "
             "starts after selecting token 1 and covers subsequent forwards and selections. "
-            "Cache inspection, serialization and reference generation are outside the timers."
+            "CUDA synchronized at timing boundaries. Cache inspection, serialization and "
+            "reference generation are outside the timers."
         ),
         "cases": [
             {
@@ -59,8 +59,13 @@ def new_result(max_new_tokens=16):
 
 def measure(runtime, record):
     """Retain completed measurements if a later case fails or is interrupted."""
-    if runtime.model.device.type != "cpu" or runtime.model.dtype != torch.float32:
-        raise ValueError("This experiment requires CPU float32.")
+    import torch
+    from src.batched_generation import generate_batch
+    from src.cached_generation import generate_cached
+    from src.inference import ContextLimitError
+
+    if runtime.model.device.type not in ("cpu", "cuda") or runtime.model.dtype != torch.float32:
+        raise ValueError("This experiment requires CPU or CUDA float32.")
     record["runtime"] = describe_runtime(runtime, {"max_tokens": record["max_new_tokens"]})
     del record["runtime"]["batch_size"]
     config = runtime.model.config
@@ -89,6 +94,8 @@ def measure(runtime, record):
                 pad_token_id=runtime.tokenizer.pad_token_id,
             )
             case["manual"] = manual
+            case["peak_allocated_bytes"] = manual.pop("peak_allocated_bytes")
+            case["peak_reserved_bytes"] = manual.pop("peak_reserved_bytes")
             reference = generate_batch(runtime, conversations, max_new_tokens=record["max_new_tokens"])
             case["reference"] = [asdict(result) for result in reference]
             generated_counts = [len(ids) for ids in manual["generated_ids"]]
@@ -117,6 +124,7 @@ def measure(runtime, record):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--max-new-tokens", type=int, default=16)
     args = parser.parse_args(argv)
     if os.environ.get("HF_HUB_OFFLINE") != "1":
@@ -128,8 +136,18 @@ def main(argv=None):
     except ValueError as error:
         parser.error(str(error))
     try:
-        torch.set_num_threads(6)
+        import torch
+        from src.batched_generation import REVISION
+        from src.inference import load_runtime
+
+        if args.device == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("The requested device requires CUDA.")
+        if args.device == "cpu":
+            torch.set_num_threads(6)
         runtime = load_runtime(revision=REVISION)
+        runtime.model.to(args.device)
+        if runtime.model.device.type != args.device:
+            raise ValueError("The loaded model is not on the requested device.")
         runtime.benchmark_model_revision = REVISION
         measure(runtime, record)
     except KeyboardInterrupt:

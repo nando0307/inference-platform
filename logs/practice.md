@@ -15,20 +15,21 @@ against Hugging Face `generate()` for token-limit and EOS stopping, and an
 initial synchronized CPU/MPS float32 comparison. Do not restart the basics.
 
 Current API state: Stage 2 technical acceptance, Phase 3 benchmarks, and Phase 4
-bounded scheduling/cancellation are implemented. There are 126 passing tests.
+bounded scheduling/cancellation are implemented. There are 128 passing tests.
 Real-Qwen controls verify FIFO admission, queued removal, running disconnects,
 bounded streaming pressure, request-setting isolation, and both shutdown paths.
 See [the Phase 4 entry](#phase-4-bounded-concurrency-and-cancellation) for current
 policy, measured concurrency evidence, and limitations.
 Stage 5 now has completed CPU and T4 static-batching measurements.
-Stage 6 now has a completed five-case CPU dynamic KV-cache scaling study.
-Next: explain its memory growth and admission-budget implications, then compare
-dynamic and static allocation. GPU cache measurements require separate approval.
+Stage 6 now has completed five-case CPU and T4 dynamic KV-cache scaling studies.
+All T4 cases matched predicted logical bytes and their same-device HF references;
+saved-file comparison also found exact CPU/GPU cache-byte and token-ID agreement.
+Next: explain logical versus allocated/reserved memory, then study static allocation.
 Manual top-k/top-p lessons were explicitly skipped, not completed. Use the
 stable roadmap [plan.md](../plan.md), this evidence log, and actual code together.
-The latest checkpoint is [Stage 6 dynamic KV-cache scaling](#stage-6-dynamic-kv-cache-scaling):
-all five cases matched predicted logical bytes and Hugging Face token IDs.
-The earlier T4 batching evidence remains recorded below without rerunning it.
+The latest checkpoint is the
+[first T4 dynamic-cache result](#first-t4-dynamic-cache-result-2026-11-04).
+The original CPU study and earlier T4 batching results remain preserved.
 
 ## Mentoring and edit permissions
 
@@ -74,6 +75,8 @@ The earlier T4 batching evidence remains recorded below without rerunning it.
   The standalone Hello demonstration retains CPU/MPS selection, float32,
   discarded prefill warm-up, synchronized timings, and Hugging Face ID parity.
   Dense finished rows stay in the cache until the whole batch finishes.
+  On CUDA the helper also owns peak-memory resets after warm-up release and
+  captures synchronized allocator peaks before any reference generation.
 - Both generation scripts use a 100-new-token limit and the model's configured
   EOS IDs, decode the generated IDs together, and print outside the timed loop.
 - Both scripts currently use `Reply with exactly one word: Hello`, which yields
@@ -92,8 +95,11 @@ The earlier T4 batching evidence remains recorded below without rerunning it.
 - `benchmarks/batching.py`: fixed four-prompt batch-size 1/2/4 timing, actual-token
   throughput, output comparisons, and CUDA allocator peaks when running on CUDA.
 - `modal_batching.py`: separate bounded T4 entrypoint; the first run is recorded below.
-- `benchmarks/cache_scaling.py`: offline pinned CPU float32 study of three prompt
-  lengths and batch sizes 1/2/4, with HF comparisons and fresh JSON evidence.
+- `benchmarks/cache_scaling.py`: offline pinned CPU/CUDA float32 study of three
+  prompt lengths and batch sizes 1/2/4, with HF comparisons, logical KV bytes,
+  CUDA allocator peaks, and fresh JSON evidence. CPU remains the default.
+- `modal_cache_scaling.py`: bounded T4 entrypoint reusing the pinned image;
+  the first real T4 cache-scaling run is now recorded below.
 
 ## Concepts covered and demonstrated
 
@@ -2625,3 +2631,249 @@ GPU allocator measurements require separate approval. Paged allocation stays
 conceptual; no custom allocator or continuous scheduler was implemented.
 Collection-window microbatching remains deferred, not completed. Automated
 verification does not establish independent learner mastery.
+
+## CUDA cache-scaling support: prepared, not run
+
+Historical implementation checkpoint: the completed T4 run below supersedes
+this section's pending-run status. No GPU job ran during implementation itself.
+
+### Approved implementation
+
+The learner requested CUDA support after committing the CPU study as `f97c2e8`.
+Approval covered implementation and local verification, not a paid GPU run.
+No Modal app was launched, image built remotely, or GPU allocated during this work.
+
+Changes:
+
+- `src/cached_generation.py`: after each discarded prefill warm-up, release its
+  outputs/cache, synchronize CUDA, and reset peak-memory counters. After manual
+  generation and result preparation, synchronize and capture absolute allocated
+  and reserved peaks. CPU/MPS results have null GPU peaks. The decode algorithm
+  and logical-cache snapshots are unchanged.
+- `benchmarks/cache_scaling.py`: CPU/CUDA selection, float32/device guards,
+  no CPU fallback on CUDA failure, per-case peak persistence before HF reference
+  generation, and lazy runtime imports so the Modal SDK environment needs no Torch.
+- `modal_cache_scaling.py`: reuse the existing pinned image/model-download
+  layer, mount only required source modules, validate bounds before submission,
+  and preserve returned evidence or a local failed/interrupted transport record.
+- `tests/test_cached_generation.py`: numerical CUDA-boundary regressions,
+  CPU avoidance of CUDA APIs, unsupported-device/precision rejection, and
+  unavailable-CUDA failure without loading a fallback model.
+
+No `empty_cache()` is called. Peak resets do not release cached reservations.
+Warm-ups and earlier cases, including their reference calls, can therefore
+influence later reserved peaks. The current case's HF reference runs after its
+peaks are captured. Peak allocated bytes include weights, cache, logits, and
+temporary tensors; neither peak is a KV-only measurement or total-device usage.
+The counters belong to the device, so measurements assume no concurrent CUDA work.
+
+### Local verification
+
+- Matched CPU environment: **7 cache tests passed**.
+- Project environment: **128 tests passed**.
+- The CUDA regression executes real tiny-Qwen CPU forwards under a simulated
+  asynchronous allocator. It checks one-token and multi-token paths, warm-up
+  tensor release, synchronization/reset effects, exclusion of reference
+  allocations, and retained reservations across all five cases. These are
+  measurement-boundary checks, not evidence of actual CUDA execution.
+- `~/.venvs/modal/bin/python -m benchmarks.cache_scaling --help` exposes CPU/CUDA
+  selection in the SDK-only environment.
+- `~/.venvs/modal/bin/modal run modal_cache_scaling.py --help` loads the real
+  Modal CLI without deployment. A fresh SDK-process import also verified that
+  Torch was not imported.
+- A throwaway local Modal-entrypoint smoke replaced remote submission with
+  controlled failures. Invalid caps and existing output paths were rejected;
+  failed/interrupted transport saved class-only evidence with
+  `remote_results_received=false` and exit codes 1/130. No remote function
+  was submitted. The throwaway files were removed.
+
+### Real-Qwen CPU compatibility smoke
+
+The new explicit CPU CLI path was exercised with a **two-token cap**, not by
+repeating the original 16-token study:
+
+```bash
+HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false \
+  ~/.venvs/inference-cpu-control/bin/python -m benchmarks.cache_scaling \
+  --device cpu --max-new-tokens 2 \
+  --output benchmark-results/cache-scaling/cpu-cuda-support-smoke-001.json
+```
+
+Record timestamp: `2026-11-04T18:50:15.306432+00:00`; status `completed`.
+The pinned model revision, chat template, float32 dtype, matched library versions,
+Apple M1 Pro host, and 6/8 Torch thread settings match the earlier CPU study.
+All five cases passed all six checks. All nine manual completions selected two
+tokens and stopped at the cap; each matched its same-batch HF reference exactly.
+GPU peak fields remained null.
+
+| Batch | Prompt positions | Final positions | Prefill bytes | Final bytes |
+|---:|---:|---:|---:|---:|
+| 1 | 52 | 53 | 1,277,952 | 1,302,528 |
+| 1 | 143 | 144 | 3,514,368 | 3,538,944 |
+| 1 | 455 | 456 | 11,182,080 | 11,206,656 |
+| 2 | 143 | 144 | 7,028,736 | 7,077,888 |
+| 4 | 143 | 144 | 14,057,472 | 14,155,776 |
+
+Predicted and measured KV bytes agreed at both snapshots. Each row grew by
+one processed position, or 24 KiB. Diagnostic single-run timings are preserved
+in the JSON, not treated as a performance comparison with the 16-token study.
+
+### Pending GPU run and learning handoff
+
+After separate approval, the intended command is:
+
+```bash
+~/.venvs/modal/bin/modal run modal_cache_scaling.py \
+  --max-new-tokens 16 \
+  --output benchmark-results/cache-scaling/t4-dynamic-001.json
+```
+
+Bounds: one T4, 4096 MiB host RAM, at most one container, zero minimum warm
+containers, 300-second function timeout, no retries. The inherited CPU download
+step has a 600-second timeout. The five fixed cases run one manual generation
+and one HF reference each, plus one discarded prefill warm-up each.
+The cap defaults to 16 and is bounded to 1..128.
+
+These are resource/workload limits, not a hard spending cap. Loading, warm-ups,
+image work, and container lifetime can incur cost outside measurement windows.
+Check credits/pricing before approval. A local interruption does not establish
+that remote work stopped; use Modal to stop the app if abandoning it.
+No returned result means no received evidence, not proof of no remote work.
+
+No actual CUDA peak values, T4 correctness, or GPU performance are claimed yet.
+Compare logical bytes only at equal batch, cached positions, and dtype. GPU
+outputs can differ from CPU; correctness compares manual and HF paths on the
+same device. Dynamic/static comparison and paged-allocation concepts remain next.
+
+The learner already explained why the last selected token is absent from the
+cache and why continued decoding needs more cache space. Do not restart those
+questions; use the eventual GPU results to distinguish logical KV storage,
+allocated tensor memory, and reserved allocator memory.
+
+## First T4 dynamic-cache result: 2026-11-04
+
+### Supplied evidence and matching control
+
+The learner ran the prepared command and supplied successful output.
+The assistant read the saved JSON and compared it with the original 16-token
+CPU study; no model computation, cloud job, or test suite was rerun.
+Only README/evidence documentation changed while recording this result.
+
+- GPU artifact: `benchmark-results/cache-scaling/t4-dynamic-001.json`.
+- CPU control: `benchmark-results/cache-scaling/cpu-dynamic-001.json`.
+- Record timestamp: `2026-11-04T18:56:43.964478+00:00`, not an exact
+  completion timestamp.
+- Status: `completed`; `remote_results_received=true`; all five cases successful.
+- [Modal app completed](https://modal.com/apps/lenando0307/main/ap-3u0we2FS5gqQLYux4Deuy2).
+- The two-token `cpu-cuda-support-smoke-001.json` is a compatibility smoke,
+  not the matching output-length control for this GPU study.
+
+```bash
+~/.venvs/modal/bin/modal run modal_cache_scaling.py \
+  --max-new-tokens 16 \
+  --output benchmark-results/cache-scaling/t4-dynamic-001.json
+```
+
+The artifact already exists and must not be overwritten. No additional run is
+needed just to confirm the supplied result; further cloud work needs approval.
+
+### Runtime and correctness
+
+- Tesla T4, `cuda:0`, float32, CUDA 12.4.
+- `Qwen/Qwen2.5-0.5B-Instruct`, revision
+  `7ae557604adf67be50417f59c2c2f167def9a775`.
+- Chat-template SHA-256:
+  `cd8e9439f0570856fd70470bf8889ebd8b5d1107207f67a5efb46e342330527f`.
+- Python 3.12.10; Torch 2.6.0+cu124; Transformers 4.57.6; NumPy 2.2.6;
+  huggingface-hub 0.36.0; tokenizers 0.22.1; safetensors 0.6.2.
+- Linux 4.19 gVisor x86_64, glibc 2.36; host CPU name unavailable;
+  17 logical CPUs, one intra-op and 17 inter-op Torch threads.
+- Greedy decoding, cap 16, context limit 2048, natural EOS enabled.
+- DynamicCache, 24 layers, 14 query heads, 2 KV heads, head dimension 64,
+  four bytes per float32 cache element.
+
+Model revision, template, prompts, case order, dtype, and generation settings
+match the CPU control. Every one of the nine manual completions selected 16
+tokens and stopped at the length cap. All matched the same-device HF reference
+in token IDs, prompt counts, and finish reasons. All six checks per case passed;
+there were no execution failures or output mismatches.
+
+Comparison of the saved files also found exact CPU/GPU generated-ID agreement
+and identical prefill/final cache snapshots across all five cases. This does
+not prove bitwise-equal logits or universal cross-device output equality.
+
+### Logical KV storage and allocator peaks
+
+| Batch | Prompt positions | Final positions | Prefill KV bytes | Final KV bytes | Peak allocated bytes | Peak reserved bytes |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 52 | 67 | 1,277,952 | 1,646,592 | 2,019,345,408 | 2,155,872,256 |
+| 1 | 143 | 158 | 3,514,368 | 3,883,008 | 2,077,401,088 | 2,246,049,792 |
+| 1 | 455 | 470 | 11,182,080 | 11,550,720 | 2,278,574,080 | 2,531,262,464 |
+| 2 | 143 | 158 | 7,028,736 | 7,766,016 | 2,169,424,896 | 2,533,359,616 |
+| 4 | 143 | 158 | 14,057,472 | 15,532,032 | 2,353,970,688 | 2,885,681,152 |
+
+| Batch | Prompt positions | Final KV MiB | Peak allocated MiB | Peak reserved MiB |
+|---:|---:|---:|---:|---:|
+| 1 | 52 | 1.5703125 | 1925.797852 | 2056 |
+| 1 | 143 | 3.7031250 | 1981.164063 | 2142 |
+| 1 | 455 | 11.0156250 | 2173.017578 | 2414 |
+| 2 | 143 | 7.4062500 | 2068.924805 | 2416 |
+| 4 | 143 | 14.8125000 | 2244.921387 | 2752 |
+
+The measured logical bytes equal the model-derived prediction at both
+snapshots in every case. Each sequence adds 15 processed positions, or 360 KiB;
+the final selected token is not processed. At 143 prompt/158 final positions,
+logical KV storage doubles and quadruples with batch sizes 2 and 4.
+
+The allocator peaks cover manual generation after warm-up output/cache release,
+CUDA synchronization, and peak reset. Capture happens after a final synchronization
+and before the current HF reference call. They include weights, KV, logits,
+and temporary tensors, not just cache. No `empty_cache()` was used.
+
+The 455-position batch-1 case was followed by the 143-position batch-2 case.
+Peak allocated memory decreased by **104.092773 MiB**, while peak reserved
+memory increased by only **2 MiB**, from 2414 to 2416 MiB. Reserved memory can
+retain reusable allocator blocks from warm-ups and earlier manual/reference
+runs rather than track each case's live tensor demand.
+
+At 143 positions, moving from batch 1 to batch 4 increased final logical KV by
+**11.109375 MiB**, but peak allocated memory increased by **263.757324 MiB**.
+The latter is not a KV-cache measurement: it includes other live tensors and
+can peak at a different point from the final cache snapshot. No allocation
+profile was captured, so these numbers do not identify an exact breakdown.
+
+The two allocator columns are independent maxima over a measurement interval,
+not necessarily simultaneous values. Do not subtract final KV from peak
+allocated to estimate weights, or subtract the two peaks to claim instantaneous
+unused memory. Retained reservations alone do not demonstrate a memory leak.
+
+### Diagnostic timings and limits
+
+| Batch | Prompt positions | Prefill ms | Subsequent generation ms |
+|---:|---:|---:|---:|
+| 1 | 52 | 40.474080 | 463.175914 |
+| 1 | 143 | 56.150981 | 454.473058 |
+| 1 | 455 | 143.129555 | 572.223150 |
+| 2 | 143 | 106.410666 | 589.019179 |
+| 4 | 143 | 164.911402 | 791.882832 |
+
+One observation per case, in fixed order, with prompt-only warm-up and no
+separate decode warm-up. Timers exclude loading, tokenization, warm-up, cache
+inspection, serialization, and HF reference generation. They are not HTTP
+latency, full TTFT, a stable throughput benchmark, or a production SLO.
+CPU/GPU runtime environments also differ in Python patch, Torch build,
+OS/architecture, host CPU, and thread counts (CPU 6/8 versus GPU host 1/17).
+The primary result is correctness and memory accounting, not a hardware-isolated
+speedup claim. This run does not measure OOM capacity or billing totals.
+
+### Completed checkpoint and next step
+
+Real CPU and T4 dynamic-cache scaling are now demonstrated for the fixed
+workloads. The API remains sequential; no static cache, paged allocator, or
+continuous scheduler was introduced.
+
+Before new code, distinguish the batch-4 final logical cache (14.8125 MiB),
+peak allocated tensors (2244.92 MiB), and peak reserved allocator memory
+(2752 MiB). Then inspect the installed static-cache interface and propose a
+bounded dynamic/static comparison, separating occupied positions from allocated
+capacity. Source changes and additional cloud execution need their own approval.
