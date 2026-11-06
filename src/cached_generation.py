@@ -42,8 +42,8 @@ def _cache_snapshot(cache, config, positions, capacity):
 
 
 @torch.inference_mode()
-def generate_cached(model, model_inputs, *, max_new_tokens, pad_token_id, cache_capacity=None):
-    """Reuse the Stage 1 loop; on CUDA, own peak counters for this measured run."""
+def generate_cached(model, model_inputs, *, max_new_tokens, pad_token_id, cache_capacity=None, fixed_length=False):
+    """Inspect cached decoding; fixed_length suppresses EOS for speed workloads only."""
     if type(max_new_tokens) is not int or not 1 <= max_new_tokens <= 512:
         raise ValueError("max_new_tokens must be an integer between 1 and 512.")
     if pad_token_id is None:
@@ -111,6 +111,8 @@ def generate_cached(model, model_inputs, *, max_new_tokens, pad_token_id, cache_
 
     for step in range(max_new_tokens):
         # Select from prefill logits first, then from the previous decode step.
+        if fixed_length:
+            outputs.logits[:, -1, eos] = -torch.inf
         next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
         next_token = torch.where(finished[:, None], pad_token_id, next_token)
         generated.append(next_token)

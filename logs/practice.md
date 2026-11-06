@@ -15,7 +15,7 @@ against Hugging Face `generate()` for token-limit and EOS stopping, and an
 initial synchronized CPU/MPS float32 comparison. Do not restart the basics.
 
 Current API state: Stage 2 technical acceptance, Phase 3 benchmarks, and Phase 4
-bounded scheduling/cancellation are implemented. There are 131 passing tests.
+bounded scheduling/cancellation are implemented. There are 135 passing tests.
 Real-Qwen controls verify FIFO admission, queued removal, running disconnects,
 bounded streaming pressure, request-setting isolation, and both shutdown paths.
 See [the Phase 4 entry](#phase-4-bounded-concurrency-and-cancellation) for current
@@ -25,12 +25,14 @@ Stage 6 now has completed five-case CPU and T4 dynamic KV-cache scaling studies.
 All T4 cases matched predicted logical bytes and their same-device HF references;
 saved-file comparison also found exact CPU/GPU cache-byte and token-ID agreement.
 A CPU dynamic/static allocation comparison also passed with identical generated
-IDs and measured capacity differences. Next: interpret unused static capacity,
-then introduce paged allocation conceptually, without implementing an allocator.
+IDs and measured capacity differences. The learner subsequently reported
+understanding the PagedAttention paper and requested precision/quantization next.
+Stage 7 now has a CPU FP32/FP16/dynamic-INT8 speed and output-quality comparison:
+FP32 and FP16 passed 8/9 frozen tasks; QNNPACK dynamic INT8 passed 1/9.
 Manual top-k/top-p lessons were explicitly skipped, not completed. Use the
 stable roadmap [plan.md](../plan.md), this evidence log, and actual code together.
 The latest checkpoint is the
-[CPU dynamic/static allocation result](#cpu-dynamicstatic-cache-allocation-2026-11-05).
+[CPU precision comparison](#cpu-precision-comparison-2026-11-06).
 The original CPU study and earlier T4 batching results remain preserved.
 
 ## Mentoring and edit permissions
@@ -82,6 +84,8 @@ The original CPU study and earlier T4 batching results remain preserved.
   Optional `cache_capacity` selects native static allocation. Cache snapshots
   distinguish processed slots, the library's raw length query, and tensor capacity.
   Explicit write positions avoid inferring offsets from nonzero cache contents.
+  Optional `fixed_length=True` suppresses EOS logits for speed workloads only,
+  without changing the model's settings or subsequent natural-EOS stopping.
 - Both generation scripts use a 100-new-token limit and the model's configured
   EOS IDs, decode the generated IDs together, and print outside the timed loop.
 - Both scripts currently use `Reply with exactly one word: Hello`, which yields
@@ -95,6 +99,8 @@ The original CPU study and earlier T4 batching results remain preserved.
   backpressure; no alternate decoding implementation.
 - `benchmarks/`: fixed workloads, bounded-wave HTTP clients, opt-in model and
   scheduling measurements, reporting, and separate model-side profiling.
+- `benchmarks/precision.py`: offline CPU FP32/FP16/QNNPACK dynamic-INT8 comparison,
+  fixed 32-token speed cases and nine frozen natural-EOS quality tasks per format.
 - `src/batched_generation.py`: standalone greedy static-batch generation and an
   offline CPU comparison against individual calls, with preserved JSON evidence.
 - `benchmarks/batching.py`: fixed four-prompt batch-size 1/2/4 timing, actual-token
@@ -3032,3 +3038,188 @@ footprints, and why fixed allocation alone does not guarantee a speedup.
 Then introduce paged allocation conceptually: allocate blocks as requests grow,
 without implementing a custom allocator. No additional GPU run is required to
 establish the observed CPU allocation tradeoff, and new cloud work needs approval.
+
+## CPU precision comparison: 2026-11-06
+
+### Approved scope and implementation
+
+After discussing paged allocation, the learner reported understanding the
+PagedAttention paper and asked to move to precision/quantization, focusing on
+speed and output quality. Do not repeat that conceptual lesson or infer mastery
+from the automated checks below.
+
+The learner approved the named files, CPU-only implementation, and bounded
+three-format run after an installed-backend inspection and tiny-Qwen compatibility
+probe. No dependencies were installed, no GPU/cloud job ran, and no alternate
+serving engine was added. Production loading and existing FP32 benchmark guards
+remain unchanged.
+
+- `src/cached_generation.py`: optional `fixed_length=True` masks all configured
+  EOS logits until the output cap, matching HF `min_new_tokens=max_new_tokens`.
+  Default natural-EOS behavior, static capacity, and cache-position accounting
+  remain available. Model generation settings are not mutated.
+- `benchmarks/precision.py`: reload the same pinned CPU FP32 checkpoint for each
+  format; cast to FP16 or convert all `torch.nn.Linear` modules with
+  `torch.ao.quantization.quantize_dynamic(..., dtype=torch.qint8)` using QNNPACK.
+  Loading/conversion are outside timing. Each format's runtime is released before
+  loading the next.
+- Reuse existing short/long prompts, runtime metadata, manual cached timing,
+  production natural-EOS generation, and exclusive JSON artifact creation.
+  Require offline mode and a fresh output path. Caught failures/interruptions
+  preserve completed case data and return a nonzero exit status.
+- Freeze nine quality prompts and their scoring rules before viewing trained-model
+  answers. Keep raw text/IDs, prompt/output counts, stopping reason, truncation,
+  and task-success scores. Do not adjust the prompts or scoring after observing
+  a regression.
+
+### Real-Qwen run and controls
+
+Artifact: `benchmark-results/precision/cpu-precision-001.json`.
+Record timestamp: `2026-11-06T05:07:07.627103+00:00`, not exact completion time.
+Status: `completed` for the experiment and all three formats. Completion means
+the measurements ran, not that every quality task passed.
+
+```bash
+HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false \
+  ~/.venvs/inference-cpu-control/bin/python -m benchmarks.precision \
+  --output benchmark-results/precision/cpu-precision-001.json
+```
+
+The artifact exists; choose a fresh path for any later approved run.
+
+- Model: `Qwen/Qwen2.5-0.5B-Instruct`, revision
+  `7ae557604adf67be50417f59c2c2f167def9a775`.
+- Chat-template SHA-256:
+  `cd8e9439f0570856fd70470bf8889ebd8b5d1107207f67a5efb46e342330527f`.
+- CPU: Apple M1 Pro, arm64, eight logical CPUs; six intra-op/eight inter-op
+  threads. Platform recorded as `macOS-26.6.2-arm64-arm-64bit`.
+- Python 3.12.13, Torch 2.6.0, Transformers 4.57.6, NumPy 2.2.6,
+  huggingface-hub 0.36.0, tokenizers 0.22.1, safetensors 0.6.2.
+- Batch 1, concurrency 1, greedy decoding, context limit 2048.
+- Fixed order: FP32, FP16, dynamic INT8. Each format runs short then long speed
+  cases, followed by the same nine quality prompts.
+- Speed: actual prompt counts 59 and 990; exactly 32 generated tokens per case,
+  with EOS suppressed. One discarded complete generation, then one measured
+  generation per case. The cached helper also discards a prefill on each call.
+- Prefill timing covers the prompt forward only. Decode timing starts after
+  token 1 selection and covers the remaining 31 forwards/selections. Loading,
+  conversion, tokenization, cache inspection, and serialization are excluded.
+  Neither region is end-to-end serving latency.
+- Quality: production HF generation, natural EOS, cap 64. Speed outputs are not
+  used for quality scoring.
+
+### Observed precision and backend caveat
+
+| Format | Floating parameters | Quantized linear modules | Sampled packed weight dtype | Observed KV dtype |
+|---|---|---:|---|---|
+| FP32 | float32 | 0 | None | float32 |
+| FP16 | float16 | 0 | None | float16 |
+| Dynamic INT8 | float32 | 169 | qint8 | float32 |
+
+All linear modules, including `lm_head`, are selected for dynamic INT8.
+Their inputs/outputs are FP32, with dynamic activation quantization inside
+the operations. Embeddings and norms remain FP32. The artifact records every
+converted module name and samples one packed weight's dtype; `model.dtype`
+alone would misleadingly label the INT8 configuration as float32.
+This is not weight-only quantization. FP16 also changes the KV representation;
+INT8 linear conversion does not quantize the KV cache.
+
+The runtime emitted, without suppression:
+
+```text
+Currently, qnnpack incorrectly ignores reduce_range when it is set to true; this may change in a future release.
+```
+
+These compare concrete PyTorch CPU configurations, not isolated weight-bit
+changes: kernel implementations and activation/cache precision can differ.
+No profiling or ablation established why performance or output behavior changed,
+or how much the QNNPACK warning contributed. The run does not measure model
+memory savings or represent MLX, GGUF, bitsandbytes, or GPU performance.
+
+### Speed observations
+
+| Format | Prompt tokens | Prefill ms | Subsequent decode ms | Decode ms/token | Decode tokens/s |
+|---|---:|---:|---:|---:|---:|
+| FP32 | 59 | 138.960084 | 2733.529417 | 88.178368 | 11.340650 |
+| FP16 | 59 | 319.948625 | 944.678917 | 30.473513 | 32.815382 |
+| Dynamic INT8 | 59 | 237.864833 | 1498.205542 | 48.329211 | 20.691420 |
+| FP32 | 990 | 1694.110417 | 3370.621666 | 108.729731 | 9.197116 |
+| FP16 | 990 | 5487.154458 | 1670.064666 | 53.873054 | 18.562155 |
+| Dynamic INT8 | 990 | 3592.625292 | 1887.216542 | 60.877953 | 16.426308 |
+
+Relative to FP32 in these single observations:
+
+- FP16 decode rate was 2.894x / 2.018x for short/long inputs, while prefill
+  duration was 2.302x / 3.239x.
+- INT8 decode rate was 1.825x / 1.786x, while prefill duration was
+  1.712x / 2.121x.
+
+Lower precision did not improve both phases. These are one-sample ratios with
+fixed format order, not statistically stable speedups. No additional timing
+repetitions or medians were collected.
+
+### Quality observations
+
+Scoring ignores outer whitespace; fact-answer casing is also ignored.
+Arithmetic and string transformations must otherwise match the requested
+answer exactly. JSON must parse as the exact requested object with an integer
+count, without Markdown or commentary. Truncation fails the task.
+
+| Format | Arithmetic task success | Fact task success | Instruction task success | Total | Truncated |
+|---|---:|---:|---:|---:|---:|
+| FP32 | 3/3 | 3/3 | 2/3 | 8/9 | 0 |
+| FP16 | 3/3 | 3/3 | 2/3 | 8/9 | 0 |
+| Dynamic INT8 | 0/3 | 1/3 | 0/3 | 1/9 | 1 |
+
+FP32 and FP16 produced identical text on all nine prompts. Their answers were
+`45`, `63`, `12`, `Paris`, `H2O`, `Mars`, fenced JSON with the correct
+`color`/`count` values, `blue green red`, and `mixed case`.
+The JSON failed because the explicit instruction forbade Markdown fences.
+
+INT8's failures were not all wrong underlying facts:
+
+| Task | INT8 observation | Interpretation |
+|---|---|---|
+| 17 + 28 | `The sum of 17 and 28 is 45.` | Correct sum; violates integer-only output |
+| 9 times 7 | `9 times 7 is 63.` | Correct product; violates integer-only output |
+| 144 divided by 12 | Explanation ending `The result is 12.` | Correct quotient; violates integer-only output |
+| France's capital | `Paris` | Pass |
+| Water formula | `Certainly! The chemical formula for water is H2O.` | Correct formula; forbidden extra text |
+| Red Planet | `The planet known as the "Red Planet" is Mars.` | Correct fact; forbidden extra text |
+| JSON | Same fenced JSON as FP32/FP16 | Correct content, invalid requested format |
+| Reverse words | `wit, created by Alibaba Cloud.` | Unrelated answer |
+| Lowercase | Unrelated Qwen/Chinese-conversation instructions, cut off at 64 tokens | Wrong task and truncated |
+
+All other answers stopped naturally. Full unabridged text and token IDs are in
+the JSON artifact. The arithmetic/fact category scores measure compliance with
+the entire prompt, not isolated numerical/factual accuracy. The regression
+observed here is predominantly instruction following, with severe unrelated
+outputs on two transformation tasks.
+
+Nine short tasks cannot establish general quality equivalence for FP16 or
+general quality loss for INT8. The observed INT8 configuration is not an
+acceptable replacement for the baseline on these task requirements.
+No post-result tuning or scorer changes were made.
+
+### Verification and next learning step
+
+- Project environment: **135 tests passed** (`unittest discover -s tests -q`).
+- Matched CPU environment: **14 cache/scoring tests passed**.
+- Fixed-length regression uses actual tiny-Qwen forwards with both EOS logits
+  preferred over the next valid token. It checks HF fixed-length parity,
+  left-padded rows, cap 1, dynamic/static allocation, cache length, and immediate
+  natural-EOS stopping after a fixed-length call.
+- Scoring tests cover forbidden explanatory text, case normalization versus
+  lowercase requirements, JSON key/value/type/format errors, and truncation.
+- Actual CLI smoke in the Torch-free Modal environment: help works without
+  loading a model; existing output is refused and preserved; missing offline
+  mode is rejected before loading. Missing Torch produces a failed JSON artifact
+  and nonzero exit with no format falsely marked as executed.
+- The full trained-model CLI completed all six measured speed cases and 27
+  quality generations. Raw answers were inspected, not just aggregate scores.
+
+Next: interpret why faster decode can coexist with slower prefill, and why
+task-format compliance must be distinguished from numerical correctness.
+Do not claim a hardware/kernel cause without profiling. Additional repetitions,
+alternative quantization configurations/backends, dependency installs, and cloud
+runs require a new agreed scope.

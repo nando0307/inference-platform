@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
-from transformers import Qwen2Config, Qwen2ForCausalLM, StaticCache
+from transformers import GenerationConfig, Qwen2Config, Qwen2ForCausalLM, StaticCache
 
 from benchmarks.cache_scaling import main, measure, new_result
 from src.batched_generation import generate_batch
@@ -78,6 +78,38 @@ class CachedGenerationTests(unittest.TestCase):
         self.assertEqual(result["generated_ids"], [[2], [2]])
         self.assertEqual(result["final"]["cached_positions"], 3)
         self.assertEqual(result["decode_ms"], 0)
+
+    def test_fixed_length_suppresses_all_eos_without_changing_natural_stopping(self):
+        inputs = self.inputs([[{"role": "user", "content": text}] for text in ("answer", "tail tail tail")])
+        model = self.runtime.model
+
+        def prefer_eos(model, args, output):
+            output.logits.fill_(-20)
+            output.logits[:, :, 2] = 30
+            output.logits[:, :, 6] = 20
+            output.logits[:, :, 5] = 10
+
+        hook = model.register_forward_hook(prefer_eos)
+        self.addCleanup(hook.remove)
+        for cap, capacity in ((1, None), (4, None), (4, 12)):
+            with self.subTest(cap=cap, capacity=capacity):
+                fixed = generate_cached(
+                    model, inputs, max_new_tokens=cap, pad_token_id=2,
+                    cache_capacity=capacity, fixed_length=True,
+                )
+                with torch.inference_mode():
+                    reference = model.generate(**inputs, generation_config=GenerationConfig(
+                        do_sample=False, min_new_tokens=cap, max_new_tokens=cap,
+                        eos_token_id=[2, 6], pad_token_id=2,
+                    ))
+                self.assertEqual(fixed["generated_ids"], [[5] * cap, [5] * cap])
+                self.assertEqual(fixed["generated_ids"], reference[:, inputs["input_ids"].shape[1]:].tolist())
+                self.assertEqual(fixed["finish_reasons"], ["length", "length"])
+                self.assertEqual(fixed["final"]["cached_positions"], 5 + cap - 1)
+                natural = generate_cached(model, inputs, max_new_tokens=cap, pad_token_id=2)
+                self.assertEqual(natural["generated_ids"], [[2], [2]])
+                self.assertEqual(natural["finish_reasons"], ["stop", "stop"])
+                self.assertEqual(natural["final"]["cached_positions"], 5)
 
     def test_real_greedy_parity_with_left_padding_and_batch_scaling(self):
         self.runtime.model.generation_config.eos_token_id = None
