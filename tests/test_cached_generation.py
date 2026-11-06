@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
-from transformers import Qwen2Config, Qwen2ForCausalLM
+from transformers import Qwen2Config, Qwen2ForCausalLM, StaticCache
 
 from benchmarks.cache_scaling import main, measure, new_result
 from src.batched_generation import generate_batch
@@ -94,6 +94,97 @@ class CachedGenerationTests(unittest.TestCase):
             width = inputs["input_ids"].shape[1]
             self.assertEqual(result["prefill"]["measured_bytes"], 128 * size * width)
             self.assertEqual(result["final"]["measured_bytes"], 128 * size * (width + 3))
+
+    def test_static_capacity_masks_unused_values_and_preserves_logits(self):
+        self.runtime.model.generation_config.eos_token_id = None
+        self.runtime.eos_token_ids = set()
+        conversations = [[{"role": "user", "content": text}] for text in ("answer", "tail tail tail")]
+        inputs = self.inputs(conversations)
+        captured = []
+
+        def inspect_and_poison(model, args, kwargs, output):
+            captured.append(output.logits[:, -1, :].clone())
+            cache = output.past_key_values
+            if isinstance(cache, StaticCache):
+                used = kwargs["attention_mask"].shape[1]
+                # Unused values must remain invisible even when they are not zero.
+                # Padding also has zero keys in this tiny model, so writes must
+                # not infer their offset by counting nonzero keys.
+                for layer in cache.layers:
+                    layer.values[:, :, used:, :].fill_(10000)
+
+        hook = self.runtime.model.register_forward_hook(inspect_and_poison, with_kwargs=True)
+        self.addCleanup(hook.remove)
+        baseline = generate_cached(self.runtime.model, inputs, max_new_tokens=4, pad_token_id=2)
+        baseline_logits = captured[:]
+        for capacity in (8, 16):
+            captured.clear()
+            result = generate_cached(
+                self.runtime.model, inputs, max_new_tokens=4, pad_token_id=2, cache_capacity=capacity,
+            )
+            self.assertEqual(result["generated_ids"], baseline["generated_ids"])
+            self.assertEqual(result["finish_reasons"], ["length", "length"])
+            for actual, expected in zip(captured, baseline_logits, strict=True):
+                torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+            for snapshot, used in ((result["prefill"], 5), (result["final"], 8)):
+                self.assertEqual(snapshot["cached_positions"], used)
+                self.assertEqual(snapshot["allocated_positions"], capacity)
+                self.assertEqual(snapshot["first_key_shape"], [2, 2, capacity, 4])
+                self.assertEqual(snapshot["predicted_used_bytes"], 256 * used)
+                self.assertEqual(snapshot["predicted_bytes"], 256 * capacity)
+                self.assertEqual(snapshot["measured_bytes"], 256 * capacity)
+
+    def test_static_eos_does_not_fill_capacity_and_invalid_capacity_is_rejected(self):
+        inputs = self.inputs([[{"role": "user", "content": "answer"}]])
+
+        def eos(model, args, kwargs, output):
+            output.logits.fill_(-20)
+            output.logits[:, :, 2] = 20
+
+        hook = self.runtime.model.register_forward_hook(eos, with_kwargs=True)
+        try:
+            result = generate_cached(
+                self.runtime.model, inputs, max_new_tokens=4, pad_token_id=2, cache_capacity=6,
+            )
+        finally:
+            hook.remove()
+        self.assertEqual(result["generated_ids"], [[2]])
+        self.assertEqual(result["finish_reasons"], ["stop"])
+        self.assertEqual(result["final"]["cached_positions"], 3)
+        self.assertEqual(result["final"]["measured_bytes"], 128 * 6)
+        self.assertEqual(result["final"]["predicted_used_bytes"], 128 * 3)
+        self.assertEqual(result["decode_ms"], 0)
+        with patch.object(self.runtime.model, "forward", side_effect=AssertionError("Must not run")):
+            for capacity in (True, 0, 5, 6.5, 1025):
+                with self.subTest(capacity=capacity), self.assertRaises(ValueError):
+                    generate_cached(
+                        self.runtime.model, inputs, max_new_tokens=4, pad_token_id=2, cache_capacity=capacity,
+                    )
+
+    def test_cpu_allocation_comparison_keeps_used_bytes_equal_but_capacity_fixed(self):
+        self.runtime.model.generation_config.eos_token_id = None
+        self.runtime.eos_token_ids = set()
+        record = measure(self.runtime, new_result(max_new_tokens=4, compare_static=True))
+        self.assertEqual(record["status"], "completed")
+        dynamic, small, large = [case["manual"] for case in record["cases"]]
+        for case in record["cases"]:
+            self.assertTrue(all(case["checks"].values()))
+        for static, capacity in ((small, 160), (large, 256)):
+            for stage in ("prefill", "final"):
+                self.assertEqual(static[stage]["measured_bytes"], 128 * capacity)
+                self.assertEqual(static[stage]["predicted_used_bytes"], dynamic[stage]["measured_bytes"])
+        self.assertEqual(
+            dynamic["final"]["measured_bytes"] - dynamic["prefill"]["measured_bytes"], 3 * 128,
+        )
+        with self.assertRaises(ValueError):
+            new_result(max_new_tokens=17, compare_static=True)
+        runtime = SimpleNamespace(model=SimpleNamespace(device=torch.device("cuda"), dtype=torch.float32))
+        with self.assertRaises(ValueError):
+            measure(runtime, new_result(compare_static=True))
+        with TemporaryDirectory() as directory, redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                main(["--compare-static", "--device", "cuda", "--output", str(Path(directory) / "no-gpu.json")])
+            self.assertEqual(raised.exception.code, 2)
 
     def test_invalid_masks_caps_and_context_are_rejected_before_forward(self):
         inputs = self.inputs([[{"role": "user", "content": "answer"}]])

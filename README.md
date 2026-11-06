@@ -14,13 +14,14 @@ and the next task. Use [plan.md](plan.md) for the broader roadmap.
 
 The implementation now includes Phase 4 controlled concurrency: one inference
 worker, two FIFO waiting slots, cooperative cancellation, and bounded streaming.
-The suite has 128 passing tests, with real-Qwen lifecycle and HTTP smoke evidence.
+The suite has 131 passing tests, with real-Qwen lifecycle and HTTP smoke evidence.
 See the [Phase 4 evidence](logs/practice.md#phase-4-bounded-concurrency-and-cancellation)
 for the fixed-workload comparison and its limitations. Stage 5 now includes CPU
 and T4 static-batching measurements at sizes 1/2/4; the API remains sequential.
 Stage 6 has completed [CPU and T4 dynamic-cache scaling experiments](#dynamic-kv-cache-scaling).
 All five T4 cases matched the CPU logical-cache bytes and passed same-device
-Hugging Face token-ID comparisons. Dynamic/static allocation comparison is next.
+Hugging Face token-ID comparisons. A [CPU dynamic/static allocation comparison](#dynamic-versus-static-kv-cache-allocation)
+also passed with identical outputs and distinct used/capacity measurements.
 Independent learning checks remain pending; automated verification does not
 prove understanding.
 The earlier GPU exploration completed a five-sample warm T4 run:
@@ -978,11 +979,16 @@ and greedy settings. Matching tokens checks generation mechanics, not factual
 accuracy or speed.
 
 The module is import-safe. `generate_cached(model, model_inputs, max_new_tokens=...,
-pad_token_id=...)` also accepts left-padded batches, handles each row's EOS
+pad_token_id=..., cache_capacity=None)` also accepts left-padded batches, handles each row's EOS
 independently, and returns generated IDs, finish reasons, and prefill/final cache
 snapshots. Rotary positions follow each row's attention mask. Dense cache rows
 are not reclaimed when a sequence finishes: batch cache length is padded prompt
 width + the longest generated token count - 1, including EOS in that count.
+Omitting `cache_capacity` keeps dynamic allocation. Providing an integer uses
+the installed `StaticCache`; capacity must cover every possible processed slot
+(`prompt_width + max_new_tokens - 1`) and stay within the model context limit.
+Warm-up and measured generation use separate caches. The library builds attention
+masks for the chosen cache, excluding unused static positions.
 On CUDA this experiment helper also resets the device's peak-memory counters
 after its discarded warm-up and returns synchronized allocated/reserved peaks.
 Do not run other CUDA workloads concurrently when interpreting those counters.
@@ -1041,8 +1047,9 @@ errors or interruption preserve completed case data and stop remaining work.
 These logical tensor bytes are not CPU RSS or GPU allocator measurements.
 Allocated/reserved GPU peaks remain `null` on CPU. Timings are diagnostic
 single-run values, not throughput comparisons; the prefill warm-up and reference
-generation are outside both timers. Dynamic-versus-static allocation is not yet
-implemented. CPU and GPU results and limitations are recorded in
+generation are outside both timers. The CPU-only static comparison below is a
+separate opt-in mode; the default five-case dynamic study is unchanged.
+CPU and GPU results and limitations are recorded in
 [the Stage 6 evidence](logs/practice.md#stage-6-dynamic-kv-cache-scaling).
 
 ### Completed GPU cache-scaling run
@@ -1123,3 +1130,61 @@ The local artifact is `benchmark-results/cache-scaling/t4-dynamic-001.json`;
 choose a fresh output path and obtain separate approval for any additional run.
 See the [Modal run](https://modal.com/apps/lenando0307/main/ap-3u0we2FS5gqQLYux4Deuy2)
 and [recorded T4 cache evidence](logs/practice.md#first-t4-dynamic-cache-result-2026-11-04).
+
+## Dynamic versus static KV-cache allocation
+
+The same decoder now supports a bounded CPU comparison of dynamic allocation
+against static capacities of 160 and 256 positions. This changes cache memory
+allocation, not batching: every case uses batch size 1, the same 143-token
+chat-formatted prompt, the pinned model, float32, and greedy decoding.
+
+```bash
+HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false \
+  ~/.venvs/inference-cpu-control/bin/python -m benchmarks.cache_scaling \
+  --compare-static --device cpu --max-new-tokens 16 \
+  --output benchmark-results/cache-scaling/cpu-allocation-001.json
+```
+
+The recorded file already exists; choose a fresh output path for another run.
+`--compare-static` accepts output caps from 1 to 16 and rejects CUDA selection
+before loading a model. Without the flag, the existing dynamic CPU/CUDA study
+and its 1..128 output-cap range remain available. Modal commands are unchanged
+and still run only the dynamic study.
+
+The three-case run completed on CPU. All cases generated the same 16 token IDs,
+matched Hugging Face generation, and passed the allocation/capacity checks:
+
+| Cache | Processed positions, prefill → final | Tensor capacity, prefill → final | Prefill K/V MiB | Final K/V MiB |
+|---|---:|---:|---:|---:|
+| Dynamic | 143 → 158 | 143 → 158 | 3.3515625 | 3.703125 |
+| Static, 160 | 143 → 158 | 160 → 160 | 3.7500000 | 3.750000 |
+| Static, 256 | 143 → 158 | 256 → 256 | 6.0000000 | 6.000000 |
+
+These library versions allocate the full static backing tensors lazily on the
+first forward pass, then update them in place. Unused capacity occupies tensor
+storage but is not valid attention history. At the final snapshot, capacity 160
+has 2 unused slots (48 KiB); capacity 256 has 98 unused slots (2.296875 MiB).
+
+Snapshot fields distinguish:
+
+- `cached_positions`: processed cache slots, including dense batch padding.
+- `reported_cache_length`: the library's raw length query, retained as a diagnostic.
+- `allocated_positions`: the actual K/V tensor sequence dimension.
+- `predicted_used_bytes`: the model formula evaluated at processed positions,
+  not an additional allocation or a physical-memory measurement.
+- `predicted_bytes`: expected tensor storage using configured static capacity
+  or dynamic processed length.
+- `measured_bytes`: the actual sum of all K/V `numel() * element_size()`,
+  including unfilled static positions.
+
+Cache write positions and per-row rotary positions are separate. The decoder
+passes an explicit write cursor and tracks successful forwards. In the pinned
+Transformers 4.57.6, the static-cache raw length query counts nonzero keys and
+can undercount zero-valued padding or valid zero keys; it is not used to infer
+our write cursor. Attention masks continue to cover only the processed prefix.
+
+The comparison ran eagerly, without `torch.compile`, a custom allocator, or
+a GPU job. Single-run timings are diagnostic, not evidence that either cache
+strategy is faster. Logical tensor storage is not process RSS or GPU allocator
+reserved memory. See [the allocation evidence](logs/practice.md#cpu-dynamicstatic-cache-allocation-2026-11-05)
+for exact bytes, runtime metadata, checks, and limitations.

@@ -1,4 +1,4 @@
-"""Compare predicted and measured dynamic KV bytes across five CPU/CUDA workloads."""
+"""Measure dynamic KV scaling or compare dynamic/static allocation on CPU."""
 
 import argparse
 import json
@@ -11,20 +11,27 @@ from benchmarks.common import write_json
 from benchmarks.warm import describe_runtime
 
 
-def new_result(max_new_tokens=16):
+def new_result(max_new_tokens=16, *, compare_static=False):
     if type(max_new_tokens) is not int or not 1 <= max_new_tokens <= 128:
         raise ValueError("max_new_tokens must be an integer between 1 and 128.")
+    if compare_static and max_new_tokens > 16:
+        raise ValueError("The fixed static-cache comparison supports output caps from 1 to 16.")
+    cases = (
+        ((1, 8, None), (1, 8, 160), (1, 8, 256)) if compare_static
+        else ((1, 1, None), (1, 8, None), (1, 32, None), (2, 8, None), (4, 8, None))
+    )
     return {
         "schema_version": 1,
-        "kind": "dynamic_cache_scaling",
+        "kind": "cache_allocation_comparison" if compare_static else "dynamic_cache_scaling",
         "recorded_at": datetime.now(timezone.utc).isoformat(),
         "status": "failed",
         "runtime": None,
         "max_new_tokens": max_new_tokens,
         "memory_boundary": (
             "Sum of numel * element_size for every layer's K/V tensors after prefill and "
-            "final decode; includes dense padding and finished rows; not allocator memory "
-            "or process RSS. CUDA peaks are absolute PyTorch allocated/reserved bytes, "
+            "final decode; includes dense padding, finished rows and unused static capacity. "
+            "Processed positions and backing-tensor capacity are recorded separately. "
+            "These are logical tensor bytes, not process RSS. CUDA peaks are absolute PyTorch allocated/reserved bytes, "
             "including weights and temporary tensors: synchronize/reset after releasing "
             "each prefill warm-up, synchronize/read after manual generation, before the "
             "reference. No empty_cache; reservations from warm-ups and earlier cases, "
@@ -41,6 +48,7 @@ def new_result(max_new_tokens=16):
             {
                 "batch_size": size,
                 "prompt_repeats": repeats,
+                "cache_capacity": capacity,
                 "prompt": (
                     "An inference server tokenizes prompts and retains attention keys and values. "
                     * repeats + "\nExplain how the cache grows during decoding."
@@ -52,7 +60,7 @@ def new_result(max_new_tokens=16):
                 "peak_allocated_bytes": None,
                 "peak_reserved_bytes": None,
             }
-            for size, repeats in ((1, 1), (1, 8), (1, 32), (2, 8), (4, 8))
+            for size, repeats, capacity in cases
         ],
     }
 
@@ -66,6 +74,9 @@ def measure(runtime, record):
 
     if runtime.model.device.type not in ("cpu", "cuda") or runtime.model.dtype != torch.float32:
         raise ValueError("This experiment requires CPU or CUDA float32.")
+    compare_static = record["kind"] == "cache_allocation_comparison"
+    if compare_static and runtime.model.device.type != "cpu":
+        raise ValueError("The static-cache comparison is CPU-only.")
     record["runtime"] = describe_runtime(runtime, {"max_tokens": record["max_new_tokens"]})
     del record["runtime"]["batch_size"]
     config = runtime.model.config
@@ -75,6 +86,7 @@ def measure(runtime, record):
         "kv_heads": config.num_key_value_heads,
         "head_dim": getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads,
     }
+    baseline = None
     for case in record["cases"]:
         case["status"] = "running"
         try:
@@ -92,6 +104,7 @@ def measure(runtime, record):
             manual = generate_cached(
                 runtime.model, inputs, max_new_tokens=record["max_new_tokens"],
                 pad_token_id=runtime.tokenizer.pad_token_id,
+                cache_capacity=case["cache_capacity"],
             )
             case["manual"] = manual
             case["peak_allocated_bytes"] = manual.pop("peak_allocated_bytes")
@@ -110,7 +123,19 @@ def measure(runtime, record):
                     manual["prefill"]["cached_positions"] == width
                     and manual["final"]["cached_positions"] == width + max(generated_counts) - 1
                 ),
+                "capacity_matches": all(
+                    snapshot["allocated_positions"] == (
+                        snapshot["cached_positions"] if case["cache_capacity"] is None else case["cache_capacity"]
+                    ) and snapshot["cached_positions"] <= snapshot["allocated_positions"]
+                    for snapshot in (manual["prefill"], manual["final"])
+                ),
             }
+            if compare_static:
+                if baseline is None:
+                    baseline = manual
+                case["checks"]["matches_dynamic_baseline"] = all(
+                    manual[key] == baseline[key] for key in ("generated_ids", "finish_reasons", "prompt_tokens")
+                )
             case["status"] = "success" if all(case["checks"].values()) else "mismatch"
         except (Exception, KeyboardInterrupt) as error:
             case["status"] = "interrupted" if isinstance(error, KeyboardInterrupt) else "error"
@@ -126,13 +151,17 @@ def main(argv=None):
     parser.add_argument("--output", required=True)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--max-new-tokens", type=int, default=16)
+    parser.add_argument("--compare-static", action="store_true",
+                        help="CPU: compare dynamic allocation with static capacities 160 and 256")
     args = parser.parse_args(argv)
+    if args.compare_static and args.device != "cpu":
+        parser.error("--compare-static requires --device cpu.")
     if os.environ.get("HF_HUB_OFFLINE") != "1":
         parser.error("Set HF_HUB_OFFLINE=1; use already-cached model artifacts.")
     if Path(args.output).exists():
         parser.error("Choose a fresh output path; previous evidence is never overwritten.")
     try:
-        record = new_result(args.max_new_tokens)
+        record = new_result(args.max_new_tokens, compare_static=args.compare_static)
     except ValueError as error:
         parser.error(str(error))
     try:

@@ -1,9 +1,9 @@
-"""Manual greedy generation with dynamic KV-cache inspection."""
+"""Manual greedy generation with dynamic/static KV-cache inspection."""
 
 from time import perf_counter
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig, StaticCache
 
 
 def _synchronize(device):
@@ -13,24 +13,27 @@ def _synchronize(device):
         torch.cuda.synchronize(device)
 
 
-def _cache_snapshot(cache, config):
-    """Count logical tensor bytes, not allocator memory or physical storage."""
+def _cache_snapshot(cache, config, positions, capacity):
+    """Separate processed positions from logical backing-tensor capacity/bytes."""
     first_layer = cache.layers[0]
     keys = first_layer.keys
-    positions = int(cache.get_seq_length())
     head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+    bytes_per_position = (
+        2 * config.num_hidden_layers * keys.shape[0] * config.num_key_value_heads
+        * head_dim * keys.element_size()
+    )
     return {
         "cache_type": type(cache).__name__,
         "cached_positions": positions,
+        "reported_cache_length": int(cache.get_seq_length()),
+        "allocated_positions": keys.shape[-2],
         "cached_layers": len(cache.layers),
         "first_key_shape": list(keys.shape),
         "first_value_shape": list(first_layer.values.shape),
         "dtype": str(keys.dtype),
         "bytes_per_element": keys.element_size(),
-        "predicted_bytes": (
-            2 * config.num_hidden_layers * keys.shape[0] * config.num_key_value_heads
-            * positions * head_dim * keys.element_size()
-        ),
+        "predicted_used_bytes": bytes_per_position * positions,
+        "predicted_bytes": bytes_per_position * (positions if capacity is None else capacity),
         "measured_bytes": sum(
             tensor.numel() * tensor.element_size()
             for layer in cache.layers for tensor in (layer.keys, layer.values)
@@ -39,7 +42,7 @@ def _cache_snapshot(cache, config):
 
 
 @torch.inference_mode()
-def generate_cached(model, model_inputs, *, max_new_tokens, pad_token_id):
+def generate_cached(model, model_inputs, *, max_new_tokens, pad_token_id, cache_capacity=None):
     """Reuse the Stage 1 loop; on CUDA, own peak counters for this measured run."""
     if type(max_new_tokens) is not int or not 1 <= max_new_tokens <= 512:
         raise ValueError("max_new_tokens must be an integer between 1 and 512.")
@@ -57,6 +60,11 @@ def generate_cached(model, model_inputs, *, max_new_tokens, pad_token_id):
         raise ValueError("Attention masks must describe nonempty, left-padded sequences.")
     if input_ids.shape[1] + max_new_tokens > model.config.max_position_embeddings:
         raise ValueError("Prompt width plus output cap exceeds the model context limit.")
+    if cache_capacity is not None and (
+        type(cache_capacity) is not int
+        or not input_ids.shape[1] + max_new_tokens - 1 <= cache_capacity <= model.config.max_position_embeddings
+    ):
+        raise ValueError("Static capacity must fit all processed positions and stay within the model context limit.")
 
     eos_token_ids = model.generation_config.eos_token_id
     if eos_token_ids is None:
@@ -69,26 +77,35 @@ def generate_cached(model, model_inputs, *, max_new_tokens, pad_token_id):
     # Masked positions do not advance a sequence's rotary position, as in generate().
     position_ids = attention_mask.long().cumsum(-1) - 1
     position_ids.masked_fill_(attention_mask == 0, 1)
+    # Cache writes count padded slots, independently of per-row rotary positions.
+    cache_position = torch.arange(input_ids.shape[1], device=input_ids.device)
+    past_key_values = StaticCache(config=model.config, max_cache_len=cache_capacity) if cache_capacity is not None else None
 
     # Warm up the prompt-forward path. Do not reuse this run's cache.
     warmup_outputs = model(
         input_ids=input_ids, attention_mask=attention_mask,
-        position_ids=position_ids, use_cache=True,
+        position_ids=position_ids, cache_position=cache_position,
+        past_key_values=past_key_values, use_cache=True,
     )
-    del warmup_outputs
+    del warmup_outputs, past_key_values
     _synchronize(model.device)
     if model.device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(model.device)
+    past_key_values = StaticCache(config=model.config, max_cache_len=cache_capacity) if cache_capacity is not None else None
     prefill_start = perf_counter()
     # Prefill: process the entire prompt once.
     outputs = model(
         input_ids=input_ids, attention_mask=attention_mask,
-        position_ids=position_ids, use_cache=True,
+        position_ids=position_ids, cache_position=cache_position,
+        past_key_values=past_key_values, use_cache=True,
     )
     _synchronize(model.device)
     prefill_seconds = perf_counter() - prefill_start
     past_key_values = outputs.past_key_values
-    prefill = _cache_snapshot(past_key_values, model.config)
+    # Track processed slots explicitly: older StaticCache length queries count
+    # nonzero keys and can undercount zero-valued padding or legitimate zero keys.
+    processed_positions = input_ids.shape[1]
+    prefill = _cache_snapshot(past_key_values, model.config, processed_positions, cache_capacity)
     decode_start = None
     decode_seconds = 0.0
 
@@ -108,17 +125,20 @@ def generate_cached(model, model_inputs, *, max_new_tokens, pad_token_id):
             decode_start = perf_counter()
         attention_mask = torch.cat([attention_mask, torch.ones_like(next_token)], dim=1)
         position_ids = position_ids[:, -1:] + 1
+        cache_position = cache_position[-1:] + 1
         # Dense batches keep finished rows; their EOS/padding still occupies cache positions.
         outputs = model(
             input_ids=next_token, attention_mask=attention_mask,
-            position_ids=position_ids, past_key_values=past_key_values, use_cache=True,
+            position_ids=position_ids, cache_position=cache_position,
+            past_key_values=past_key_values, use_cache=True,
         )
         past_key_values = outputs.past_key_values
+        processed_positions += 1
 
     if decode_start is not None:
         _synchronize(model.device)
         decode_seconds = perf_counter() - decode_start
-    final = _cache_snapshot(past_key_values, model.config)
+    final = _cache_snapshot(past_key_values, model.config, processed_positions, cache_capacity)
     generated_ids = []
     finish_reasons = []
     for row in torch.cat(generated, dim=1).tolist():
