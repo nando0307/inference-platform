@@ -55,7 +55,7 @@ class TimedStream(httpx.AsyncByteStream):
 
 
 class BenchmarkClientTests(unittest.TestCase):
-    def request(self, schedule, status=200, content_type="text/event-stream", *, cancel_after_text=False):
+    def request(self, schedule, status=200, content_type="text/event-stream", *, cancel_after_text=False, capture_events=False):
         clock = [0.0]
         self.last_stream = TimedStream(schedule, clock)
         transport = httpx.MockTransport(lambda request: httpx.Response(
@@ -69,6 +69,7 @@ class BenchmarkClientTests(unittest.TestCase):
                     return await run_request(
                         client, "http://benchmark.invalid", WORKLOAD, CASE, "measured", 1,
                         cancel_after_text=cancel_after_text,
+                        capture_events=capture_events,
                     )
         return asyncio.run(send())
 
@@ -105,6 +106,45 @@ class BenchmarkClientTests(unittest.TestCase):
         row = self.request([(0.1, frames[:23]), (0.4, frames[23:127]), (0.8, frames[127:])])
         self.assertEqual(row["status"], "success")
         self.assertEqual((row["completion_tokens"], row["finish_reason"]), (8, "length"))
+
+    def test_captured_stream_preserves_multitoken_and_empty_text_token_events(self):
+        first = chunk({"content": "Two tokens"})
+        first["choices"][0]["token_ids"] = [10, 11]
+        first["prompt_token_ids"] = list(range(12))
+        silent = chunk({"content": ""})
+        silent["choices"][0]["token_ids"] = [12]
+        row = self.request([
+            (0.1, event(chunk({"role": "assistant"}))),
+            (0.3, event(first)),
+            (0.6, event(silent)),
+            (0.7, event(chunk(finish="stop", counts=usage(completion=3)))),
+            (0.8, event("[DONE]")),
+        ], capture_events=True)
+        self.assertEqual(row["status"], "success")
+        self.assertEqual(row["text"], "Two tokens")
+        self.assertEqual(row["prompt_token_ids"], list(range(12)))
+        self.assertEqual(row["events"], [
+            {"elapsed_ms": 300, "text": "Two tokens", "token_ids": [10, 11]},
+            {"elapsed_ms": 600, "text": "", "token_ids": [12]},
+        ])
+        self.assertEqual(row["completion_tokens"], 3)
+        self.assertAlmostEqual(row["first_text_ms"], 300)
+        self.assertAlmostEqual(row["e2e_ms"], 800)
+
+    def test_invalid_or_conflicting_token_ids_do_not_pass_capture_validation(self):
+        for ids in ([True], [-1], ["12"], 12):
+            invalid = chunk({"content": "Text"})
+            invalid["choices"][0]["token_ids"] = ids
+            with self.subTest(ids=ids):
+                row = self.request([(0.1, event(invalid))], capture_events=True)
+                self.assertEqual((row["status"], row["error_code"]), ("error", "invalid_token_ids"))
+        first = {**chunk({"role": "assistant"}), "prompt_token_ids": [1, 2]}
+        second = {**chunk({"content": "Text"}), "prompt_token_ids": [1, 3]}
+        row = self.request([(0.1, event(first)), (0.2, event(second))], capture_events=True)
+        self.assertEqual((row["status"], row["error_code"]), ("error", "conflicting_prompt_token_ids"))
+        wrong_count = {**chunk(finish="stop", counts=usage()), "prompt_token_ids": [1, 2]}
+        row = self.request([(0.1, event(wrong_count)), (0.2, event("[DONE]"))], capture_events=True)
+        self.assertEqual((row["status"], row["error_code"]), ("error", "invalid_usage"))
 
     def test_role_only_zero_completion_has_no_first_text(self):
         row = self.request([

@@ -59,6 +59,12 @@ def _terminal_usage(usage, case, finish_reason):
     return counts
 
 
+def _token_ids(value):
+    if not isinstance(value, list) or any(type(token) is not int or token < 0 for token in value):
+        raise StreamError("invalid_token_ids")
+    return value
+
+
 async def _consume_stream(response, row, case, started, *, cancel_after_text=False):
     finish_reason = None
     usage = None
@@ -73,6 +79,8 @@ async def _consume_stream(response, row, case, started, *, cancel_after_text=Fal
                 raise StreamError("missing_usage")
             if row["first_text_ms"] is not None and usage["completion_tokens"] == 0:
                 raise StreamError("invalid_usage")
+            if row.get("prompt_token_ids") is not None and len(row["prompt_token_ids"]) != usage["prompt_tokens"]:
+                raise StreamError("invalid_usage")
             row["e2e_ms"] = (perf_counter() - started) * 1000
             done = True
             continue
@@ -84,6 +92,11 @@ async def _consume_stream(response, row, case, started, *, cancel_after_text=Fal
             raise StreamError("malformed_stream")
         if "error" in chunk:
             raise StreamError(_error_code(chunk, "stream_error"))
+        if "events" in row and chunk.get("prompt_token_ids") is not None:
+            prompt_ids = _token_ids(chunk["prompt_token_ids"])
+            if row["prompt_token_ids"] is not None and row["prompt_token_ids"] != prompt_ids:
+                raise StreamError("conflicting_prompt_token_ids")
+            row["prompt_token_ids"] = prompt_ids
         choices = chunk.get("choices")
         if not isinstance(choices, list) or len(choices) > 1:
             raise StreamError("malformed_stream")
@@ -103,6 +116,16 @@ async def _consume_stream(response, row, case, started, *, cancel_after_text=Fal
             content = delta.get("content")
             if content is not None and not isinstance(content, str):
                 raise StreamError("malformed_stream")
+            if "events" in row:
+                token_ids = choice.get("token_ids")
+                if token_ids is not None:
+                    token_ids = _token_ids(token_ids)
+                if content or token_ids:
+                    row["text"] += content or ""
+                    row["events"].append({
+                        "elapsed_ms": (perf_counter() - started) * 1000,
+                        "text": content or "", "token_ids": token_ids,
+                    })
             if content and row["first_text_ms"] is None:
                 row["first_text_ms"] = (perf_counter() - started) * 1000
                 if cancel_after_text:
@@ -122,7 +145,10 @@ async def _consume_stream(response, row, case, started, *, cancel_after_text=Fal
     row.update(usage, finish_reason=finish_reason, status="success")
 
 
-async def run_request(client, url, workload, case, phase, iteration, *, cancel_after_text=False):
+async def run_request(
+    client, url, workload, case, phase, iteration, *,
+    cancel_after_text=False, request_options=None, capture_events=False,
+):
     row = {
         "case": case["name"], "phase": phase, "iteration": iteration,
         "status": "error", "http_status": None, "request_id": None,
@@ -131,11 +157,14 @@ async def run_request(client, url, workload, case, phase, iteration, *, cancel_a
         "error_code": None,
     }
     payload = {
+        **(request_options or {}),
         "model": workload["model"], "messages": case["messages"],
         "max_tokens": case["max_tokens"], "temperature": workload["generation"]["temperature"],
         "top_p": workload["generation"]["top_p"], "stream": True,
     }
     started = perf_counter()
+    if capture_events:
+        row.update(started_at=started, text="", events=[], prompt_token_ids=None)
     try:
         async with client.stream("POST", url.rstrip("/") + "/v1/chat/completions", json=payload) as response:
             row["http_status"] = response.status_code

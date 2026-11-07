@@ -14,7 +14,7 @@ and the next task. Use [plan.md](plan.md) for the broader roadmap.
 
 The implementation now includes Phase 4 controlled concurrency: one inference
 worker, two FIFO waiting slots, cooperative cancellation, and bounded streaming.
-The suite has 135 passing tests, with real-Qwen lifecycle and HTTP smoke evidence.
+The suite has 153 passing tests, with real-Qwen lifecycle and HTTP smoke evidence.
 See the [Phase 4 evidence](logs/practice.md#phase-4-bounded-concurrency-and-cancellation)
 for the fixed-workload comparison and its limitations. Stage 5 now includes CPU
 and T4 static-batching measurements at sizes 1/2/4; the API remains sequential.
@@ -27,6 +27,11 @@ prove understanding.
 Stage 7 now includes a [CPU FP32/FP16/dynamic-INT8 comparison](#cpu-precision-and-quantization):
 six fixed-length speed observations and nine frozen quality tasks per format.
 FP32 and FP16 passed 8/9 tasks; QNNPACK dynamic INT8 passed 1/9, with instruction-following regressions.
+A [real T4 vLLM experiment](#continuous-batching-with-vllm) now demonstrates
+request refill while another stream continues. The existing API remains sequential;
+the engine comparison runs separately and does not establish a throughput improvement.
+A [matched Transformers-versus-vLLM runner](#transformers-versus-vllm-comparison)
+now reuses that client against both servers without changing the production API.
 The earlier GPU exploration completed a five-sample warm T4 run:
 3397.13 ms median inference duration and 36.86 output tokens/s for the 59/128 case.
 The matched-library CPU control observed 11604.62 ms and 10.96 output tokens/s.
@@ -840,6 +845,10 @@ timings are excluded from the repeated-run headline statistics.
   closure. A malformed or incomplete stream is an error, not a successful sample.
 - **Client first text:** request start to first nonempty content event; role-only
   events do not count.
+- **Opt-in engine capture:** the continuous-batching runner retains generated text,
+  returned token IDs, and stream-event timestamps. Event gaps are delivery-chunk
+  gaps, not necessarily per-token latency. The ordinary client still omits text
+  and event capture unless explicitly requested.
 - **Model TTFT:** immediately before `model.generate()` to its first generated
   token callback. Includes generation setup/prefill, excludes our tokenization.
 - **Queue wait:** validated admission to actual worker entry. Client first-text
@@ -1267,3 +1276,218 @@ suppressed. The experiment does not isolate that warning's effect, establish
 general INT8 quality loss, or represent an MLX/GGUF backend. Nine simple tasks
 are a sanity check, not a general quality benchmark.
 See [the complete evidence and verification](logs/practice.md#cpu-precision-comparison-2026-11-06).
+
+## Continuous batching with vLLM
+
+`modal_continuous_batching.py` starts a private vLLM server and runs the
+`benchmarks/continuous_batching.py` client workload inside one bounded T4 function.
+The client controls arrivals; vLLM owns scheduling, model execution, and paged
+KV-cache management. There is no custom engine scheduler, public endpoint,
+persistent deployment, or change to the existing CPU API.
+
+Recorded command:
+
+```bash
+~/.venvs/modal/bin/modal run modal_continuous_batching.py \
+  --output benchmark-results/continuous-batching/t4-vllm-001.json
+```
+
+The file exists. Later runs require a fresh path and separate GPU approval.
+The runner allows one container, no automatic retries, and a 600-second function
+timeout. It terminates the server process group after collecting results.
+Image-build failures happen before the local entrypoint can write its artifact;
+the three encountered failures are preserved separately under
+`benchmark-results/continuous-batching/t4-vllm-build-001.json` through `003.json`.
+
+### Controlled configuration
+
+- vLLM 0.33.0 in an official Linux/amd64 image pinned by digest.
+- Same Qwen model/tokenizer revision as earlier experiments; Tesla T4, FP16
+  weights and KV cache. Observed attention backend: `TRITON_ATTN`.
+- Context limit 2048, at most two active sequences, 256-token scheduler budget,
+  GPU memory utilization setting 0.5.
+- Prefix caching disabled; chunked prefill enabled; eager execution.
+  `torch.compile`, CUDA graphs, and engine JIT-kernel warm-up are disabled.
+- The separate asynchronous-scheduling optimization is disabled. This does
+  **not** disable continuous batching.
+- Engine generation defaults are explicit: greedy requests, model EOS IDs
+  supplied as stop-token IDs, and `min_tokens=max_tokens` for fixed-length cases.
+  Natural-EOS control omits the minimum.
+- Weights are downloaded during CPU image build and used offline during the
+  GPU job. Local dependencies and earlier Torch environments are unchanged.
+
+Both measured scenarios use the same engine, not vLLM versus Transformers:
+
+1. One discarded 16-token warm-up request.
+2. **Sequential:** A, then B, then C.
+3. **Refill:** start A/B; after A finishes, submit C while B remains active.
+4. One separate natural-EOS control.
+
+A/B/C share the existing 59-token prompt and generate exactly 16/128/32 tokens.
+HTTP/SSE is measured over container loopback, excluding build, loading, startup,
+and warm-up. The artifact retains raw text/IDs, prompt-ID comparisons, usage,
+request IDs, planned/actual timelines, chunk gaps, and acceptance checks.
+
+### Observed refill and performance
+
+All eight requests succeeded, their returned prompt IDs matched local formatting,
+and every fixed-length request met its cap. The refill timeline, relative to
+that scenario's start:
+
+| Event | Time ms |
+|---|---:|
+| A first text | 31.99 |
+| B first text | 736.16 |
+| A `[DONE]` | 1851.91 |
+| C request start | 1852.44 |
+| C first text | 1899.32 |
+| C `[DONE]` | 2625.34 |
+| B `[DONE]` | 4525.47 |
+
+C produced text before B finished: waiting for the entire original group was
+not required. These are client-observed streaming events, not an engine
+scheduler or GPU-kernel trace.
+
+| Scenario | Output tokens | Elapsed ms | Aggregate output tokens/s |
+|---|---:|---:|---:|
+| Sequential | 176 | 4172.22 | 42.18 |
+| Refill | 176 | 4525.87 | 38.89 |
+
+Refill throughput was **7.81% lower in this observation**, despite successful
+admission and overlap. One batch-1 warm-up does not establish that two-active-
+request kernel paths are warm. Fixed order, single samples, eager settings, and
+different arrival schedules limit interpretation; no cause was isolated by
+profiling. This is not a static-batching ablation or a production speed claim.
+
+The natural control stopped at EOS after 10 tokens, below its cap of 32.
+It returned `Hello! How can I assist you today?`, so it passed stopping/stream
+checks but did not obey the one-word instruction. A/C token IDs matched between
+measured scenarios; B differed starting at token 92. Output equality and
+technical correctness are not established by successful serving.
+
+The full suite passed 145 tests, and the real GPU job passed all acceptance
+checks. See [the detailed evidence](logs/practice.md#t4-continuous-batching-with-vllm-2026-11-06)
+for request latencies, deployment fixes, warnings, and limitations.
+
+## Transformers versus vLLM comparison
+
+`modal_engine_comparison.py` runs the existing Transformers HTTP service, then
+vLLM, sequentially inside one T4 allocation. The baseline worker exits before the
+engine starts, so the two models do not compete for GPU memory. Both use the
+same pinned vLLM image, Qwen checkpoint, tokenizer, FP16 precision, and HTTP client.
+This is the existing application on the comparison's cloud software stack,
+not a reproduction of the older local package environment.
+
+The new `benchmarks/engine_comparison.py` injects a benchmark-only runtime into
+the real `src.api.app`. Production loading, one-worker scheduling, the two-slot
+queue, cancellation, and streaming remain unchanged. The normal API still loads
+CPU FP32. Its strict request schema is not expanded: only vLLM receives its
+vendor-specific streaming/token/minimum-generation fields.
+
+### Protocol and bounds
+
+Each backend receives 14 requests:
+
+| Phase | Requests | Used for comparison |
+|---|---:|---|
+| Sequential warm-up | A/B/C | No |
+| Concurrent/refill warm-up | A/B/C | No |
+| Sequential measurement | A/B/C | Yes |
+| Concurrent/refill measurement | A/B/C | Yes |
+| Natural-EOS warm-up | Hello | No |
+| Natural-EOS control | Hello | Stopping control only |
+
+A/B/C use the shared short prompt and exact output lengths 16/128/32, producing
+176 completion tokens per fixed scenario. Sequential admission waits for each
+predecessor. Refill starts A/B and admits C after A completes, with at most two
+HTTP requests in flight. Both backends receive the same closed-loop policy,
+not an identical externally timed arrival trace.
+
+Transformers suppresses EOS through a scoped change to each fresh generation
+configuration; vLLM receives `min_tokens=max_tokens`. The baseline scope restores
+the setting on success and failure, and never mutates shared model defaults.
+The natural controls omit the minimum and have a 32-token cap.
+
+Startup and discarded warm-ups are excluded from scenario throughput. Results
+retain individual first-text/E2E times, usage, output text, request timelines,
+and actual token IDs where available. Baseline input-ID matching is observed
+at the model boundary during discarded warm-ups, not invented HTTP fields.
+Baseline non-overlap is expected and is not an acceptance failure.
+
+One observation per scenario is not a stable speedup claim. Chunk delivery gaps
+are not token/kernel timings. Fixed execution order, engine kernels, stream
+buffering, and different actual completion-driven arrivals remain confounders.
+No percentiles, quality equivalence, or memory-saving claim is inferred.
+
+The cloud job allows one T4 container, four CPUs, 8192 MiB host memory, zero
+minimum containers, and no retries. A shared 480-second internal deadline spans
+both backends within a 600-second hard function limit. Servers remain on loopback;
+there is no persistent endpoint. Process-group cleanup checks surviving
+descendants even after the original leader exits and records forced termination.
+Baseline failures abort before starting vLLM.
+
+### Commands and verification
+
+The entrypoint works in the separate SDK-only environment:
+
+```bash
+~/.venvs/modal/bin/modal run modal_engine_comparison.py --help
+```
+
+Cloud execution requires explicit approval and a fresh output path:
+
+```bash
+~/.venvs/modal/bin/modal run modal_engine_comparison.py \
+  --output benchmark-results/engine-comparison/t4-transformers-vllm-001.json
+```
+
+Local verification passed **153 tests** and a real cached-Qwen, CPU-FP32
+loopback HTTP exercise of all 14 requests. Every fixed count matched, both
+natural controls stopped after 10 tokens, warm-up input IDs matched, model
+defaults were preserved, and server resources were released. That artifact,
+`benchmark-results/engine-comparison/cpu-http-smoke-001.json`, is functional
+evidence, not a GPU performance baseline.
+
+Additional real-process smoke checks covered ordinary termination, forced
+termination, and a surviving descendant after leader exit. Controlled failure
+checks preserved partial child results and remote errors, rejected failed
+baselines, and refused to overwrite existing evidence.
+
+### Recorded T4 comparison
+
+The command above completed one approved GPU invocation and saved the named
+artifact. That path now exists and must not be reused. All 28 requests returned
+HTTP 200 with distinct request IDs; all cross-backend acceptance checks passed.
+
+| Backend | Policy | Output tokens | Scenario ms | Output tokens/s |
+|---|---|---:|---:|---:|
+| Transformers | Sequential | 176 | 4074.64 | 43.19 |
+| vLLM | Sequential | 176 | 4143.77 | 42.47 |
+| Transformers | Concurrent/refill | 176 | 4033.85 | 43.63 |
+| vLLM | Concurrent/refill | 176 | 2983.86 | 58.98 |
+
+In this observation, vLLM throughput was **35.19% higher under the refill
+policy**, but **1.67% lower under sequential admission**, compared with
+Transformers. This is a whole-serving-stack comparison, not an isolation of
+batching or a particular attention kernel.
+
+For C under refill, first-text latency from its own request start was
+2987.20 ms on Transformers versus 46.77 ms on vLLM. On vLLM, C produced text
+at scenario time 420.20 ms and finished at 1139.15 ms, before B finished at
+2983.27 ms. The baseline kept C behind B, as its unchanged scheduler requires.
+
+First-text boundaries also differ in buffering: the first sequential A content
+chunk was `An ` on Transformers and `An` on vLLM. These are user-visible text
+measurements, not comparable internal first-token timestamps.
+
+Sequential A/B/C text matched across backends; refill A/C matched but B differed.
+Actual baseline output IDs were not captured, so no cross-backend token-ID
+parity is claimed. Both natural controls returned the same 10-token answer and
+stopped early, while failing the one-word instruction. Generated B explanations
+of prefill remained incorrect; this experiment does not establish output quality.
+
+Both process groups exited with code zero, without outer-runner SIGKILL
+escalation. vLLM's own shutdown still logged force-killing EngineCore and a
+semaphore cleanup warning. Modal reported the app completed; no endpoint remains.
+See the [full comparison evidence](logs/practice.md#transformers-versus-vllm-comparison-2026-11-06)
+for per-request measurements, runtime versions, and limitations.
