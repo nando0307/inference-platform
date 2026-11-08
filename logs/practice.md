@@ -15,7 +15,7 @@ against Hugging Face `generate()` for token-limit and EOS stopping, and an
 initial synchronized CPU/MPS float32 comparison. Do not restart the basics.
 
 Current API state: Stage 2 technical acceptance, Phase 3 benchmarks, and Phase 4
-bounded scheduling/cancellation are implemented. There are 153 passing tests.
+bounded scheduling/cancellation are implemented. There are 177 passing tests.
 Real-Qwen controls verify FIFO admission, queued removal, running disconnects,
 bounded streaming pressure, request-setting isolation, and both shutdown paths.
 See [the Phase 4 entry](#phase-4-bounded-concurrency-and-cancellation) for current
@@ -38,8 +38,13 @@ A subsequent matched Transformers-versus-vLLM comparison on one T4 passed all
 and 1.67% lower under sequential admission, each a single measured observation.
 Manual top-k/top-p lessons were explicitly skipped, not completed. Use the
 stable roadmap [plan.md](../plan.md), this evidence log, and actual code together.
+Stage 9 now has an opt-in explicit two-model router with one resident model, a
+bounded FIFO queue, pinned tokenization, and validated JSON/SSE responses. Two
+approved T4 runs exercised a Qwen3 smoke and the two-model lifecycle: three
+loads, cross-model FIFO, queued cancellation, clean process-group shutdown, and
+frozen quality tasks (8/9 low, 9/9 high).
 The latest checkpoint is the
-[Transformers-versus-vLLM comparison](#transformers-versus-vllm-comparison-2026-11-06).
+[explicit two-model routing run](#explicit-two-model-routing-2026-11-08-utc).
 The original CPU study and earlier T4 batching results remain preserved.
 
 ## Mentoring and edit permissions
@@ -3733,3 +3738,158 @@ scheduling, client first-text versus model TTFT, and why the low-load and
 concurrent results differ. The technical Stage 8 comparison is now exercised;
 independent learning acceptance remains separate. Stage 9 explicit multi-model
 routing is next only after agreement. Further GPU runs need fresh approval.
+
+## Explicit two-model routing: 2026-11-08 UTC
+
+### Approval and implemented scope
+
+The learner agreed to Stage 9 explicit model selection with bounded memory, then
+selected one Qwen3-only T4 smoke before any two-model lifecycle run. The smoke
+was limited to three completion attempts, one model load, one GPU invocation,
+no retries, and no persistent endpoint. After the smoke passed, the learner
+separately approved one lifecycle invocation: three loads, at most 32 completion
+attempts, 18 frozen quality scores, and no retries.
+
+Files added:
+
+- `src/vllm_engine.py`: pinned offline vLLM process-group lifecycle, tokenizer
+  preparation, startup readiness, and shared descendant-aware cleanup.
+- `src/model_router.py`: opt-in FastAPI app with one resident model, two active
+  leases plus two queued leases, cross-model FIFO, drain-before-switch, pinned
+  prompt/EOS IDs, validated JSON/SSE forwarding, and bounded shutdown.
+- `benchmarks/model_routing.py`: real-loopback smoke and lifecycle exercises
+  with request budgets, identity/tokenization checks, memory observations, and
+  frozen quality scoring.
+- `modal_model_routing.py`: one private T4 allocation per phase, build-time
+  checkpoint downloads, and offline GPU containers.
+- `tests/test_model_router.py`: 24 deterministic router and endpoint tests.
+
+Files changed:
+
+- `modal_engine_comparison.py`: reuses `stop_process_group` instead of its own
+  duplicate cleanup copy.
+
+Production `src/api.py`, `src/inference.py`, and `src/streaming.py` are
+unchanged; the CPU API remains sequential and single-model.
+
+### Policy evidence from tests
+
+- Unknown model identifiers return 422 before any engine call or load.
+- Two simultaneous cold requests share one load and one lifecycle pump.
+- Cross-model FIFO prevents a later low-model request from overtaking a queued
+  high-model request; a model switch waits for active leases to finish.
+- Queued cancellation removes the FIFO entry without a switch; active
+  cancellation drains peers and recycles the process group before admitting
+  another generation.
+- Failed loads, dead processes, failed cleanup, wrong served model, wrong request
+  identity, missing prompt token IDs, truncated streams, invalid usage, and
+  oversized bodies fail closed with sanitized errors.
+- Lexical `../`, URLs, and unknown fields in the request contract are rejected;
+  no model value becomes a path or command.
+
+The full suite passed **177 tests**. These are protocol and scheduling checks
+against a fake engine and a real loopback ASGI upstream, not model performance
+proof.
+
+### Recorded T4 smoke
+
+Command (one approved invocation):
+
+```bash
+~/.venvs/modal/bin/modal run modal_model_routing.py \
+  --mode smoke --output benchmark-results/model-routing/t4-qwen3-smoke-001.json
+```
+
+Artifact: `benchmark-results/model-routing/t4-qwen3-smoke-001.json`.
+Status `completed`; all 15 checks true.
+
+| Case | Stream | Prompt | Output | Finish | First text ms | E2E ms | Text |
+|---|---|---:|---:|---|---:|---:|---|
+| One word | No | 19 | 2 | `stop` | - | 77787.31 | `Hello` |
+| 2 + 2 | Yes | 26 | 2 | `stop` | 70.38 | 100.55 | `4` |
+| 200-count cap 1 | Yes | 35 | 1 | `length` | 38.53 | 39.54 | `1` |
+
+The non-stream E2E includes the cold 75076.42 ms load, so its duration is not a
+serving latency. Generated token IDs were `[9707, 151645]`, `[19, 151645]`, and
+`[16]`; the first two ended on EOS 151645. Every request used a distinct
+generated `x-request-id`, and each response `id` was `chatcmpl-<request-id>`.
+Prompt token IDs returned by vLLM matched the router's own-tokenizer preparation,
+and no thinking/reasoning fields appeared.
+
+Device memory (`nvidia-smi`, whole T4, all processes and CUDA overhead):
+4 MiB before load, 7606 MiB with Qwen3-1.7B resident, 4 MiB after cleanup.
+The process group stopped in 708.11 ms with `forced: false`, `error: null`,
+exit code zero, and `shutdown_clean: true`.
+
+### Recorded two-model lifecycle
+
+A second approved T4 invocation (same cached image) ran 26 completion attempts
+with three loads:
+
+```bash
+~/.venvs/modal/bin/modal run modal_model_routing.py \
+  --mode lifecycle --output benchmark-results/model-routing/t4-two-model-lifecycle-001.json
+```
+
+Artifact: `benchmark-results/model-routing/t4-two-model-lifecycle-001.json`.
+Status `completed`; all 24 checks true.
+
+| Order | Model | Startup ms | Unload ms | Forced |
+|---|---|---:|---:|---|
+| 1 | `Qwen/Qwen2.5-0.5B-Instruct` | 73560.54 | 605.72 | No |
+| 2 | `Qwen/Qwen3-1.7B` | 65881.53 | 505.42 | No |
+| 3 | `Qwen/Qwen2.5-0.5B-Instruct` | 48008.74 | 556.30 | No |
+
+Lifecycle observations:
+
+- Two warm streams and nine frozen quality requests ran on the low model. Its
+  first stream included the cold load (`first_text 74984.40 ms`, `E2E 76073.98
+  ms`); the second warm stream reached first text in 31.51 ms.
+- `low_active` ran a 128-token capped prompt while `high_queued` waited. The
+  manager recorded the low lease's release before the single high load, and the
+  high request's first text came 67940.10 ms after its own start because it
+  included the 65881.53 ms high-model startup.
+- A later low request queued behind the high head was canceled while waiting.
+  It produced a `canceled` manager event, no `admitted` event, and no HTTP
+  completion (`E2E 6.24 ms` to cancellation).
+- Two high requests were queued during the switch and admitted together
+  (admitted events reached `active == 2`). Both streams returned exactly 128
+  tokens with `finish_reason: length`.
+- Returning to the low model loaded it a third time. After the two returning
+  streams, readiness reported the low model again.
+- The unknown-model request returned 422 with no additional load.
+- Frozen quality tasks: low model 8/9, high model 9/9. The only failure was the
+  low model's JSON task, which wrapped the object in a ```json fence. High-model
+  output was the bare object. Nine greedy single samples do not rank quality.
+
+Device memory was 6 MiB before the first load, 7612 MiB with the low model
+resident, 7608 MiB with the high model resident, 7612 MiB after returning to the
+low model, and 6 MiB after cleanup. Both models launch with
+`--gpu-memory-utilization 0.5`, so this whole-device number is dominated by the
+KV-cache reservation and does not measure checkpoint weights.
+
+Warm short-prompt first text was about 31.5 ms (low) and 37.9-47.8 ms (high).
+Requests issued during a switch waited 48-74 s for drain, load, and admission.
+Those numbers are not matched latency comparisons.
+
+### Warnings and limitations
+
+vLLM's own shutdown still logged force-killing EngineCore and Python reported one
+leaked semaphore at interpreter exit in both runs; neither was suppressed. All
+requests had already completed, and the outer router reported every unload as
+stopped, unforced, error-free, and exit code zero.
+
+These are single observations of two checkpoints on one T4. They do not show
+throughput, GPU kernel overlap, relative model quality, or a stable latency
+difference. Timing includes queueing and model switches where noted; memory is
+whole-device `nvidia-smi` usage, not peak or per-model allocation. Failure
+injection (crashed engine, failed load, unclean cleanup) is covered only by
+deterministic local tests, not by a GPU run. The quality cases use greedy
+decoding and score exact task constraints; scores never gated infrastructure
+success and are not a benchmark of model quality.
+
+Next: have the learner explain why an application queue and a vLLM scheduler are
+different owners, why a model switch must drain before unloading, and what the
+router validates instead of trusting from an "OpenAI-compatible" upstream.
+Further GPU runs, repetitions, or a latency/quality router need fresh approval
+and new artifact paths.

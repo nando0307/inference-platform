@@ -10,6 +10,7 @@ from benchmarks.common import write_json
 from benchmarks.workloads import MODEL_ID
 from modal_continuous_batching import ENGINE_IMAGE, ENGINE_VERSION, image as engine_image
 from modal_inference import REVISION
+from src.vllm_engine import stop_process_group
 
 
 app = modal.App("inference-qwen-engine-comparison")
@@ -17,7 +18,7 @@ image = engine_image
 # The inherited image already includes common, workloads, client, continuous_batching,
 # and modal_inference. Mount only the additional source files, never saved results.
 for relative in (
-    "src/api.py", "src/inference.py", "src/streaming.py",
+    "src/api.py", "src/inference.py", "src/streaming.py", "src/vllm_engine.py",
     "benchmarks/engine_comparison.py", "modal_continuous_batching.py",
     "modal_engine_comparison.py",
 ):
@@ -52,44 +53,6 @@ def _required_checks_pass(record):
     return True
 
 
-def _stop_process_group(process, *, terminate_seconds=10, kill_seconds=5):
-    """Reap the leader and wait for its entire session group, not just Popen.wait()."""
-    import os
-    import signal
-    from time import sleep
-
-    started = perf_counter()
-    cleanup = {"stopped": False, "forced": False, "error": None}
-
-    def group_exists():
-        process.poll()  # Reap an exited leader even when descendants are still alive.
-        try:
-            os.killpg(process.pid, 0)
-        except ProcessLookupError:
-            return False
-        return True
-
-    try:
-        for sig, seconds in ((signal.SIGTERM, terminate_seconds), (signal.SIGKILL, kill_seconds)):
-            if not group_exists():
-                cleanup["stopped"] = True
-                break
-            if sig == signal.SIGKILL:
-                cleanup["forced"] = True
-            try:
-                os.killpg(process.pid, sig)
-            except ProcessLookupError:
-                pass
-            deadline = perf_counter() + seconds
-            while group_exists() and perf_counter() < deadline:
-                sleep(min(0.05, max(0, deadline - perf_counter())))
-        cleanup["stopped"] = not group_exists()
-        if not cleanup["stopped"]:
-            cleanup["error"] = "Process group remained after SIGTERM and SIGKILL."
-    except (Exception, KeyboardInterrupt) as error:
-        cleanup["error"] = f"{type(error).__name__}: {error}"
-    cleanup.update(returncode=process.poll(), elapsed_ms=(perf_counter() - started) * 1000)
-    return cleanup
 
 
 def _run_baseline(record, *, deadline, output):
@@ -123,7 +86,7 @@ def _run_baseline(record, *, deadline, output):
         failure = error
     finally:
         if process is not None:
-            cleanup = _stop_process_group(process)
+            cleanup = stop_process_group(process)
         try:
             with Path(output).open(encoding="utf-8") as source:
                 child = json.load(source)
@@ -340,7 +303,7 @@ def run_benchmark():
         traceback.print_exc()
     finally:
         if process is not None:
-            cleanup = _stop_process_group(process)
+            cleanup = stop_process_group(process)
             engine["process_cleanup"] = cleanup
             engine["checks"]["process_stopped_cleanly"] = (
                 cleanup["stopped"] and not cleanup["forced"] and cleanup["error"] is None

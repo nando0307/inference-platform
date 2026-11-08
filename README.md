@@ -14,7 +14,7 @@ and the next task. Use [plan.md](plan.md) for the broader roadmap.
 
 The implementation now includes Phase 4 controlled concurrency: one inference
 worker, two FIFO waiting slots, cooperative cancellation, and bounded streaming.
-The suite has 153 passing tests, with real-Qwen lifecycle and HTTP smoke evidence.
+The suite has 177 passing tests, with real-Qwen lifecycle and HTTP smoke evidence.
 See the [Phase 4 evidence](logs/practice.md#phase-4-bounded-concurrency-and-cancellation)
 for the fixed-workload comparison and its limitations. Stage 5 now includes CPU
 and T4 static-batching measurements at sizes 1/2/4; the API remains sequential.
@@ -37,6 +37,11 @@ The earlier GPU exploration completed a five-sample warm T4 run:
 The matched-library CPU control observed 11604.62 ms and 10.96 output tokens/s.
 The resulting 3.42x median ratio is cross-platform evidence, not an isolated
 hardware-speedup claim.
+Stage 9 now adds an opt-in [explicit two-model router](#explicit-two-model-routing)
+with one resident model, a bounded FIFO queue, pinned tokenization, and validated
+JSON/SSE responses. Two approved T4 runs exercised a Qwen3 smoke and the full
+two-model lifecycle: three loads, cross-model FIFO, queued cancellation, a clean
+process-group shutdown, and frozen quality tasks (8/9 low, 9/9 high).
 
 ## Explore the codebase with Understand Anything
 
@@ -1491,3 +1496,133 @@ escalation. vLLM's own shutdown still logged force-killing EngineCore and a
 semaphore cleanup warning. Modal reported the app completed; no endpoint remains.
 See the [full comparison evidence](logs/practice.md#transformers-versus-vllm-comparison-2026-11-06)
 for per-request measurements, runtime versions, and limitations.
+
+## Explicit two-model routing
+
+`src/model_router.py` is an opt-in FastAPI app that owns two pinned checkpoints
+behind one private, single-resident vLLM process group from
+`src/vllm_engine.py`. It runs only on the pinned Linux/T4 image; the production
+CPU API is unchanged.
+
+### Policy and bounds
+
+- The request `model` field must be exactly `Qwen/Qwen2.5-0.5B-Instruct` or
+  `Qwen/Qwen3-1.7B`. Unknown identifiers return 422 before any load or process
+  work. No request value reaches a path, download, or command.
+- One model is resident at a time. At most two completions are active and two
+  more wait in a strict FIFO queue shared across models, so a later low-model
+  request cannot overtake a queued high-model request.
+- A model switch drains active work, stops the process group, and loads the next
+  checkpoint. One lifecycle pump owns every load and unload, so simultaneous
+  requests cannot trigger duplicate loads.
+- Each request is pinned before admission: formatted-prompt token IDs, chat
+  template hash, EOS IDs, and a 2048-token context bound are computed with the
+  same revision's tokenizer. Prompt plus `max_tokens` over that bound returns
+  400 `context_length_exceeded` without loading a model.
+- Responses are validated, not trusted: upstream `id` must equal
+  `chatcmpl-<request-id>`, served model must match, prompt token IDs must match
+  the pinned preparation, completion token IDs are forwarded, usage is checked
+  against the prompt and output cap, and thinking/reasoning fields are rejected.
+  JSON and SSE share these checks; a truncated or malformed stream returns an
+  error event and no success marker.
+- A failed load, lost process, or failed upstream closes admission and fails
+  queued work with a sanitized error instead of retrying or switching models.
+  Shutdown drains, stops the group, and reports unclean cleanup.
+
+### Commands and verification
+
+Local behavioral tests use a fake engine plus a real loopback ASGI upstream:
+
+```bash
+.venv/bin/python -m unittest discover -s tests
+```
+
+That suite passed **177 tests**, including 24 router tests covering FIFO order,
+capacity, cold-load sharing, drain before switch, queued and active cancellation,
+load/process/cleanup failures, strict schema rejection, identity mismatches,
+missing prompt IDs, truncated streams, and shutdown ownership.
+
+Cloud execution uses two separately approved, gated invocations; `--help` needs
+neither the Modal SDK nor a GPU:
+
+```bash
+~/.venvs/modal/bin/modal run modal_model_routing.py \
+  --mode smoke --output benchmark-results/model-routing/t4-qwen3-smoke-001.json
+~/.venvs/modal/bin/modal run modal_model_routing.py \
+  --mode lifecycle --output benchmark-results/model-routing/t4-two-model-lifecycle-001.json
+```
+
+### Recorded Qwen3 smoke (2026-11-08 UTC)
+
+One T4 invocation, three requests, one model load, zero retries. All 15 checks
+passed; the artifact is
+`benchmark-results/model-routing/t4-qwen3-smoke-001.json`.
+
+| Case | Stream | Prompt tokens | Output tokens | Finish | First text ms | E2E ms | Output |
+|---|---|---:|---:|---|---:|---:|---|
+| Reply with one word | No | 19 | 2 | `stop` | - | 77787.31 | `Hello` |
+| 2 + 2, integer only | Yes | 26 | 2 | `stop` | 70.38 | 100.55 | `4` |
+| Count to 200, cap 1 | Yes | 35 | 1 | `length` | 38.53 | 39.54 | `1` |
+
+The first E2E time includes the cold load of Qwen3-1.7B (75076.42 ms to ready).
+Device-level `nvidia-smi` used memory was 4 MiB before the load, 7606 MiB with
+Qwen3 resident, and 4 MiB after cleanup; the process group stopped in 708.11 ms
+with `forced: false`, no error, and exit code zero. vLLM still logged
+force-killing its EngineCore and one leaked-semaphore warning during its own
+shutdown. These warnings were not suppressed.
+
+### Recorded two-model lifecycle (2026-11-08 UTC)
+
+One approved T4 invocation, 26 completion attempts, three model loads, zero
+retries. All 24 checks passed; the artifact is
+`benchmark-results/model-routing/t4-two-model-lifecycle-001.json`.
+
+| Order | Resident model | Startup ms | Unload ms | Forced kill |
+|---|---|---:|---:|---|
+| 1 | `Qwen/Qwen2.5-0.5B-Instruct` | 73560.54 | 605.72 | No |
+| 2 | `Qwen/Qwen3-1.7B` | 65881.53 | 505.42 | No |
+| 3 | `Qwen/Qwen2.5-0.5B-Instruct` | 48008.74 | 556.30 | No |
+
+Observed lifecycle behavior:
+
+- Two warm-up and nine frozen quality requests ran on the low model before any
+  switch; eight of nine quality tasks passed.
+- One low-model request stayed active while a high-model request waited. The
+  high model loaded only after the active lease was released, and the later
+  low-model request behind it was not admitted first.
+- A third low-model request was canceled while queued: it produced a `canceled`
+  manager event and no `admitted` event, and the HTTP client observed no
+  completion.
+- Two high-model requests were queued during the switch and were admitted
+  together afterwards. Both hit their 128-token cap with exactly 128 completion
+  tokens and `finish_reason: length`.
+- Returning to the low model triggered the third load; the unknown-model request
+  returned 422 without another load.
+- Frozen quality scores: low model 8/9, high model 9/9. Only the low model's JSON
+  task failed, with the answer wrapped in a ```json fence. Single greedy samples
+  of nine tasks are not a quality ranking.
+
+Device-level `nvidia-smi` memory was 6 MiB before the first load, about 7.6 GiB
+while either model was resident, and 6 MiB after cleanup. This metric cannot
+separate weights from vLLM's KV-cache reservation, because both models run with
+`--gpu-memory-utilization 0.5` on a 15360 MiB T4. After a warm prompt, first
+text was about 31.5 ms on the low model and 37.9-47.8 ms on the high model, but
+requests issued during a switch included 48-74 s of drain, load, and admission.
+Those are not matched latency observations.
+
+vLLM again logged force-killing its EngineCore and one leaked-semaphore warning
+during shutdown; the outer router still reported every unload as stopped,
+unforced, error-free, and exit code zero. All 25 completed requests had distinct
+request IDs and `chatcmpl-<request-id>` response identities, and every returned
+prompt tokenization matched the router's own preparation.
+
+### Limits
+
+These are single observations on one T4. They do not establish throughput,
+relative model quality, GPU kernel overlap, or a stable latency comparison.
+Timing includes queueing and model switches where noted; memory is whole-device
+`nvidia-smi` usage, not peak allocation. Failure injection (crashed engine,
+failed load, unclean cleanup) is covered only by deterministic local tests, not
+by a GPU run. See the
+[practice log](logs/practice.md#explicit-two-model-routing-2026-11-08-utc)
+for the full evidence and limits.
