@@ -1,6 +1,7 @@
 import asyncio
 import gc
 import json
+import os
 import unittest
 
 from threading import Event, Timer, get_ident
@@ -822,6 +823,146 @@ class CompletionEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("POST", wrong_method.headers["allow"])
         self.assertNotIn("error", missing.json())
         self.assertNotIn("error", wrong_method.json())
+
+
+class MetricsTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        loader_patch = patch("src.api.load_runtime", return_value=object())
+        loader_patch.start()
+        self.addCleanup(loader_patch.stop)
+        env = patch.dict(os.environ, {api.AUTH_TOKEN_ENV: ""})
+        env.start()
+        self.addCleanup(env.stop)
+        context = app.router.lifespan_context(app)
+        await context.__aenter__()
+        self.addAsyncCleanup(context.__aexit__, None, None, None)
+        self.client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        )
+        self.addAsyncCleanup(self.client.aclose)
+        self.request = ChatCompletionRequest.model_validate(request_data())
+        self.result = GenerationResult("answer", 3, [7, 2], "stop")
+
+    async def test_metrics_track_outcomes_errors_latency_and_tokens(self):
+        with patch("src.api.generate", return_value=self.result):
+            completed = await self.client.post("/v1/chat/completions", json=request_data())
+        self.assertEqual(completed.status_code, 200)
+        rejected = await self.client.post(
+            "/v1/chat/completions", json=request_data(model="other")
+        )
+        self.assertEqual(rejected.status_code, 422)
+
+        metrics = (await self.client.get("/metrics")).json()
+        self.assertEqual(metrics["requests"], {
+            "completed": 1, "rejected": 1, "failed": 0, "disconnected": 0,
+        })
+        self.assertEqual(metrics["errors"], {"invalid_request": 1})
+        self.assertEqual(metrics["tokens"]["prompt"], 3)
+        self.assertEqual(metrics["tokens"]["completion"], 2)
+        self.assertGreater(metrics["tokens"]["completion_per_second"], 0)
+        self.assertEqual(metrics["latency_ms"]["count"], 2)
+        self.assertIsNotNone(metrics["latency_ms"]["p95"])
+        self.assertEqual(metrics["queue"], {"capacity": 2, "queued": 0, "in_flight": 0})
+        self.assertGreater(metrics["memory"]["process_peak_rss_bytes"], 0)
+
+    async def test_oversized_body_is_rejected_before_admission(self):
+        oversized = request_data(
+            messages=[{"role": "user", "content": "x" * 70000}], max_tokens=1
+        )
+        response = await self.client.post("/v1/chat/completions", json=oversized)
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(response.json()["error"]["code"], "request_too_large")
+        self.assertEqual(
+            response.headers["x-request-id"], response.json()["error"]["request_id"]
+        )
+        self.assertIsNone(app.state.active_job)
+        metrics = (await self.client.get("/metrics")).json()
+        self.assertEqual(metrics["errors"], {"request_too_large": 1})
+        self.assertEqual(metrics["requests"]["rejected"], 1)
+        self.assertEqual(metrics["latency_ms"]["count"], 1)
+
+    async def test_metrics_report_live_queue_depth(self):
+        started, release = Event(), Event()
+
+        def held(*args, **kwargs):
+            started.set()
+            if not release.wait(5):
+                raise TimeoutError("Producer was not released")
+            return self.result
+
+        jobs = []
+        try:
+            with patch("src.api.generate", side_effect=held):
+                jobs.append(submit_inference(app, self.request))
+                self.assertTrue(await asyncio.to_thread(started.wait, 2))
+                jobs.append(submit_inference(app, self.request))
+                jobs.append(submit_inference(app, self.request))
+                metrics = (await self.client.get("/metrics")).json()
+                self.assertEqual(
+                    metrics["queue"], {"capacity": 2, "queued": 2, "in_flight": 1}
+                )
+                ready = (await self.client.get("/ready")).json()
+                self.assertEqual(
+                    (ready["status"], ready["running"], ready["queued"]),
+                    ("full", 1, 2),
+                )
+        finally:
+            release.set()
+            await asyncio.gather(
+                *(job.result for job in jobs), return_exceptions=True
+            )
+
+
+class AuthTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        loader_patch = patch("src.api.load_runtime", return_value=object())
+        loader_patch.start()
+        self.addCleanup(loader_patch.stop)
+        self.client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        )
+        self.addAsyncCleanup(self.client.aclose)
+        self.result = GenerationResult("answer", 3, [7, 2], "stop")
+
+    async def test_metrics_are_unavailable_until_startup_succeeds(self):
+        response = await self.client.get("/metrics")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "not_ready")
+
+    async def test_bearer_token_gates_private_routes_when_configured(self):
+        secret = "correct-horse-battery-staple"
+        with patch.dict(os.environ, {api.AUTH_TOKEN_ENV: secret}):
+            async with app.router.lifespan_context(app):
+                self.assertEqual((await self.client.get("/health")).status_code, 200)
+                self.assertEqual((await self.client.get("/ready")).status_code, 200)
+                for response in (
+                    await self.client.get("/metrics"),
+                    await self.client.post(
+                        "/v1/chat/completions", json=request_data()
+                    ),
+                ):
+                    self.assertEqual(response.status_code, 401)
+                    self.assertEqual(response.json()["error"]["code"], "unauthorized")
+                    self.assertEqual(response.headers["www-authenticate"], "Bearer")
+                    self.assertNotIn(secret, response.text)
+                wrong = await self.client.post(
+                    "/v1/chat/completions", json=request_data(),
+                    headers={"Authorization": "Bearer wrong-token"},
+                )
+                self.assertEqual(wrong.status_code, 401)
+
+                headers = {"Authorization": f"Bearer {secret}"}
+                with patch("src.api.generate", return_value=self.result):
+                    allowed = await self.client.post(
+                        "/v1/chat/completions", json=request_data(), headers=headers
+                    )
+                self.assertEqual(allowed.status_code, 200)
+                metrics = await self.client.get("/metrics", headers=headers)
+                self.assertEqual(metrics.status_code, 200)
+                body = metrics.json()
+                self.assertEqual(body["errors"]["unauthorized"], 3)
+                self.assertEqual(body["requests"]["completed"], 1)
+                self.assertNotIn(secret, metrics.text)
 
 
 if __name__ == "__main__":

@@ -14,7 +14,7 @@ and the next task. Use [plan.md](plan.md) for the broader roadmap.
 
 The implementation now includes Phase 4 controlled concurrency: one inference
 worker, two FIFO waiting slots, cooperative cancellation, and bounded streaming.
-The suite has 177 passing tests, with real-Qwen lifecycle and HTTP smoke evidence.
+The suite has 182 passing tests, with real-Qwen lifecycle and HTTP smoke evidence.
 See the [Phase 4 evidence](logs/practice.md#phase-4-bounded-concurrency-and-cancellation)
 for the fixed-workload comparison and its limitations. Stage 5 now includes CPU
 and T4 static-batching measurements at sizes 1/2/4; the API remains sequential.
@@ -42,6 +42,10 @@ with one resident model, a bounded FIFO queue, pinned tokenization, and validate
 JSON/SSE responses. Two approved T4 runs exercised a Qwen3 smoke and the full
 two-model lifecycle: three loads, cross-model FIFO, queued cancellation, a clean
 process-group shutdown, and frozen quality tasks (8/9 low, 9/9 high).
+Stage 10 now adds a [metrics snapshot](#metrics) endpoint, optional bearer
+authentication, a 64 KiB request-body cap, and a verified local restart and
+failed-startup procedure. The roadmap in [plan.md](plan.md) ends here; the
+remaining items are independent learning checks.
 
 ## Explore the codebase with Understand Anything
 
@@ -505,6 +509,77 @@ work, removes any remaining queued jobs, signals running cancellation, and waits
 off the event loop for the actual worker to exit before releasing the runtime.
 A cancellation flag cannot interrupt a stuck native call; such a call can still
 prevent graceful shutdown and require process termination.
+
+### Optional bearer authentication
+
+`INFERENCE_API_TOKEN` gates `POST /v1/chat/completions` and `GET /metrics`.
+Unset or empty leaves both open, which is the documented mode for loopback use.
+
+```bash
+INFERENCE_API_TOKEN="$TOKEN" .venv/bin/python -m uvicorn src.api:app \
+  --host 127.0.0.1 --port 8000 --workers 1
+```
+
+`/health` and `/ready` remain unauthenticated for probes. A missing or wrong
+token returns 401 with `WWW-Authenticate: Bearer`; the token is never logged.
+Authentication runs before request logging, so unauthorized attempts produce no
+lifecycle log and no `x-request-id` header. They are counted in `/metrics` as
+`errors.unauthorized`.
+
+### Metrics
+
+`GET /metrics` returns one JSON snapshot from the current process. Counters reset
+on restart; nothing is aggregated across instances or processes.
+
+| Field | Meaning |
+|---|---|
+| `requests` | HTTP outcomes: `completed`, `rejected`, `failed`, `disconnected` |
+| `errors.<code>` | count per sanitized error code, for example `invalid_request` |
+| `queue` | live `capacity`, `queued`, and `in_flight` |
+| `latency_ms` | last 256 HTTP request durations with `p50`, `p95`, `max`, `last` |
+| `tokens` | prompt/completion totals; rate uses producer wall time only |
+| `memory.process_peak_rss_bytes` | process high-water RSS, including the model; not GPU memory |
+| `uptime_seconds` | seconds since this process initialized |
+
+If startup has not completed, `/metrics` returns 503 `not_ready`. The endpoint
+never includes prompts, outputs, headers, or exception messages.
+
+```json
+{
+  "queue": {"capacity": 2, "queued": 0, "in_flight": 0},
+  "requests": {"completed": 1, "rejected": 0, "failed": 0, "disconnected": 0},
+  "errors": {},
+  "latency_ms": {"count": 1, "p50": 1187.61, "p95": 1187.61, "max": 1187.61},
+  "tokens": {"prompt": 36, "completion": 4, "completion_per_second": 3.377},
+  "memory": {"process_peak_rss_bytes": 2127249408}
+}
+```
+
+## Operations and recovery
+
+Verified on this machine with the cached CPU checkpoint:
+
+- **Restart.** SIGTERM drained the listener, logged `Application shutdown
+  complete`, and left no listener on the port. A second process started normally
+  with fresh counters (`uptime_seconds` near zero, `requests.completed` zero).
+  Uvicorn 0.54 re-raises a captured SIGTERM after graceful shutdown, so the
+  process status is `-15` even though teardown completed; check the shutdown log
+  lines rather than an expected exit code of zero.
+- **Failed startup.** Starting with an empty `HF_HOME` plus
+  `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` aborted before serving:
+  `Application startup failed. Exiting.`, exit code 3, and no listener. The
+  service never answered `/ready`.
+- **Model cache.** Weights and tokenizers must already be cached or downloadable
+  at startup; `HF_HOME` selects the cache. Offline evaluation requires a
+  pre-populated cache. Loading happens once per process in the lifespan, and a
+  loading failure releases the runtime and stops startup.
+- **Credentials.** Supply the bearer token through the environment, never on the
+  command line or in committed files. The default bind is loopback; add
+  authentication, network limits, and TLS termination before exposing the
+  service beyond a trusted host.
+- **Resource bounds.** `max_tokens` is capped at 512, prompt-plus-output at the
+  model context limit, completion bodies at 64 KiB, the queue at two waiting jobs,
+  and one worker runs one generation at a time.
 
 ## Request an ordinary chat completion
 
@@ -1537,7 +1612,7 @@ Local behavioral tests use a fake engine plus a real loopback ASGI upstream:
 .venv/bin/python -m unittest discover -s tests
 ```
 
-That suite passed **177 tests**, including 24 router tests covering FIFO order,
+That suite passed **182 tests**, including 24 router and 5 operations tests covering FIFO order,
 capacity, cold-load sharing, drain before switch, queued and active cancellation,
 load/process/cleanup failures, strict schema rejection, identity mismatches,
 missing prompt IDs, truncated streams, and shutdown ownership.

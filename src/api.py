@@ -1,6 +1,10 @@
 import asyncio
+import hmac
 import json
 import logging
+import os
+import resource
+import sys
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -35,6 +39,10 @@ from .streaming import BoundedTextIteratorStreamer
 
 QUEUE_CAPACITY = 2
 STREAM_SEND_TIMEOUT = 5.0
+MAX_BODY_BYTES = 65536
+AUTH_TOKEN_ENV = "INFERENCE_API_TOKEN"
+AUTH_PATHS = frozenset({"/v1/chat/completions", "/metrics"})
+LATENCY_WINDOW = 256
 
 
 logger = logging.getLogger("inference.lifecycle")
@@ -44,11 +52,54 @@ if not logger.handlers:
     logger.addHandler(logging.StreamHandler())
 
 
+def _peak_rss_bytes() -> int:
+    """Process lifetime high-water RSS; ru_maxrss is bytes on macOS and KiB on Linux."""
+    value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return int(value if sys.platform == "darwin" else value * 1024)
+
+
+class _Metrics:
+    """Bounded in-process counters; never retains prompts, outputs, or exceptions."""
+
+    def __init__(self) -> None:
+        self.started = perf_counter()
+        self.outcomes = {"completed": 0, "rejected": 0, "failed": 0, "disconnected": 0}
+        self.errors: dict[str, int] = {}
+        self.durations: deque = deque(maxlen=LATENCY_WINDOW)
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.producer_ms = 0.0
+
+    def record(
+        self,
+        outcome: str,
+        error_code: str | None,
+        duration_ms: float,
+        prompt_tokens: int | None,
+        completion_tokens: int | None,
+        producer_ms: float | None,
+    ) -> None:
+        self.outcomes[outcome] = self.outcomes.get(outcome, 0) + 1
+        if error_code is not None:
+            self.errors[error_code] = self.errors.get(error_code, 0) + 1
+        self.durations.append(duration_ms)
+        if prompt_tokens is not None:
+            self.prompt_tokens += prompt_tokens
+            self.completion_tokens += completion_tokens or 0
+        if producer_ms is not None:
+            self.producer_ms += producer_ms
+
+    def record_rejection(self, code: str) -> None:
+        self.outcomes["rejected"] += 1
+        self.errors[code] = self.errors.get(code, 0) + 1
+
+
 @dataclass
 class _RequestLog:
     """Event-loop-owned metadata only; never retain bodies, results, or exceptions."""
 
     started: float
+    metrics: "_Metrics | None" = None
     request_id: str = field(default_factory=lambda: uuid4().hex)
     stream: bool | None = None
     http_status: int | None = None
@@ -59,6 +110,7 @@ class _RequestLog:
     completion_tokens: int | None = None
     queue_wait_ms: float | None = None
     cancellation_delay_ms: float | None = None
+    producer_duration_ms: float | None = None
     finished: bool = False
 
     def emit(self, event: str, **fields) -> None:
@@ -83,8 +135,9 @@ class _RequestLog:
         if self.finished:
             return
         self.finished = True
+        resolved = outcome or self.outcome
         fields = {
-            "outcome": outcome or self.outcome,
+            "outcome": resolved,
             "duration_ms": (perf_counter() - self.started) * 1000,
         }
         if self.error_code is not None:
@@ -99,6 +152,11 @@ class _RequestLog:
         if self.cancellation_delay_ms is not None:
             fields["cancellation_delay_ms"] = self.cancellation_delay_ms
         self.emit("request_finished", **fields)
+        if self.metrics is not None:
+            self.metrics.record(
+                resolved, self.error_code, fields["duration_ms"],
+                self.prompt_tokens, self.completion_tokens, self.producer_duration_ms,
+            )
 
     def scheduling_finished(
         self, job: "_InferenceJob", result: GenerationResult | None,
@@ -122,10 +180,11 @@ class _RequestLog:
         if requested_at is not None:
             metrics["cancellation_reason"] = job.cancellation.reason
         if job.started_at is not None:
+            self.producer_duration_ms = (job.finished_at - job.started_at) * 1000
             fields = {
                 **metrics,
                 "outcome": "completed",
-                "producer_duration_ms": (job.finished_at - job.started_at) * 1000,
+                "producer_duration_ms": self.producer_duration_ms,
             }
             if result is not None:
                 self.prompt_tokens = result.prompt_tokens
@@ -161,7 +220,7 @@ class _RequestLoggingMiddleware:
             await self.app(scope, receive, send)
             return
 
-        request_log = _RequestLog(perf_counter())
+        request_log = _RequestLog(perf_counter(), getattr(scope["app"].state, "metrics", None))
         scope_state = scope.setdefault("state", {})
         scope_state["request_log"] = request_log
 
@@ -228,6 +287,89 @@ class _RequestLoggingMiddleware:
             if not request_log.finished:
                 request_log.error_code = request_log.error_code or "generation_failed"
                 request_log.finish("failed")
+
+
+class _AuthMiddleware:
+    """Require a bearer token for private routes only when a token is configured."""
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope["path"] not in AUTH_PATHS:
+            await self.app(scope, receive, send)
+            return
+        state = scope["app"].state
+        token = getattr(state, "auth_token", None)
+        if token is None:
+            await self.app(scope, receive, send)
+            return
+        authorization = next(
+            (value.decode("latin-1") for name, value in scope["headers"]
+             if name == b"authorization"),
+            "",
+        )
+        scheme, _, presented = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not hmac.compare_digest(presented.strip(), token):
+            metrics = getattr(state, "metrics", None)
+            if metrics is not None:
+                metrics.record_rejection("unauthorized")
+            response = JSONResponse(
+                status_code=401,
+                content=_error_payload(
+                    "unauthorized", "A valid bearer token is required.", uuid4().hex,
+                ),
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+            await response(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
+class _BodyLimitMiddleware:
+    """Buffer at most MAX_BODY_BYTES, then replay the body to the application."""
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope["path"] != "/v1/chat/completions":
+            await self.app(scope, receive, send)
+            return
+        buffered = []
+        received = 0
+        while True:
+            message = await receive()
+            buffered.append(message)
+            if message["type"] != "http.request":
+                break
+            received += len(message.get("body", b""))
+            if received > MAX_BODY_BYTES:
+                request_log = scope.get("state", {}).get("request_log")
+                if request_log is not None:
+                    request_log.error("request_too_large")
+                response = JSONResponse(
+                    status_code=413,
+                    content=_error_payload(
+                        "request_too_large", "Request body is too large.",
+                        request_log.request_id if request_log is not None else uuid4().hex,
+                    ),
+                )
+                await response(scope, receive, send)
+                return
+            if not message.get("more_body", False):
+                break
+        replayed = 0
+
+        async def replay_receive():
+            nonlocal replayed
+            if replayed < len(buffered):
+                message = buffered[replayed]
+                replayed += 1
+                return message
+            return await receive()
+
+        await self.app(scope, replay_receive, send)
 
 
 class ChatMessage(BaseModel):
@@ -457,6 +599,8 @@ async def lifespan(app: FastAPI):
     state.active_job = None
     state.pending_jobs = deque()
     state.producer_futures = set()
+    state.metrics = _Metrics()
+    state.auth_token = os.environ.get(AUTH_TOKEN_ENV, "").strip() or None
 
     try:
         state.runtime = load_runtime()
@@ -480,10 +624,15 @@ async def lifespan(app: FastAPI):
                 return_exceptions=True,
             )
         state.runtime = None
+        state.metrics = None
+        state.auth_token = None
 
 
 app = FastAPI(lifespan=lifespan)
+app.add_middleware(_BodyLimitMiddleware)
 app.add_middleware(_RequestLoggingMiddleware)
+# Added last so authentication runs before logging and body handling.
+app.add_middleware(_AuthMiddleware)
 
 
 def _error_payload(code: str, message: str, request_id: str) -> dict:
@@ -792,3 +941,55 @@ async def ready(request: Request):
             "queued": queued, "queue_capacity": QUEUE_CAPACITY,
         },
     )
+
+
+def _percentile(ordered: list[float], fraction: float) -> float:
+    return ordered[min(len(ordered) - 1, int(fraction * (len(ordered) - 1) + 0.5))]
+
+
+@app.get("/metrics")
+async def metrics(request: Request):
+    state = request.app.state
+    counters = getattr(state, "metrics", None)
+    if counters is None:
+        return JSONResponse(
+            status_code=503,
+            content={"error": {
+                "code": "not_ready",
+                "message": "Metrics are unavailable until startup succeeds.",
+            }},
+        )
+    durations = sorted(counters.durations)
+    producer_seconds = counters.producer_ms / 1000
+    return {
+        "model": MODEL_ID,
+        "uptime_seconds": perf_counter() - counters.started,
+        "queue": {
+            "capacity": QUEUE_CAPACITY,
+            "queued": len(getattr(state, "pending_jobs", ())),
+            "in_flight": int(getattr(state, "active_job", None) is not None),
+        },
+        "requests": dict(counters.outcomes),
+        "errors": dict(counters.errors),
+        "latency_ms": {
+            "scope": "HTTP request duration at the ASGI boundary, including queueing",
+            "window": counters.durations.maxlen,
+            "count": len(durations),
+            "last": counters.durations[-1] if counters.durations else None,
+            "p50": _percentile(durations, 0.5) if durations else None,
+            "p95": _percentile(durations, 0.95) if durations else None,
+            "max": durations[-1] if durations else None,
+        },
+        "tokens": {
+            "scope": "prompt and completion totals; rate uses producer wall time only",
+            "prompt": counters.prompt_tokens,
+            "completion": counters.completion_tokens,
+            "completion_per_second": (
+                counters.completion_tokens / producer_seconds if producer_seconds else None
+            ),
+        },
+        "memory": {
+            "scope": "process lifetime high-water RSS; not current RSS or GPU memory",
+            "process_peak_rss_bytes": _peak_rss_bytes(),
+        },
+    }

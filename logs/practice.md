@@ -15,7 +15,7 @@ against Hugging Face `generate()` for token-limit and EOS stopping, and an
 initial synchronized CPU/MPS float32 comparison. Do not restart the basics.
 
 Current API state: Stage 2 technical acceptance, Phase 3 benchmarks, and Phase 4
-bounded scheduling/cancellation are implemented. There are 177 passing tests.
+bounded scheduling/cancellation are implemented. There are 182 passing tests.
 Real-Qwen controls verify FIFO admission, queued removal, running disconnects,
 bounded streaming pressure, request-setting isolation, and both shutdown paths.
 See [the Phase 4 entry](#phase-4-bounded-concurrency-and-cancellation) for current
@@ -43,8 +43,12 @@ bounded FIFO queue, pinned tokenization, and validated JSON/SSE responses. Two
 approved T4 runs exercised a Qwen3 smoke and the two-model lifecycle: three
 loads, cross-model FIFO, queued cancellation, clean process-group shutdown, and
 frozen quality tasks (8/9 low, 9/9 high).
+Stage 10 now exposes a per-process `/metrics` snapshot, optional bearer
+authentication, and a 64 KiB request-body cap. A local walkthrough verified
+restart, failed startup, unauthorized access, and oversized-body rejection. The
+roadmap now ends here; independent learning acceptance is the remaining piece.
 The latest checkpoint is the
-[explicit two-model routing run](#explicit-two-model-routing-2026-11-08-utc).
+[operations and metrics run](#operations-metrics-and-deployment-readiness-2026-11-08).
 The original CPU study and earlier T4 batching results remain preserved.
 
 ## Mentoring and edit permissions
@@ -3893,3 +3897,108 @@ different owners, why a model switch must drain before unloading, and what the
 router validates instead of trusting from an "OpenAI-compatible" upstream.
 Further GPU runs, repetitions, or a latency/quality router need fresh approval
 and new artifact paths.
+
+## Operations, metrics, and deployment readiness: 2026-11-08
+
+### Approval and implemented scope
+
+The learner approved the Stage 10 operations slice: an in-process metrics
+snapshot, optional bearer authentication, a request-body cap, and a verified
+restart and failed-startup procedure. No cloud run, new dependency, container,
+or persistent deployment target was added.
+
+Files changed:
+
+- `src/api.py`: `GET /metrics` snapshot, optional `INFERENCE_API_TOKEN` gate,
+  64 KiB request-body buffering limit, and counter updates at request
+  completion. All remain inside the existing single-process ASGI service.
+- `tests/test_api.py`: five operations tests for counters, live queue depth,
+  auth on/off, metrics before startup, and oversized bodies.
+- `README.md` and this log: operations guide, metric definitions, and the
+  measured restart/failure walkthrough.
+
+### Observable behavior
+
+`GET /metrics` returns one JSON snapshot from the current process:
+
+- `requests`: `completed`, `rejected`, `failed`, `disconnected`.
+- `errors`: counts per sanitized error code, including `unauthorized` and
+  `request_too_large`.
+- `queue`: live capacity, queued jobs, and in-flight jobs.
+- `latency_ms`: last 256 HTTP durations with p50, p95, max, and last.
+- `tokens`: prompt/completion totals; rate divides by producer wall time only.
+- `memory.process_peak_rss_bytes`: process high-water RSS, including the model,
+  not GPU memory.
+- `uptime_seconds`: seconds since this process initialized.
+
+Counters reset on restart. Before startup completes, `/metrics` returns 503
+`not_ready`. The snapshot never contains prompts, outputs, headers, or
+exception messages.
+
+`INFERENCE_API_TOKEN` enables a static bearer check for
+`POST /v1/chat/completions` and `GET /metrics`. Unset or empty leaves them open
+for loopback use. `/health` and `/ready` stay open for probes. Missing or wrong
+tokens return 401 with `WWW-Authenticate: Bearer`; the token is never logged.
+Authentication runs before logging, so unauthorized attempts have no lifecycle
+log and no `x-request-id` header but do increment `errors.unauthorized`.
+
+Request bodies are buffered by a middleware up to 65536 bytes and replayed to
+FastAPI. Larger bodies return 413 `request_too_large` before parsing or
+admission. That rejection flows through the request log, so its body
+`request_id`, `x-request-id` header, and log line agree.
+
+### Verified walkthrough
+
+Environment: this Mac, project `.venv`, cached `Qwen/Qwen2.5-0.5B-Instruct`
+CPU float32, uvicorn 0.54.0.
+
+```bash
+.venv/bin/python -m uvicorn src.api:app --host 127.0.0.1 --port 8011
+```
+
+Observed:
+
+- `/ready` returned 200 with `ready: true` after load. Initial `/metrics`
+  reported zero outcomes, empty errors, and peak RSS 1,794,408,448 bytes.
+- One non-stream completion returned 200 and `Hello! How can` with 36 prompt and
+  4 completion tokens. `/metrics` then reported `completed: 1`, latency
+  1187.61 ms, 3.377 completion tokens/s, and peak RSS 2,127,249,408 bytes.
+- A 70,103-byte JSON body returned 413 `request_too_large`. The response header
+  and body carried request ID `f464c397ee9e4193b7f4343e3a35ba7d`, matching the
+  `request_finished` log line with `outcome: rejected`.
+- SIGTERM logged `Shutting down`, `Application shutdown complete`, and
+  `Finished server process`. A restart answered `/ready` with fresh counters
+  (`uptime_seconds` 2.40, `completed: 0`). Uvicorn 0.54 re-raises the captured
+  SIGTERM after graceful shutdown, so the process status is `-15`; the log lines,
+  not a zero exit status, are the shutdown evidence.
+- With `INFERENCE_API_TOKEN` set, `/health` and `/ready` returned 200;
+  `/metrics`, a tokenless completion, and a wrong-token completion returned 401.
+  `errors.unauthorized` reached 3. An authorized completion returned 200.
+  Searching the service output for the token found zero occurrences.
+- An empty `HF_HOME` with `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` failed
+  during tokenizer/model loading: `Application startup failed. Exiting.`, exit
+  code 3, and no listener on the port. `/ready` was never served.
+
+The suite passed **182 tests**, including five new operations tests. Those cover
+counts and sanitized error codes, live `in_flight`/`queued` transitions, the 413
+path with matching request IDs, auth on/off for private routes, and metrics
+unavailable before startup.
+
+### Limits
+
+Metrics are in-process snapshots, not persisted time series; a restart discards
+them, and multiple processes would need external aggregation. Latency includes
+queueing and HTTP delivery. Peak RSS includes the loaded model and is not
+current, GPU, or per-request memory. Authentication is a single static token
+with no rotation, scopes, rate limiting, or TLS; it is a gate for trusted-host
+exposure, not an internet-facing security design. The body cap applies only to
+the completion route. There is no container or hosted deployment, so a new
+environment was not exercised beyond the documented local procedure. Failure
+evidence covers missing model files, not a full disk, port conflict, or OOM.
+
+Next: have the learner explain why readiness is a snapshot rather than a
+reservation, which metric would reveal queue saturation versus slow generation,
+and why authentication alone is insufficient for a public endpoint. A hosted or
+containerized deployment, TLS termination, and rate limiting need their own
+scope and approval.
+
