@@ -45,7 +45,8 @@ process-group shutdown, and frozen quality tasks (8/9 low, 9/9 high).
 Stage 10 now adds a [metrics snapshot](#metrics) endpoint, optional bearer
 authentication, a 64 KiB request-body cap, and a verified local restart and
 failed-startup procedure. The roadmap in [plan.md](plan.md) ends here; the
-remaining items are independent learning checks.
+remaining items are independent learning checks. Report-ready numbers and their
+scopes live in [the results summary](logs/results-summary.md).
 
 ## Explore the codebase with Understand Anything
 
@@ -464,13 +465,23 @@ See [the GPU batching result](logs/practice.md#first-t4-batching-result-2026-11-
 
 ## Run the local application
 
-From the repository root, using the existing project environment:
+From the repository root:
 
 ```bash
+python3.12 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python -m uvicorn src.api:app \
   --host 127.0.0.1 --port 8000 --workers 1
 ```
+
+`requirements.txt` pins the direct versions used for the recorded results:
+torch 2.14.1, transformers 5.18.0, pydantic 2.14.1, fastapi 0.143.3,
+uvicorn 0.54.0, and httpx 0.28.1. Transitive dependencies are not locked. The
+T4 jobs use a separately pinned image digest and vLLM version.
+
+A clean Python 3.12.13 venv created from these pins installed in 27.5 seconds,
+passed all 182 tests, served `/ready`, and completed one real request on
+2026-11-08.
 
 The lifespan loads `Qwen/Qwen2.5-0.5B-Instruct` once per application process on
 CPU in float32. Model files must be cached locally or downloadable. Importing
@@ -569,6 +580,9 @@ Verified on this machine with the cached CPU checkpoint:
   `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` aborted before serving:
   `Application startup failed. Exiting.`, exit code 3, and no listener. The
   service never answered `/ready`.
+- **Clean environment.** A Python 3.12.13 venv created from the pinned
+  `requirements.txt` installed in 27.5 s, passed 182 tests, answered `/ready`,
+  and completed one real request. Transitive versions still resolve freely.
 - **Model cache.** Weights and tokenizers must already be cached or downloadable
   at startup; `HF_HOME` selects the cache. Offline evaluation requires a
   pre-populated cache. Loading happens once per process in the lifespan, and a

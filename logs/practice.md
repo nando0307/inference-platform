@@ -3984,6 +3984,35 @@ counts and sanitized error codes, live `in_flight`/`queued` transitions, the 413
 path with matching request IDs, auth on/off for private routes, and metrics
 unavailable before startup.
 
+### Fresh environment acceptance
+
+Direct dependencies were pinned in `requirements.txt` to the versions used for
+the recorded results. On 2026-11-08, a clean venv was created with Python
+3.12.13 and those pins:
+
+```bash
+python3.12 -m venv /tmp/inference-fresh
+/tmp/inference-fresh/bin/python -m pip install -r requirements.txt
+/tmp/inference-fresh/bin/python -m unittest discover -s tests
+/tmp/inference-fresh/bin/python -m uvicorn src.api:app --host 127.0.0.1 --port 8013
+```
+
+Observed:
+
+- Installation completed in **27.5 s** with torch 2.14.1, transformers 5.18.0,
+  pydantic 2.14.1, fastapi 0.143.3, uvicorn 0.54.0, and httpx 0.28.1.
+- **182 tests passed** in 5.647 s from the clean environment.
+- `/ready` returned 200. One real completion returned 200 with `Hello! How can`,
+  36 prompt and 4 completion tokens.
+- `/metrics` reported one completed request, 1104.06 ms latency, 3.629
+  completion tokens/s, and 2,316,468,224 bytes peak RSS.
+- Shutdown completed normally.
+
+Transitive packages were not locked: the fresh install resolved tokenizers
+0.23.3, numpy 2.5.4, and huggingface-hub 2.4.0, while other recorded local runs
+used tokenizers 0.23.2. The cloud experiments remain pinned separately by image
+digest and vLLM version, with different direct versions.
+
 ### Limits
 
 Metrics are in-process snapshots, not persisted time series; a restart discards
@@ -3992,9 +4021,11 @@ queueing and HTTP delivery. Peak RSS includes the loaded model and is not
 current, GPU, or per-request memory. Authentication is a single static token
 with no rotation, scopes, rate limiting, or TLS; it is a gate for trusted-host
 exposure, not an internet-facing security design. The body cap applies only to
-the completion route. There is no container or hosted deployment, so a new
-environment was not exercised beyond the documented local procedure. Failure
-evidence covers missing model files, not a full disk, port conflict, or OOM.
+the completion route. The fresh-environment check covers a local macOS install
+and serving, not a different operating system or GPU host, and transitive
+dependencies still resolve freely. There is no container or hosted deployment.
+Failure evidence covers missing model files, not a full disk, port conflict, or
+OOM.
 
 Next: have the learner explain why readiness is a snapshot rather than a
 reservation, which metric would reveal queue saturation versus slow generation,

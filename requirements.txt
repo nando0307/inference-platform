@@ -1,8 +1,6 @@
-torch
-transformers
-pydantic>=2,<3
-fastapi
-uvicorn
-httpx
-
-
+torch==2.14.1
+transformers==5.18.0
+pydantic==2.14.1
+fastapi==0.143.3
+uvicorn==0.54.0
+httpx==0.28.1
