@@ -63,6 +63,19 @@ class Connection:
         ]
 
 
+class RecordingTrace:
+    def __init__(self):
+        self.metadata = {}
+        self.finishes = []
+
+    def update(self, **fields):
+        self.metadata.update({key: value for key, value in fields.items() if value is not None})
+
+    def finish(self, **fields):
+        self.finishes.append(fields)
+
+
+
 class StreamingTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         loader_patch = patch(
@@ -78,6 +91,128 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.addAsyncCleanup(self.client.aclose)
         self.result = GenerationResult("你好, world!", 12, [7, 8, 2], "stop")
+
+    async def test_trace_ends_after_terminal_delivery_with_actual_usage(self):
+        trace = RecordingTrace()
+        terminal_waiting, deliver_terminal = asyncio.Event(), asyncio.Event()
+
+        class HeldTerminalConnection(Connection):
+            async def send(self, message):
+                if message["type"] == "http.response.body" and not message.get("more_body", False):
+                    terminal_waiting.set()
+                    await deliver_terminal.wait()
+                await super().send(message)
+
+        def generate(*args, streamer, on_prepared, **kwargs):
+            on_prepared()
+            streamer.on_finalized_text(self.result.text, stream_end=True)
+            return self.result
+
+        with (
+            patch("src.api.start_request", return_value=trace),
+            patch("src.api.generate", side_effect=generate),
+        ):
+            connection = HeldTerminalConnection()
+            try:
+                await asyncio.wait_for(terminal_waiting.wait(), 2)
+                self.assertIsNone(app.state.active_job)
+                self.assertEqual(trace.finishes, [])
+            finally:
+                deliver_terminal.set()
+                await asyncio.wait_for(connection.task, 3)
+        self.assertEqual(trace.finishes, [
+            {"outcome": "completed", "http_status": 200, "error_code": None},
+        ])
+        self.assertEqual(trace.metadata["prompt_tokens"], 12)
+        self.assertEqual(trace.metadata["completion_tokens"], 3)
+        self.assertGreaterEqual(trace.metadata["queue_wait_ms"], 0)
+        self.assertGreaterEqual(trace.metadata["producer_duration_ms"], 0)
+        self.assertNotIn(self.result.text, json.dumps(trace.metadata))
+
+    async def test_disconnect_ends_trace_before_worker_without_inventing_usage(self):
+        trace = RecordingTrace()
+        release = Event()
+
+        def held(*args, streamer, on_prepared, **kwargs):
+            on_prepared()
+            streamer.on_finalized_text("private partial output")
+            if not release.wait(5):
+                raise TimeoutError("Producer was not released")
+            return self.result
+
+        with (
+            patch("src.api.start_request", return_value=trace),
+            patch("src.api.generate", side_effect=held),
+        ):
+            connection = Connection()
+            active = None
+            try:
+                await asyncio.wait_for(connection.content_sent.wait(), 2)
+                active = app.state.active_job
+                connection.disconnect()
+                await asyncio.wait_for(connection.task, 2)
+                self.assertFalse(active.producer.done())
+                self.assertEqual(trace.finishes, [
+                    {"outcome": "disconnected", "http_status": 200, "error_code": None},
+                ])
+                self.assertNotIn("prompt_tokens", trace.metadata)
+                self.assertNotIn("completion_tokens", trace.metadata)
+                self.assertNotIn("producer_duration_ms", trace.metadata)
+                terminal_metadata = dict(trace.metadata)
+            finally:
+                release.set()
+                await asyncio.gather(connection.task, return_exceptions=True)
+                if active is not None:
+                    await asyncio.gather(active.result, return_exceptions=True)
+        self.assertEqual(trace.metadata, terminal_metadata)
+        self.assertEqual(len(trace.finishes), 1)
+
+    async def test_disabled_tracing_preserves_response_and_metrics(self):
+        with (
+            patch.object(app.state, "tracer", None),
+            patch("src.telemetry.RequestTrace", side_effect=AssertionError("Tracing disabled")),
+            patch("src.api.generate", return_value=self.result),
+        ):
+            response = await self.client.post("/v1/chat/completions", json=payload(False))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["choices"][0]["message"]["content"], self.result.text)
+        self.assertEqual(response.json()["usage"]["completion_tokens"], 3)
+        metrics = (await self.client.get("/metrics")).json()
+        self.assertEqual(metrics["requests"]["completed"], 1)
+        self.assertEqual(metrics["tokens"]["completion"], 3)
+
+    async def test_auth_and_probe_exclusion_with_private_validation_rejection(self):
+        traces = []
+        secret = "PRIVATE-AUTH-TOKEN"
+
+        def start(*args, **kwargs):
+            trace = RecordingTrace()
+            traces.append(trace)
+            return trace
+
+        with (
+            patch.object(app.state, "auth_token", secret),
+            patch("src.api.start_request", side_effect=start),
+        ):
+            for path in ("/health", "/ready"):
+                self.assertEqual((await self.client.get(path)).status_code, 200)
+            headers = {"Authorization": f"Bearer {secret}"}
+            self.assertEqual((await self.client.get("/metrics", headers=headers)).status_code, 200)
+            unauthorized = await self.client.post("/v1/chat/completions", json=payload(False))
+            self.assertEqual(unauthorized.status_code, 401)
+            self.assertEqual(traces, [])
+            rejected = await self.client.post(
+                "/v1/chat/completions",
+                json={**payload(False), "model": "PRIVATE-INVALID-MODEL"},
+                headers={**headers, "X-Request-ID": "PRIVATE-CLIENT-ID"},
+            )
+        self.assertEqual(rejected.status_code, 422)
+        self.assertEqual(len(traces), 1)
+        self.assertEqual(traces[0].finishes, [
+            {"outcome": "rejected", "http_status": 422, "error_code": "invalid_request"},
+        ])
+        self.assertEqual(traces[0].metadata, {})
+        self.assertNotIn("PRIVATE", json.dumps([traces[0].metadata, traces[0].finishes]))
 
     async def test_incremental_content_and_truthful_terminal_usage(self):
         release = Event()
@@ -184,6 +319,7 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
     async def test_failure_with_or_without_sentinel_has_no_success_terminal(self):
         for sentinel in (False, True):
             with self.subTest(sentinel=sentinel):
+                trace = RecordingTrace()
                 release = Event()
 
                 def failing_generation(*args, streamer, on_prepared, **kwargs):
@@ -193,7 +329,10 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
                         raise TimeoutError("Producer was not released")
                     raise RuntimeError("PRIVATE-GENERATION")
 
-                with patch("src.api.generate", side_effect=failing_generation):
+                with (
+                    patch("src.api.generate", side_effect=failing_generation),
+                    patch("src.api.start_request", return_value=trace),
+                ):
                     connection = Connection()
                     try:
                         await asyncio.wait_for(connection.content_sent.wait(), 2)
@@ -214,6 +353,14 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
                     self.assertNotIn("usage", event)
                     if "choices" in event:
                         self.assertIsNone(event["choices"][0]["finish_reason"])
+                self.assertEqual(trace.finishes, [
+                    {"outcome": "failed", "http_status": 200, "error_code": "generation_failed"},
+                ])
+                self.assertNotIn("prompt_tokens", trace.metadata)
+                self.assertNotIn("completion_tokens", trace.metadata)
+                recorded = json.dumps([trace.metadata, trace.finishes])
+                self.assertNotIn("PRIVATE-GENERATION", recorded)
+                self.assertNotIn("Partial text", recorded)
                 with patch("src.api.generate", return_value=self.result):
                     recovered = await self.client.post("/v1/chat/completions", json=payload(False))
                 self.assertEqual(recovered.status_code, 200)

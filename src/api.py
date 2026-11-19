@@ -35,6 +35,7 @@ from .inference import (
     load_runtime,
 )
 from .streaming import BoundedTextIteratorStreamer
+from .telemetry import RequestTrace, close_tracer, create_tracer, start_request
 
 
 QUEUE_CAPACITY = 2
@@ -112,6 +113,7 @@ class _RequestLog:
     cancellation_delay_ms: float | None = None
     producer_duration_ms: float | None = None
     finished: bool = False
+    trace: RequestTrace | None = None
 
     def emit(self, event: str, **fields) -> None:
         logger.info(json.dumps({
@@ -156,6 +158,16 @@ class _RequestLog:
             self.metrics.record(
                 resolved, self.error_code, fields["duration_ms"],
                 self.prompt_tokens, self.completion_tokens, self.producer_duration_ms,
+            )
+        if self.trace is not None:
+            self.trace.update(
+                prompt_tokens=self.prompt_tokens,
+                completion_tokens=self.completion_tokens,
+                queue_wait_ms=self.queue_wait_ms,
+                producer_duration_ms=self.producer_duration_ms,
+            )
+            self.trace.finish(
+                outcome=resolved, http_status=self.http_status, error_code=self.error_code,
             )
 
     def scheduling_finished(
@@ -221,6 +233,9 @@ class _RequestLoggingMiddleware:
             return
 
         request_log = _RequestLog(perf_counter(), getattr(scope["app"].state, "metrics", None))
+        request_log.trace = start_request(
+            getattr(scope["app"].state, "tracer", None), request_log.request_id, backend="cpu",
+        )
         scope_state = scope.setdefault("state", {})
         scope_state["request_log"] = request_log
 
@@ -601,31 +616,37 @@ async def lifespan(app: FastAPI):
     state.producer_futures = set()
     state.metrics = _Metrics()
     state.auth_token = os.environ.get(AUTH_TOKEN_ENV, "").strip() or None
+    state.tracer = None
 
     try:
+        state.tracer = create_tracer()
         state.runtime = load_runtime()
         state.executor = ThreadPoolExecutor(max_workers=1)
         state.initialized = True
         yield
     finally:
-        # Uvicorn normally drains HTTP first. This handles any jobs left at teardown.
-        state.initialized = False
-        state.shutting_down = True
-        for job in tuple(state.pending_jobs):
-            cancel_inference(app, job, "shutdown")
-        if state.active_job is not None:
-            cancel_inference(app, state.active_job, "shutdown")
-        if state.executor is not None:
-            await asyncio.to_thread(state.executor.shutdown, wait=True)
-            state.executor = None
-        if state.producer_futures:
-            await asyncio.gather(
-                *(asyncio.shield(future) for future in state.producer_futures),
-                return_exceptions=True,
-            )
-        state.runtime = None
-        state.metrics = None
-        state.auth_token = None
+        try:
+            # Uvicorn normally drains HTTP first. This handles any jobs left at teardown.
+            state.initialized = False
+            state.shutting_down = True
+            for job in tuple(state.pending_jobs):
+                cancel_inference(app, job, "shutdown")
+            if state.active_job is not None:
+                cancel_inference(app, state.active_job, "shutdown")
+            if state.executor is not None:
+                await asyncio.to_thread(state.executor.shutdown, wait=True)
+                state.executor = None
+            if state.producer_futures:
+                await asyncio.gather(
+                    *(asyncio.shield(future) for future in state.producer_futures),
+                    return_exceptions=True,
+                )
+            state.runtime = None
+            state.metrics = None
+            state.auth_token = None
+        finally:
+            await close_tracer(getattr(state, "tracer", None))
+            state.tracer = None
 
 
 app = FastAPI(lifespan=lifespan)
@@ -864,6 +885,8 @@ async def _stream_completion(
 async def chat_completions(body: ChatCompletionRequest, request: Request):
     request_log = request.state.request_log
     request_log.stream = body.stream
+    if request_log.trace is not None:
+        request_log.trace.update(model=body.model, stream=body.stream)
     request_id = request_log.request_id
     created = int(time())
     try:

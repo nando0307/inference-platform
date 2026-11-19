@@ -483,6 +483,9 @@ A clean Python 3.12.13 venv created from these pins installed in 27.5 seconds,
 passed all 182 tests, served `/ready`, and completed one real request on
 2026-11-08.
 
+The optional observability integration additionally pins `langfuse==5.2.0`;
+the dated environment check above predates that addition.
+
 The lifespan loads `Qwen/Qwen2.5-0.5B-Instruct` once per application process on
 CPU in float32. Model files must be cached locally or downloadable. Importing
 `src.api` does not load weights; failed loading aborts startup. Avoid reload
@@ -523,8 +526,10 @@ prevent graceful shutdown and require process termination.
 
 ### Optional bearer authentication
 
-`INFERENCE_API_TOKEN` gates `POST /v1/chat/completions` and `GET /metrics`.
-Unset or empty leaves both open, which is the documented mode for loopback use.
+In the CPU app (`src.api:app`), `INFERENCE_API_TOKEN` gates
+`POST /v1/chat/completions` and `GET /metrics`. Unset or empty leaves both open,
+which is the documented mode for loopback use. The separate model router does
+not implement this bearer gate or the CPU `/metrics` endpoint; keep it private.
 
 ```bash
 INFERENCE_API_TOKEN="$TOKEN" .venv/bin/python -m uvicorn src.api:app \
@@ -565,6 +570,76 @@ never includes prompts, outputs, headers, or exception messages.
   "memory": {"process_peak_rss_bytes": 2127249408}
 }
 ```
+
+### Optional Langfuse tracing
+
+Both Python serving apps support opt-in, metadata-only tracing. Install the
+pinned dependencies with `.venv/bin/python -m pip install -r requirements.txt`.
+The integration uses Langfuse Python SDK **5.2.0**, which requires Langfuse Cloud
+or self-hosted Langfuse **4.59.0 or newer**; see the
+[SDK compatibility requirements](https://langfuse.com/docs/observability/sdk/overview).
+No cloud account or credentials are needed to keep tracing disabled.
+
+Supply your project's keys through your shell or secret manager, never source
+control. Set all four variables before starting either app:
+
+```bash
+export LANGFUSE_TRACING_ENABLED=true
+export LANGFUSE_PUBLIC_KEY="pk-lf-your-project-key"
+export LANGFUSE_SECRET_KEY="sk-lf-your-project-secret"
+export LANGFUSE_BASE_URL="https://cloud.langfuse.com"
+.venv/bin/python -m uvicorn src.api:app \
+  --host 127.0.0.1 --port 8000 --workers 1
+```
+
+Use the base URL for your project's region or compatible self-hosted instance.
+The same variables apply to `src.model_router:create_app` when launched with
+Uvicorn's `--factory` in its existing supported vLLM environment; enabling
+tracing does not install vLLM, start a GPU allocation, or change routing.
+
+Changing Langfuse project keys or the base URL requires a full process restart:
+SDK resources are process-cached, and the integration rejects configuration
+changes within the same process.
+
+Unset `LANGFUSE_TRACING_ENABLED` or set it to `false` to disable tracing.
+Disabled mode does not import or initialize the SDK or export anything.
+Enabled but missing/invalid configuration produces a sanitized warning and
+leaves inference available. Export failures are isolated from responses,
+scheduling, existing lifecycle logs, and CPU metrics. There is no per-request
+flush; lifespan teardown waits a bounded time off the event loop for export
+after inference cleanup. Timed-out export can lose final telemetry; the SDK's
+process-owned resources shut down at process exit.
+
+Only `POST /v1/chat/completions` creates an observation, not probes or metrics.
+Each request has one manual `chat.completion` generation observation. Its trace
+ID equals the server-generated `x-request-id` response header; supplied request
+IDs are ignored. CPU authentication remains outside tracing, so unauthorized
+CPU requests still have no trace or request ID. Router authentication behavior
+is unchanged.
+
+Exported application fields are restricted to request ID, static backend,
+validated model and stream flag, sanitized outcome/error code and HTTP status,
+actual token usage when known, and measured durations. No prompts, generated
+text, token IDs, request/response bodies, headers, credentials, or raw exception
+messages are captured. No decorators, automatic HTTP/model instrumentation,
+or implicit current-span context are used.
+
+The root duration covers the **HTTP request lifetime**, including validation,
+queueing, any model load, and response delivery, not pure model/GPU execution.
+Both apps use outcomes `completed`, `rejected`, `failed`, and `disconnected`.
+A stream can have HTTP 200 but outcome `failed`; cancellation/disconnect is
+`disconnected`, not success. CPU `queue_wait_ms` ends at worker entry; router `queue_wait_ms` runs
+from submission through lease readiness and includes preparation, draining,
+model unload/load, and admission wait. Router producer duration is unavailable,
+not estimated. CPU producer duration is recorded only when known before HTTP
+completion. A disconnected CPU producer can finish later: its existing logs
+may contain authoritative usage that the already-ended trace omits. Missing
+usage is never replaced with zero, the requested cap, or a text-based estimate.
+
+To correlate a request, use `curl -i` with either chat example below and locate
+its `x-request-id` in Langfuse after background export. A completed HTTP request
+alone does not prove dashboard ingestion; verify export with your configured
+Langfuse project. No cloud credentials or dashboard access are assumed here.
 
 ## Operations and recovery
 
@@ -737,10 +812,11 @@ The server does not reset global random state to emulate per-request seeds.
 
 ## Private request lifecycle logs
 
-The normal Uvicorn command also emits one JSON line per lifecycle event through
-Python's `inference.lifecycle` logger at INFO level, to stderr. No log files or
-external telemetry service are created. Uvicorn's own startup/access logs remain
-separate and may be plain text.
+The normal CPU Uvicorn command also emits one JSON line per lifecycle event
+through Python's `inference.lifecycle` logger at INFO level, to stderr. No log
+files are created, and external telemetry stays disabled unless explicitly
+enabled above. Uvicorn's own startup/access logs remain separate and may be
+plain text.
 
 Logging covers `POST /v1/chat/completions`. A server-generated UUID is assigned
 before body parsing and validation and reused in `X-Request-ID`, completion IDs,

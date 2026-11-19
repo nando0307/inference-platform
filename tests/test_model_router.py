@@ -2,6 +2,8 @@ import asyncio
 import json
 import unittest
 from contextlib import suppress
+from threading import Event
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
@@ -271,6 +273,7 @@ class LocalUpstream:
         self.missing_prompt_ids = False
         self.truncated = False
         self.reject = False
+        self.invalid_usage = False
 
     async def start(self):
         self.server = await asyncio.start_server(self.handle, "127.0.0.1", 0)
@@ -303,6 +306,8 @@ class LocalUpstream:
             base = {"id": upstream_id, "object": "chat.completion.chunk", "created": 1, "model": model}
             prompt = {} if self.missing_prompt_ids else {"prompt_token_ids": [10, 11, 12]}
             usage = {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+            if self.invalid_usage:
+                usage = {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
             if not body["stream"]:
                 payload = {**base, **prompt, "choices": [{"index": 0, "message": {"role": "assistant", "content": "hello"},
                                                          "finish_reason": "length", "token_ids": [13]}], "usage": usage}
@@ -335,27 +340,94 @@ class LocalUpstream:
             self.tasks.discard(asyncio.current_task())
 
 
+class RecordedObservation:
+    def __init__(self, fields):
+        self.fields = fields
+        self.ends = 0
+
+    def update(self, **fields):
+        metadata = fields.pop("metadata", {})
+        self.fields.setdefault("metadata", {}).update(metadata)
+        self.fields.update(fields)
+
+    def end(self):
+        self.ends += 1
+
+
+class RecordingTracer:
+    def __init__(self):
+        self.observations = []
+
+    def start_observation(self, **fields):
+        observation = RecordedObservation(fields)
+        self.observations.append(observation)
+        return observation
+
+
+class LifespanTests(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_engine_cleanup_still_flushes_tracer(self):
+        engine = FakeEngine()
+        engine.fail_stop = True
+        flushed = Event()
+
+        def flush(*, timeout_millis):
+            flushed.set()
+            return True
+
+        app = router.create_app(engine)
+        context = app.router.lifespan_context(app)
+        with (
+            patch.object(router, "create_tracer", return_value=object()),
+            patch("src.telemetry._provider", SimpleNamespace(force_flush=flush)),
+        ):
+            await context.__aenter__()
+            with self.assertRaisesRegex(RuntimeError, "cleanup"):
+                await context.__aexit__(None, None, None)
+        self.assertTrue(flushed.is_set())
+
+
 class EndpointTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        self.tracer = RecordingTracer()
         self.upstream = LocalUpstream()
         self.engine = FakeEngine()
         self.engine.base_url = await self.upstream.start()
         self.addAsyncCleanup(self.upstream.close)
         self.app = router.create_app(self.engine)
         context = self.app.router.lifespan_context(self.app)
-        await context.__aenter__()
+        with patch.object(router, "create_tracer", return_value=self.tracer):
+            await context.__aenter__()
         self.addAsyncCleanup(context.__aexit__, None, None, None)
         self.engine.manager = self.app.state.manager
         self.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url="http://router")
         self.addAsyncCleanup(self.client.aclose)
+
+    def assert_trace(self, observation, outcome, status, code=None):
+        self.assertEqual(observation.ends, 1)
+        metadata = observation.fields["metadata"]
+        self.assertEqual(metadata["backend"], "model-router")
+        self.assertEqual(metadata["outcome"], outcome)
+        self.assertEqual(metadata.get("http_status"), status)
+        self.assertEqual(metadata.get("error_code"), code)
+        self.assertNotIn("input", observation.fields)
+        self.assertNotIn("output", observation.fields)
+        encoded = json.dumps(observation.fields)
+        for private in ("PRIVATE", "hello", "token_ids", "messages", "authorization"):
+            self.assertNotIn(private, encoded)
 
     async def test_nonstream_routes_exact_identity_and_returns_usage(self):
         cold = await self.client.get("/ready")
         self.assertEqual(cold.status_code, 503)
         self.assertEqual(cold.json()["state"], "unloaded")
         self.assertTrue(cold.json()["accepting"])
+        await self.client.get("/health")
+        self.assertEqual(self.tracer.observations, [])
         for model in (LOW_MODEL, HIGH_MODEL):
-            response = await self.client.post("/v1/chat/completions", json=data(model))
+            response = await self.client.post(
+                "/v1/chat/completions",
+                json=data(model, messages=[{"role": "user", "content": "PRIVATE-PROMPT"}]),
+                headers={"authorization": "Bearer PRIVATE-TOKEN", "x-request-id": "PRIVATE-ID"},
+            )
             self.assertEqual(response.status_code, 200)
             result = response.json()
             self.assertEqual(result["model"], model)
@@ -364,8 +436,16 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["prompt_token_ids"], [10, 11, 12])
             self.assertEqual(result["choices"][0]["token_ids"], [13])
             self.assertEqual(result["usage"], {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4})
+            observation = self.tracer.observations[-1]
+            self.assert_trace(observation, "completed", 200)
+            self.assertEqual(observation.fields["trace_context"]["trace_id"], response.headers["x-request-id"])
+            self.assertEqual(observation.fields["model"], model)
+            self.assertFalse(observation.fields["metadata"]["stream"])
+            self.assertGreaterEqual(observation.fields["metadata"]["queue_wait_ms"], 0)
+            self.assertEqual(observation.fields["usage_details"], {"input": 3, "output": 1})
         self.assertEqual(self.app.state.manager.snapshot()["active"], 0)
         self.assertTrue((await self.client.get("/ready")).json()["ready"])
+        self.assertEqual(len(self.tracer.observations), 2)
 
     async def test_stream_satisfies_existing_strict_client(self):
         workload = {"model": HIGH_MODEL, "generation": {"temperature": 0, "top_p": 1}}
@@ -377,14 +457,24 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["events"][0]["token_ids"], [13])
         self.assertEqual(row["finish_reason"], "length")
         self.assertEqual(self.app.state.manager.snapshot()["active"], 0)
+        observation = self.tracer.observations[0]
+        self.assert_trace(observation, "completed", 200)
+        self.assertTrue(observation.fields["metadata"]["stream"])
+        self.assertEqual(observation.fields["usage_details"], {"input": 3, "output": 1})
 
     async def test_invalid_requests_reject_before_any_load_and_hide_inputs(self):
         for payload in (data("PRIVATE-MODEL"), data(backend="PRIVATE-BACKEND"), data(max_tokens=513)):
             response = await self.client.post("/v1/chat/completions", json=payload)
             self.assertEqual(response.status_code, 422)
             self.assertNotIn("PRIVATE", response.text)
+            observation = self.tracer.observations[-1]
+            self.assert_trace(observation, "rejected", 422, "invalid_request")
+            self.assertNotIn("model", observation.fields)
+            self.assertNotIn("stream", observation.fields["metadata"])
+            self.assertNotIn("usage_details", observation.fields)
         response = await self.client.post("/v1/chat/completions", content=b"x" * (router.MAX_BODY_BYTES + 1))
         self.assertEqual(response.status_code, 413)
+        self.assert_trace(self.tracer.observations[-1], "rejected", 413, "request_too_large")
         self.assertEqual(self.engine.calls, [])
         self.assertEqual(self.upstream.requests, [])
 
@@ -395,30 +485,42 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("hello", response.text)
         self.assertNotIn("choices", response.json())
         self.assertFalse(self.app.state.manager.snapshot()["accepting"])
+        self.assert_trace(self.tracer.observations[-1], "failed", 502, "upstream_failed")
         again = await self.client.post("/v1/chat/completions", json=data())
         self.assertEqual(again.status_code, 503)
+        self.assert_trace(self.tracer.observations[-1], "rejected", 503, "not_ready")
         self.assertEqual(len(self.upstream.requests), 1)
 
-    async def assert_invalid_upstream_identity(self, flag, stream):
+    async def assert_invalid_upstream(self, flag, stream):
         setattr(self.upstream, flag, True)
         response = await self.client.post("/v1/chat/completions", json=data(stream=stream))
         self.assertEqual(response.status_code, 200 if stream else 502)
         self.assertIn("upstream_failed", response.text)
-        self.assertNotIn("hello", response.text)
-        self.assertNotIn('"choices"', response.text)
+        if not stream or flag != "invalid_usage":
+            self.assertNotIn("hello", response.text)
+            self.assertNotIn('"choices"', response.text)
         self.assertFalse(self.app.state.manager.snapshot()["accepting"])
+        observation = self.tracer.observations[-1]
+        self.assert_trace(observation, "failed", 200 if stream else 502, "upstream_failed")
+        self.assertNotIn("usage_details", observation.fields)
 
     async def test_nonstream_wrong_request_id_is_rejected(self):
-        await self.assert_invalid_upstream_identity("wrong_id", False)
+        await self.assert_invalid_upstream("wrong_id", False)
 
     async def test_stream_wrong_request_id_is_rejected(self):
-        await self.assert_invalid_upstream_identity("wrong_id", True)
+        await self.assert_invalid_upstream("wrong_id", True)
 
     async def test_nonstream_missing_prompt_token_ids_is_rejected(self):
-        await self.assert_invalid_upstream_identity("missing_prompt_ids", False)
+        await self.assert_invalid_upstream("missing_prompt_ids", False)
 
     async def test_stream_missing_prompt_token_ids_is_rejected(self):
-        await self.assert_invalid_upstream_identity("missing_prompt_ids", True)
+        await self.assert_invalid_upstream("missing_prompt_ids", True)
+
+    async def test_nonstream_invalid_usage_is_never_exported(self):
+        await self.assert_invalid_upstream("invalid_usage", False)
+
+    async def test_stream_invalid_usage_is_never_exported(self):
+        await self.assert_invalid_upstream("invalid_usage", True)
 
     async def test_upstream_errors_are_sanitized_and_not_retried(self):
         self.upstream.reject = True
@@ -436,12 +538,15 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["status"], "error")
         self.assertEqual(row["error_code"], "upstream_failed")
         self.assertEqual(self.app.state.manager.snapshot()["active"], 0)
+        observation = self.tracer.observations[-1]
+        self.assert_trace(observation, "failed", 200, "upstream_failed")
+        self.assertNotIn("usage_details", observation.fields)
 
-    async def asgi_stream(self, *, slow_send=False):
+    async def asgi_request(self, *, stream=True, slow_send=False, broken_send=False):
         disconnected = asyncio.Event()
         delivered = asyncio.Event()
         sent_body = False
-        raw = json.dumps(data(stream=True)).encode()
+        raw = json.dumps(data(stream=stream)).encode()
         scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"},
                  "http_version": "1.1", "scheme": "http", "method": "POST", "root_path": "",
                  "path": "/v1/chat/completions", "raw_path": b"/v1/chat/completions", "query_string": b"",
@@ -459,6 +564,8 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
         async def send(message):
             if message["type"] == "http.response.body" and message.get("body"):
                 delivered.set()
+                if broken_send:
+                    raise BrokenPipeError("PRIVATE-SOCKET")
                 if slow_send:
                     await asyncio.Event().wait()
 
@@ -468,7 +575,7 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_waiting_http_cancellation_removes_request_without_switching(self):
         self.upstream.hold_stream = True
-        active, disconnected = await self.asgi_stream()
+        active, disconnected = await self.asgi_request()
         waiting = asyncio.create_task(self.client.post(
             "/v1/chat/completions", json=data(HIGH_MODEL),
         ))
@@ -480,13 +587,18 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.app.state.manager.snapshot()["queued"], 0)
             self.assertEqual(self.engine.calls, [("start", LOW_MODEL)])
             self.assertEqual(len(self.upstream.requests), 1)
+            observation = self.tracer.observations[-1]
+            self.assert_trace(observation, "disconnected", None, "request_canceled")
+            self.assertEqual(observation.fields["model"], HIGH_MODEL)
+            self.assertNotIn("usage_details", observation.fields)
+            self.assertNotIn("queue_wait_ms", observation.fields["metadata"])
         finally:
             disconnected.set()
             await asyncio.wait_for(active, 2)
 
     async def test_stream_disconnect_closes_upstream_before_releasing_lease(self):
         self.upstream.hold_stream = True
-        task, disconnected = await self.asgi_stream()
+        task, disconnected = await self.asgi_request()
         self.assertEqual(self.app.state.manager.snapshot()["active"], 1)
         disconnected.set()
         await asyncio.wait_for(task, 2)
@@ -494,14 +606,48 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
         await until(lambda: self.engine.model is None)
         self.assertEqual(self.app.state.manager.snapshot()["active"], 0)
         self.assertIn(("stop", LOW_MODEL), self.engine.calls)
+        observation = self.tracer.observations[-1]
+        self.assert_trace(observation, "disconnected", 200, "client_disconnected")
+        self.assertNotIn("usage_details", observation.fields)
 
     async def test_backpressure_deadline_closes_upstream_and_releases_lease(self):
         self.upstream.hold_stream = True
         with patch.object(router, "SEND_TIMEOUT", 0.02):
-            task, _ = await self.asgi_stream(slow_send=True)
+            task, _ = await self.asgi_request(slow_send=True)
             with self.assertRaises((TimeoutError, ExceptionGroup)):
                 await asyncio.wait_for(task, 2)
         await asyncio.wait_for(self.upstream.disconnected.wait(), 2)
+        self.assertEqual(self.app.state.manager.snapshot()["active"], 0)
+        self.assert_trace(self.tracer.observations[-1], "failed", 200, "slow_consumer")
+
+    async def test_broken_response_send_records_disconnect_and_releases_lease(self):
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                observations = len(self.tracer.observations)
+                task, _ = await self.asgi_request(stream=stream, broken_send=True)
+                with self.assertRaises((BrokenPipeError, ExceptionGroup)) as raised:
+                    await asyncio.wait_for(task, 2)
+                if isinstance(raised.exception, ExceptionGroup):
+                    self.assertIsNotNone(raised.exception.subgroup(BrokenPipeError))
+                self.assertEqual(len(self.tracer.observations), observations + 1)
+                self.assert_trace(
+                    self.tracer.observations[-1], "disconnected", 200, "client_disconnected",
+                )
+                self.assertEqual(self.app.state.manager.snapshot()["active"], 0)
+                self.assertEqual(self.app.state.manager.snapshot()["queued"], 0)
+
+    async def test_trace_ends_before_failed_lease_cleanup(self):
+        release = self.app.state.manager.release
+
+        async def failing_release(lease, completed):
+            self.assert_trace(self.tracer.observations[-1], "completed", 200)
+            await release(lease, completed)
+            raise RuntimeError("PRIVATE-CLEANUP")
+
+        with patch.object(self.app.state.manager, "release", side_effect=failing_release):
+            with self.assertRaisesRegex(RuntimeError, "PRIVATE-CLEANUP"):
+                await self.client.post("/v1/chat/completions", json=data())
+        self.assert_trace(self.tracer.observations[-1], "completed", 200)
         self.assertEqual(self.app.state.manager.snapshot()["active"], 0)
 
 

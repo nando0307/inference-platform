@@ -4033,3 +4033,31 @@ and why authentication alone is insufficient for a public endpoint. A hosted or
 containerized deployment, TLS termination, and rate limiting need their own
 scope and approval.
 
+## Optional Langfuse observability
+
+Added metadata-only request observations to the CPU API and opt-in model router,
+using pinned `langfuse==5.2.0`. Setup and privacy boundaries are documented in
+[Optional Langfuse tracing](../README.md#optional-langfuse-tracing). Tracing is
+disabled unless explicitly configured; existing logs and metrics remain.
+
+Verification:
+
+- `.venv/bin/python -m unittest discover -s tests -q`: **202 tests passed**.
+- `.venv/bin/python -m pip check`: no broken requirements.
+- Real Uvicorn HTTP smoke with cached Qwen2.5-0.5B on CPU, offline model loading,
+  and the actual Langfuse SDK exporting protobuf to a temporary local OTLP sink:
+  non-streaming and SSE requests returned 200 with 42 prompt / 4 completion
+  tokens each; SSE ended with `[DONE]`.
+- Decoded exports matched response request IDs, outcomes, statuses, and actual
+  usage. Validation/body-limit rejections exported 422/413 without invented
+  usage. Readiness and unauthorized requests produced no observations.
+- Private prompt/auth/secret markers were absent from exports. A completion
+  still returned 200 while the collector returned 503; the exporter reported
+  failure without breaking inference. Service shutdown completed.
+- Router cancellation, transport failure, malformed upstream usage, and failed
+  cleanup were exercised by deterministic tests, without GPU allocation.
+
+This verifies local SDK export, not Langfuse authentication, ingestion, or UI
+rendering. No project keys/base URL were configured for a live Langfuse instance.
+Live dashboard acceptance requires operator-provided credentials and a compatible
+server; no hosted infrastructure was deployed and no performance claim is made.

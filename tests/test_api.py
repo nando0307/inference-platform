@@ -5,6 +5,7 @@ import os
 import unittest
 
 from threading import Event, Timer, get_ident
+from types import SimpleNamespace
 from unittest.mock import patch
 from uuid import UUID
 
@@ -195,9 +196,21 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_loading_failure_prevents_serving(self):
         self.loader.side_effect = RuntimeError("Controlled loading failure")
-        with self.assertRaises(RuntimeError):
-            async with app.router.lifespan_context(app):
-                self.fail("Startup failure must not enter the serving phase.")
+        flushed = Event()
+
+        def flush(*, timeout_millis):
+            flushed.set()
+            return True
+
+        with (
+            patch("src.api.create_tracer", return_value=object()),
+            patch("src.telemetry._provider", SimpleNamespace(force_flush=flush)),
+        ):
+            with self.assertRaises(RuntimeError):
+                async with app.router.lifespan_context(app):
+                    self.fail("Startup failure must not enter the serving phase.")
+        self.assertTrue(flushed.is_set())
+        self.assertIsNone(app.state.tracer)
         self.assertFalse(app.state.initialized)
         self.assertIsNone(app.state.runtime)
         self.assertIsNone(app.state.executor)

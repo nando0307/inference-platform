@@ -16,6 +16,7 @@ from starlette.responses import JSONResponse, StreamingResponse
 
 from .api import ChatCompletionRequest, ChatMessage, _DisconnectedResponse
 from .inference import ContextLimitError
+from .telemetry import close_tracer, create_tracer, start_request
 from .vllm_engine import MODEL_SPECS, VLLMEngine
 
 
@@ -301,19 +302,72 @@ class _LeaseMiddleware:
             return
         state = scope.setdefault("state", {})
         state["request_id"] = uuid4().hex
+        trace = None
+        if scope["method"] == "POST" and scope["path"] == "/v1/chat/completions":
+            trace = start_request(
+                getattr(scope["app"].state, "tracer", None), state["request_id"],
+                backend="model-router",
+            )
+        state["request_trace"] = trace
+        status = None
+        disconnected = False
+        delivered = False
         success = False
 
+        async def traced_receive():
+            nonlocal disconnected
+            message = await receive()
+            if message["type"] == "http.disconnect" and not delivered:
+                disconnected = True
+            return message
+
         async def bounded_send(message):
+            nonlocal status, delivered, disconnected
             if message["type"] == "http.response.start":
+                status = message["status"]
                 message["headers"] = [*message.get("headers", []),
                                       (b"x-request-id", state["request_id"].encode())]
-            async with asyncio.timeout(SEND_TIMEOUT):
-                await send(message)
+            try:
+                async with asyncio.timeout(SEND_TIMEOUT):
+                    await send(message)
+                if message["type"] == "http.response.body" and not message.get("more_body", False):
+                    delivered = True
+            except TimeoutError:
+                state["trace_error_code"] = "slow_consumer"
+                raise
+            except OSError:
+                disconnected = True
+                state["trace_error_code"] = "client_disconnected"
+                raise
 
         try:
-            await self.app(scope, receive, bounded_send)
+            await self.app(scope, traced_receive if trace is not None else receive, bounded_send)
             success = True
+        except asyncio.CancelledError:
+            if not disconnected:
+                state.setdefault("trace_error_code", "request_canceled")
+            raise
+        except ClientDisconnect:
+            disconnected = True
+            raise
         finally:
+            if trace is not None:
+                code = state.get("trace_error_code")
+                if code in ("client_disconnected", "request_canceled"):
+                    outcome = "disconnected"
+                elif code is not None:
+                    outcome = (
+                        "rejected" if (status is not None and 400 <= status < 500) or code == "not_ready"
+                        else "failed"
+                    )
+                elif disconnected or (success and not (delivered and state.get("completed", False))):
+                    outcome, code = "disconnected", "client_disconnected"
+                elif success:
+                    outcome = "completed"
+                else:
+                    outcome, code = "failed", "internal_error"
+                # End at HTTP delivery, before potentially slow lease cleanup.
+                trace.finish(outcome=outcome, http_status=status, error_code=code)
             lease = state.get("lease")
             if lease is not None:
                 cleanup = asyncio.create_task(scope["app"].state.manager.release(
@@ -421,6 +475,7 @@ async def _stream(request, lease):
     usage = None
     done = False
     first = True
+    trace = getattr(request.state, "request_trace", None)
     try:
         async with asyncio.timeout(180):
             async for event in _upstream_events(lease.upstream):
@@ -449,6 +504,9 @@ async def _stream(request, lease):
                         raise ValueError("Invalid usage ordering.")
                     usage = _usage(payload["usage"], lease, finish)
                     payload["usage"] = usage
+                    if trace is not None:
+                        trace.update(prompt_tokens=usage["prompt_tokens"],
+                                     completion_tokens=usage["completion_tokens"])
                 yield _sse({key: value for key, value in payload.items() if key in (
                     "id", "object", "created", "model", "choices", "usage", "prompt_token_ids",
                 )})
@@ -459,6 +517,7 @@ async def _stream(request, lease):
     except asyncio.CancelledError:
         raise
     except Exception:
+        request.state.trace_error_code = "upstream_failed"
         request.app.state.manager.fail("upstream_failed", exclude=lease)
         yield _sse(_error(RouterError(502, "upstream_failed", "The inference upstream failed."), lease.request_id))
         yield "data: [DONE]\n\n"
@@ -511,6 +570,9 @@ async def _complete(request, lease):
     if choice["finish_reason"] is None or not isinstance(choice["message"].get("content"), str):
         raise ValueError("Incomplete completion.")
     usage = _usage(payload.get("usage"), lease, choice["finish_reason"])
+    trace = getattr(request.state, "request_trace", None)
+    if trace is not None:
+        trace.update(prompt_tokens=usage["prompt_tokens"], completion_tokens=usage["completion_tokens"])
     request.state.completed = True
     return JSONResponse({"id": payload["id"], "object": "chat.completion", "created": int(time()),
                          "model": body.model, "choices": [choice], "usage": usage,
@@ -524,17 +586,21 @@ def create_app(engine=None):
     async def lifespan(app):
         manager = ModelManager(engine)
         app.state.manager = manager
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=5, read=120, write=10, pool=1),
-            limits=httpx.Limits(max_connections=2, max_keepalive_connections=2),
-            trust_env=False, follow_redirects=False,
-        ) as client:
-            app.state.client = client
-            manager.start()
-            try:
-                yield
-            finally:
-                await manager.shutdown()
+        app.state.tracer = create_tracer()
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=5, read=120, write=10, pool=1),
+                limits=httpx.Limits(max_connections=2, max_keepalive_connections=2),
+                trust_env=False, follow_redirects=False,
+            ) as client:
+                app.state.client = client
+                manager.start()
+                try:
+                    yield
+                finally:
+                    await manager.shutdown()
+        finally:
+            await close_tracer(getattr(app.state, "tracer", None))
 
     app = FastAPI(lifespan=lifespan)
     app.add_middleware(_LeaseMiddleware)
@@ -552,6 +618,7 @@ def create_app(engine=None):
     async def completion(request: Request):
         lease = None
         work = None
+        trace = getattr(request.state, "request_trace", None)
         try:
             raw = bytearray()
             async with asyncio.timeout(10):
@@ -563,25 +630,34 @@ def create_app(engine=None):
                 body = RoutingRequest.model_validate_json(raw)
             except (ValidationError, ValueError):
                 raise RouterError(422, "invalid_request", "Request does not match the supported schema.") from None
+            if trace is not None:
+                trace.update(model=body.model, stream=body.stream)
+            submitted = perf_counter() if trace is not None else None
             lease = app.state.manager.submit(body, request.state.request_id)
             request.state.lease = lease
             lease.task = asyncio.current_task()
             await _connected(request, lease.ready)
+            if trace is not None:
+                trace.update(queue_wait_ms=(perf_counter() - submitted) * 1000)
             work = asyncio.create_task(_complete(request, lease))
             async with asyncio.timeout(180):
                 return await _connected(request, work)
         except ClientDisconnect:
+            request.state.trace_error_code = "client_disconnected"
             return _DisconnectedResponse()
         except RouterError as error:
+            request.state.trace_error_code = error.code
             return JSONResponse(_error(error, request.state.request_id), status_code=error.status)
         except asyncio.CancelledError:
             raise
         except TimeoutError:
             error = RouterError(504, "request_timeout", "The request exceeded its deadline.")
+            request.state.trace_error_code = error.code
             return JSONResponse(_error(error, request.state.request_id), status_code=error.status)
         except Exception:
             app.state.manager.fail("upstream_failed")
             error = RouterError(502, "upstream_failed", "The inference upstream failed.")
+            request.state.trace_error_code = error.code
             return JSONResponse(_error(error, request.state.request_id), status_code=error.status)
         finally:
             if work is not None and not work.done():
