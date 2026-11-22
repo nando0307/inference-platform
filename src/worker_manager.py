@@ -178,7 +178,7 @@ class MultiWorkerManager:
                              and [item["id"] for item in models.json()["data"]] == [worker.definition.model])
             except Exception:
                 valid = False
-        if worker.generation != generation:
+        if worker.generation != generation or self._quarantined(worker):
             return
         if valid:
             worker.consecutive_successes += 1

@@ -245,6 +245,56 @@ class WorkerManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(worker.engine.starts, 1)
         self.assertEqual(worker.engine.stops, 1)
 
+    async def test_probe_in_flight_cannot_quarantine_escape_after_retire_starts(self):
+        manager = MultiWorkerManager(self.config("D"), engine_factory=FakeEngine)
+        self.addAsyncCleanup(manager.shutdown)
+        await manager.start()
+        worker = next(w for w in manager.workers.values() if w.definition.model == LOW_MODEL)
+        lease = manager.submit(request(), "dispatched")
+        await lease.ready
+        self.assertIs(lease.worker, worker)
+        generation = worker.generation
+        served = {w.definition.endpoint: w.definition.model for w in manager.workers.values()}
+        probed = asyncio.Event()
+        resumed = asyncio.Event()
+        retiring = asyncio.Event()
+
+        async def hold_retire(manager_self, retired_worker):
+            retiring.set()
+            await asyncio.Event().wait()
+
+        class GatedUpstream:
+            def __init__(self, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def get(self, url, headers=None):
+                probed.set()
+                await resumed.wait()
+                if url.endswith("/health"):
+                    return httpx.Response(503)
+                return httpx.Response(200, json={"data": [{"id": served[url[: -len("/v1/models")]]}]})
+
+        with patch.object(MultiWorkerManager, "_retire", hold_retire), \
+                patch("src.worker_manager.httpx.AsyncClient", GatedUpstream):
+            probe = asyncio.create_task(manager._probe(worker, generation))
+            await asyncio.wait_for(probed.wait(), 2)
+            lease.dispatched = True
+            await manager.release(lease, False)
+            self.assertEqual(worker.state, "unavailable")
+            self.assertIsNotNone(worker.cleanup_task)
+            await asyncio.wait_for(retiring.wait(), 2)
+            self.assertEqual(worker.generation, generation)
+            resumed.set()
+            await asyncio.wait_for(probe, 2)
+        self.assertEqual(worker.state, "unavailable")
+        self.assertEqual(worker.engine.starts, 1)
+
     async def test_metrics_deduplicate_physical_device_and_leave_unavailable_unknown(self):
         manager = MultiWorkerManager(self.config("B"), engine_factory=FakeEngine)
         self.addAsyncCleanup(manager.shutdown)
