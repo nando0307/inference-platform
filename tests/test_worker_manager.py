@@ -189,10 +189,13 @@ class WorkerManagerTests(unittest.IsolatedAsyncioTestCase):
         await lease.ready
         worker.engine.fail = True
         lease.dispatched = True
-        await manager.release(lease, False)
-        await asyncio.gather(*manager.tasks)
+        with self.assertLogs("inference.workers", level="WARNING") as logs:
+            await manager.release(lease, False)
+            await asyncio.gather(*manager.tasks)
         self.assertEqual(worker.state, "unavailable")
         self.assertEqual(worker.last_error, "recycle_failed")
+        self.assertIn("recycle_failed", "\n".join(logs.output))
+        self.assertIn("worker small-0 worker_failed", "\n".join(logs.output))
         self.assertEqual(worker.engine.starts, 2)
         with self.assertRaises(RouterError) as caught:
             manager.submit(request(), "after-failure")

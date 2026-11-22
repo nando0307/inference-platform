@@ -334,7 +334,7 @@ class MultiWorkerManager:
         self.emit("released", worker, request_id=lease.request_id, outcome=outcome)
         if not completed and lease.dispatched and not self.closing:
             self._fail_queued(worker, "not_ready")
-            if worker.cleanup_task is None and not self._quarantined(worker):
+            if not self._quarantined(worker):
                 if self.mode == "local" and not worker.engine.is_alive():
                     worker.state = "unavailable"
                     worker.last_error = "process_exited"
@@ -381,6 +381,7 @@ class MultiWorkerManager:
             except Exception:
                 worker.last_error = "cleanup_failed"
             worker.state = "unavailable"
+            self.emit("worker_failed", worker, reason=worker.last_error, generation=worker.generation)
         else:
             worker.last_error = None
             worker.consecutive_successes = 0
