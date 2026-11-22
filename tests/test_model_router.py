@@ -402,7 +402,7 @@ class LegacyAuthTests(unittest.IsolatedAsyncioTestCase):
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://router") as client:
                 response = await client.post("/v1/chat/completions", json=data())
                 self.assertEqual(response.status_code, 200, response.text)
-                self.assertEqual((await client.get("/metrics")).status_code, 200)
+                self.assertEqual((await client.get("/metrics")).status_code, 404)
 
 
 class EndpointTests(unittest.IsolatedAsyncioTestCase):

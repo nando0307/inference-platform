@@ -651,12 +651,10 @@ def create_app(engine=None, config=None, worker_engine_factory=None, mode=None):
         state = manager.readiness() if hasattr(manager, "readiness") else manager.snapshot()
         return JSONResponse(state, status_code=200 if state["ready"] else 503)
 
-    @app.get("/metrics")
-    async def metrics():
-        manager = app.state.manager
-        return manager.metrics() if hasattr(manager, "metrics") else {
-            "workers": {}, "models": {}, "physical_gpus": [],
-        }
+    if config is not None:
+        @app.get("/metrics")
+        async def metrics():
+            return app.state.manager.metrics()
 
     @app.post("/v1/chat/completions")
     async def completion(request: Request):
