@@ -616,10 +616,10 @@ MULTI_GPU_CONFIG=/path/to/serving-a.json MULTI_GPU_MODE=remote \
 ```
 
 `/ready` reports only global routability and per-model availability status, so
-it can stay public for probes. It returns 200 only when every configured model
-is fully available (every configured replica is ready) and 503 otherwise,
-including when a model has no ready replica (`unavailable`) or only some
-replicas ready (`degraded`). Worker state, physical UUIDs, device
+it can stay public for probes. It returns 200 when every configured model has at
+least one ready replica, including models reported `degraded` only because some
+replicas are unavailable, and 503 when any configured model has no ready
+replica (`unavailable`). Worker state, physical UUIDs, device
 ordinals, revisions, queue depths, and failure detail stay on `/metrics`, which
 reports request state per worker, model, and physical UUID. NVML telemetry is
 optional and missing values remain unknown, not zero. No prompts, outputs,

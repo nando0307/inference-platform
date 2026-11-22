@@ -111,7 +111,7 @@ class MultiWorkerManager:
             models[model.id] = {"ready": ready, "configured": len(replicas),
                                 "status": "ready" if ready == len(replicas) else "degraded" if ready else "unavailable"}
         return {
-            "ready": self.accepting and all(row["status"] == "ready" for row in models.values()),
+            "ready": self.accepting and all(row["ready"] > 0 for row in models.values()),
             "placement": self.config.placement, "models": models,
             "workers": {w.definition.id: {
                 "state": w.state, "generation": w.generation, "model": w.definition.model,

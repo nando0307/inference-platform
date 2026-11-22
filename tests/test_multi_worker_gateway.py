@@ -140,7 +140,8 @@ class MultiWorkerGatewayTests(unittest.IsolatedAsyncioTestCase):
         manager.workers["large-0"].state = "ready"
         manager.workers["small-0"].state = "unavailable"
         degraded = await self.client.get("/ready")
-        self.assertEqual(degraded.status_code, 503)
+        self.assertEqual(degraded.status_code, 200)
+        self.assertTrue(degraded.json()["ready"])
         self.assertEqual(degraded.json()["models"][LOW_MODEL]["status"], "degraded")
         self.assertEqual(degraded.json()["models"][LOW_MODEL]["ready"], 1)
         self.assertEqual(degraded.json()["models"][HIGH_MODEL]["status"], "ready")
