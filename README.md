@@ -542,8 +542,8 @@ INFERENCE_API_TOKEN="$TOKEN" .venv/bin/python -m uvicorn src.api:app \
 `/health` and `/ready` remain unauthenticated for probes. A missing or wrong
 token returns 401 with `WWW-Authenticate: Bearer`; the token is never logged.
 Authentication runs before request logging, so unauthorized attempts produce no
-lifecycle log and no `x-request-id` header. They are counted in `/metrics` as
-`errors.unauthorized`.
+lifecycle log and no `x-request-id` header. The CPU app counts them in `/metrics`
+as `errors.unauthorized`; static multi-GPU mode publishes no per-error counters.
 
 ### Static multi-GPU vLLM serving
 
@@ -623,7 +623,11 @@ replica (`unavailable`). Worker state, physical UUIDs, device
 ordinals, revisions, queue depths, and failure detail stay on `/metrics`, which
 reports request state per worker, model, and physical UUID. NVML telemetry is
 optional and missing values remain unknown, not zero. No prompts, outputs,
-request headers, or service credentials are included in these metrics.
+request headers, or service credentials are included in these metrics. Each
+worker admits at most two active sequences and queues at most two more; when
+every ready replica of the requested model is saturated the gateway returns
+429 `server_busy` instead of exceeding that bound, and a request that exceeds
+its worker's `request_timeout_s` returns 504 `request_timeout`.
 
 #### Approved two-card T4 validation protocol
 
@@ -681,13 +685,14 @@ same-model replicas keep serving. A worker that had become ready is marked
 its restarted remote process answers again. A local child process that exited,
 or a worker that never completed startup, is marked `unavailable` and is not
 probed again. A dispatched request that does not complete, such as a client
-cancellation, quarantines its worker: the worker leaves routing at once and is
-terminated after its remaining leases drain; it is never relaunched. When no
-replica of the requested model is ready, the gateway returns 503 `not_ready`.
-Failure state is recorded in the worker metrics and gateway logs. Recovery is
-operator-controlled with no automatic restart, backoff, or retry loop: restart
-a remote worker process (a `suspect` worker rejoins through health probes), or
-restart the gateway to recover an `unavailable` or quarantined worker.
+cancellation, quarantines its worker (`/metrics` reports `unavailable`): the
+worker leaves routing at once and is terminated after its remaining leases
+drain; it is never relaunched. When no replica of the requested model is ready,
+the gateway returns 503 `not_ready`. Failure state is recorded in the worker
+metrics and gateway logs. Recovery is operator-controlled with no automatic
+restart, backoff, or retry loop: restart a remote worker process (a `suspect`
+worker rejoins through health probes), or restart the gateway to recover an
+`unavailable` worker.
 
 The client never stops a worker. After the protocol, restart the failed remote
 worker, or the gateway for a local worker, and verify the affected model becomes
@@ -1817,10 +1822,12 @@ for per-request measurements, runtime versions, and limitations.
 
 ## Explicit two-model routing
 
-`src/model_router.py` is an opt-in FastAPI app that owns two pinned checkpoints
-behind one private, single-resident vLLM process group from
-`src/vllm_engine.py`. It runs only on the pinned Linux/T4 image; the production
-CPU API is unchanged.
+`src/model_router.py` is an opt-in FastAPI app. Its default mode owns two pinned
+checkpoints behind one private, single-resident vLLM process group from
+`src/vllm_engine.py`; the opt-in
+[static multi-GPU mode](#static-multi-gpu-vllm-serving) runs one process per
+configured worker instead. It runs only on the pinned Linux/T4 image; the
+production CPU API is unchanged.
 
 ### Policy and bounds
 

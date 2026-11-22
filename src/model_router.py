@@ -1,4 +1,4 @@
-"""Opt-in, single-resident vLLM routing with bounded FIFO admission."""
+"""Opt-in vLLM routing: single-resident FIFO, or a static multi-worker pool."""
 
 import asyncio
 import json
