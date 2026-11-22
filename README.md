@@ -528,8 +528,9 @@ prevent graceful shutdown and require process termination.
 
 In the CPU app (`src.api:app`), `INFERENCE_API_TOKEN` gates
 `POST /v1/chat/completions` and `GET /metrics`. Unset or empty leaves both open,
-which is the documented mode for loopback use. The separate model router does
-not implement this bearer gate or the CPU `/metrics` endpoint; keep it private.
+which is the documented mode for loopback use. The model router uses the same
+bearer gate for chat and `/metrics`; in static multi-GPU mode, metrics include
+worker, model, and physical-device state.
 
 ```bash
 INFERENCE_API_TOKEN="$TOKEN" .venv/bin/python -m uvicorn src.api:app \
@@ -742,9 +743,8 @@ process-owned resources shut down at process exit.
 Only `POST /v1/chat/completions` creates an observation, not probes or metrics.
 Each request has one manual `chat.completion` generation observation. Its trace
 ID equals the server-generated `x-request-id` response header; supplied request
-IDs are ignored. CPU authentication remains outside tracing, so unauthorized
-CPU requests still have no trace or request ID. Router authentication behavior
-is unchanged.
+IDs are ignored. CPU and router authentication both run outside tracing, so
+unauthorized requests have no trace or request ID.
 
 Exported application fields are restricted to request ID, static backend,
 validated model and stream flag, sanitized outcome/error code and HTTP status,
