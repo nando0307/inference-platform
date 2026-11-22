@@ -145,7 +145,6 @@ class MultiWorkerGatewayTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('"code": "request_timeout"', response.text)
             manager = app.state.manager
             worker = manager.workers["small-0"]
-            self.assertEqual(worker.recycles, 1)
             async with asyncio.timeout(2):
                 while worker.state != "ready":
                     await asyncio.sleep(0.01)

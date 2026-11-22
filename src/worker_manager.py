@@ -32,7 +32,6 @@ class Worker:
     requests: dict = field(default_factory=lambda: {"completed": 0, "failed": 0, "canceled": 0, "rejected": 0})
     last_error: str | None = None
     cleanup_task: asyncio.Task | None = None
-    recycles: int = 0
 
     @property
     def inflight(self):
@@ -337,15 +336,9 @@ class MultiWorkerManager:
             self._fail_queued(worker, "not_ready")
             if worker.cleanup_task is None:
                 worker.last_error = outcome
-                if worker.recycles == 0:
-                    worker.recycles = 1
-                    worker.state = "recycling"
-                    self.emit("recycling", worker, generation=worker.generation)
-                    task = self._recycle(worker)
-                else:
-                    worker.state = "unavailable"
-                    task = self._retire(worker)
-                worker.cleanup_task = asyncio.create_task(task)
+                worker.state = "recycling"
+                self.emit("recycling", worker, generation=worker.generation)
+                worker.cleanup_task = asyncio.create_task(self._recycle(worker))
                 self.tasks.add(worker.cleanup_task)
                 worker.cleanup_task.add_done_callback(self.tasks.discard)
         self._promote(worker)
@@ -360,20 +353,6 @@ class MultiWorkerManager:
             worker.consecutive_successes = 0
         self.emit("worker_failed", worker, reason=reason, generation=worker.generation)
         self._fail_queued(worker, "not_ready")
-
-    async def _retire(self, worker):
-        worker.generation += 1
-        try:
-            async with asyncio.timeout(DRAIN_TIMEOUT):
-                while worker.active:
-                    await asyncio.sleep(0.01)
-        except TimeoutError:
-            pass
-        try:
-            async with asyncio.timeout(STOP_TIMEOUT):
-                await worker.engine.stop()
-        except Exception:
-            worker.last_error = "cleanup_failed"
 
     async def _recycle(self, worker):
         worker.generation += 1

@@ -689,11 +689,12 @@ or a worker that never completed startup, is marked `unavailable` and is not
 probed again. A dispatched request that does not complete, such as a client
 cancellation or a request deadline, does not permanently take a healthy replica
 offline: the gateway closes that upstream generation, keeps the worker out of
-routing (`/metrics` reports `recycling`), and recycles the worker at most once
-(stop, then start and wait for fresh readiness). A successful recycle returns
-the worker to `ready`; a failed one, or any later non-completion after that
-single recycle, reports `unavailable`: the worker leaves routing at once and is
-terminated after its remaining leases drain. When no replica of the requested
+routing (`/metrics` reports `recycling`), and recycles that worker once for that
+request (drain, stop, then start and wait for fresh identity/readiness). One
+recycle runs at a time per worker, and each later non-completion gets its own
+single recycle; there is no automatic retry after a failed one. A successful
+recycle returns the worker to `ready`; a failed recycle reports `unavailable`:
+the worker leaves routing at once and is terminated. When no replica of the requested
 model is ready, the gateway returns 503 `not_ready`. Failure state is recorded
 in the worker metrics and gateway logs. An unexpectedly dead process is never
 restarted automatically; recovery is operator-controlled with no restart loop,
