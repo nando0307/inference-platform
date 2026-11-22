@@ -60,7 +60,8 @@ class WorkerManagerTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(manager.shutdown)
         self.assertTrue(await manager.start())
         state = manager.snapshot()
-        self.assertTrue(state["ready"])
+        self.assertFalse(state["ready"])
+        self.assertFalse(manager.readiness()["ready"])
         self.assertEqual(state["models"][LOW_MODEL]["status"], "ready")
         self.assertEqual(state["models"][HIGH_MODEL]["status"], "unavailable")
         lease = manager.submit(request(LOW_MODEL), "small-request")
@@ -107,27 +108,7 @@ class WorkerManagerTests(unittest.IsolatedAsyncioTestCase):
         await manager.release(leases[2], True)
         self.assertEqual(len(worker.active), 0)
 
-    async def test_lost_dispatched_worker_recycles_only_its_replica(self):
-        engines = {}
-        def factory(row):
-            engines[row.id] = FakeEngine(row)
-            return engines[row.id]
-        manager = MultiWorkerManager(self.config("B"), engine_factory=factory)
-        self.addAsyncCleanup(manager.shutdown)
-        await manager.start()
-        lease = manager.submit(request(), "dispatched")
-        await lease.ready
-        other = manager.workers["large-0"]
-        old_other_starts = other.engine.starts
-        lease.dispatched = True
-        manager.fail("worker_lost", exclude=lease)
-        await manager.release(lease, False)
-        await asyncio.gather(*manager.tasks)
-        self.assertEqual(lease.worker.generation, 1)
-        self.assertEqual(lease.worker.state, "ready")
-        self.assertEqual(other.engine.starts, old_other_starts)
-
-    async def test_failed_request_recycles_only_after_last_active_lease_drains(self):
+    async def test_cancelled_dispatched_worker_is_quarantined_without_restart(self):
         engines = {}
         def factory(row):
             engines[row.id] = FakeEngine(row)
@@ -138,19 +119,48 @@ class WorkerManagerTests(unittest.IsolatedAsyncioTestCase):
         worker = next(w for w in manager.workers.values() if w.definition.model == LOW_MODEL)
         first = manager.submit(request(), "first")
         second = manager.submit(request(), "second")
+        queued = manager.submit(request(), "queued")
         await asyncio.gather(first.ready, second.ready)
-        first.dispatched = second.dispatched = True
-        starts = worker.engine.starts
+        self.assertIn(queued, worker.queue)
+        first.dispatched = True
         await manager.release(first, False)
-        self.assertTrue(worker.pending_recycle)
-        self.assertEqual(worker.generation, 0)
-        self.assertEqual(worker.engine.starts, starts)
+        self.assertEqual(worker.state, "unavailable")
+        with self.assertRaises(RouterError) as caught:
+            await queued.ready
+        self.assertEqual(caught.exception.status, 503)
+        await asyncio.gather(queued.prepare_task, return_exceptions=True)
+        self.assertNotIn(queued, worker.queue)
+        self.assertEqual(worker.engine.starts, 1)
+        self.assertEqual(worker.engine.stops, 0)
+        second.dispatched = True
         await manager.release(second, True)
         await asyncio.gather(*manager.tasks)
-        self.assertFalse(worker.pending_recycle)
-        self.assertEqual(worker.generation, 1)
-        self.assertEqual(worker.state, "ready")
-        self.assertEqual(worker.engine.starts, starts + 1)
+        self.assertEqual(worker.state, "unavailable")
+        self.assertEqual(worker.engine.starts, 1)
+        self.assertEqual(worker.engine.stops, 1)
+
+    async def test_quarantined_worker_leaves_its_model_replica_routable(self):
+        engines = {}
+        def factory(row):
+            engines[row.id] = FakeEngine(row)
+            return engines[row.id]
+        manager = MultiWorkerManager(self.config("B"), engine_factory=factory)
+        self.addAsyncCleanup(manager.shutdown)
+        await manager.start()
+        failed = manager.workers["small-0"]
+        lease = manager.submit(request(), "dispatched")
+        await lease.ready
+        self.assertEqual(lease.worker.definition.id, "small-0")
+        lease.dispatched = True
+        await manager.release(lease, False)
+        await asyncio.gather(*manager.tasks)
+        self.assertEqual(failed.state, "unavailable")
+        self.assertEqual(failed.engine.starts, 1)
+        replacement = manager.submit(request(), "failover")
+        await replacement.ready
+        self.assertEqual(replacement.worker.definition.id, "small-1")
+        self.assertEqual(manager.workers["large-0"].engine.starts, 1)
+        await manager.release(replacement, True)
 
     async def test_dead_local_worker_leaves_routing_and_same_model_replica_serves(self):
         manager = MultiWorkerManager(self.config("B"), engine_factory=FakeEngine)
@@ -159,7 +169,7 @@ class WorkerManagerTests(unittest.IsolatedAsyncioTestCase):
         dead = manager.workers["small-0"]
         dead.engine.alive = False
         await manager._probe(dead, dead.generation)
-        self.assertEqual(dead.state, "suspect")
+        self.assertEqual(dead.state, "unavailable")
         self.assertEqual(manager.metrics()["workers"]["small-0"]["error"], "health_check_failed")
         lease = manager.submit(request(), "failover")
         await lease.ready
@@ -173,6 +183,7 @@ class WorkerManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.status, 503)
         self.assertEqual(caught.exception.code, "not_ready")
         state = manager.readiness()
+        self.assertFalse(state["ready"])
         self.assertEqual(state["models"][LOW_MODEL]["status"], "unavailable")
         self.assertEqual(state["models"][HIGH_MODEL]["status"], "ready")
 

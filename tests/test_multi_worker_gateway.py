@@ -120,7 +120,8 @@ class MultiWorkerGatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.json()["error"]["code"], "not_ready")
         self.assertEqual(len(self.forwarded), 0)
-    async def test_public_readiness_hides_worker_topology_and_reports_partial_failure(self):
+
+    async def test_public_readiness_hides_worker_topology_and_requires_every_model(self):
         response = await self.client.get("/ready")
         self.assertEqual(response.status_code, 200)
         body = response.json()
@@ -130,9 +131,16 @@ class MultiWorkerGatewayTests(unittest.IsolatedAsyncioTestCase):
         for private in ("GPU-", "127.0.0.1", "cuda_device", "physical_gpu_uuid",
                         "host", "error", "endpoint", "revision", "queued"):
             self.assertNotIn(private, serialized)
-        self.app.state.manager.workers["small-0"].state = "unavailable"
+        manager = self.app.state.manager
+        manager.workers["large-0"].state = "unavailable"
+        unavailable = await self.client.get("/ready")
+        self.assertEqual(unavailable.status_code, 503)
+        self.assertEqual(unavailable.json()["models"][HIGH_MODEL]["status"], "unavailable")
+        self.assertEqual(unavailable.json()["models"][LOW_MODEL]["status"], "ready")
+        manager.workers["large-0"].state = "ready"
+        manager.workers["small-0"].state = "unavailable"
         degraded = await self.client.get("/ready")
-        self.assertEqual(degraded.status_code, 200)
+        self.assertEqual(degraded.status_code, 503)
         self.assertEqual(degraded.json()["models"][LOW_MODEL]["status"], "degraded")
         self.assertEqual(degraded.json()["models"][LOW_MODEL]["ready"], 1)
         self.assertEqual(degraded.json()["models"][HIGH_MODEL]["status"], "ready")

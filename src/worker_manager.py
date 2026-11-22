@@ -31,7 +31,7 @@ class Worker:
     consecutive_successes: int = 0
     requests: dict = field(default_factory=lambda: {"completed": 0, "failed": 0, "canceled": 0, "rejected": 0})
     last_error: str | None = None
-    pending_recycle: bool = False
+    cleanup_task: asyncio.Task | None = None
 
     @property
     def inflight(self):
@@ -111,7 +111,7 @@ class MultiWorkerManager:
             models[model.id] = {"ready": ready, "configured": len(replicas),
                                 "status": "ready" if ready == len(replicas) else "degraded" if ready else "unavailable"}
         return {
-            "ready": self.accepting and any(row["ready"] for row in models.values()),
+            "ready": self.accepting and all(row["status"] == "ready" for row in models.values()),
             "placement": self.config.placement, "models": models,
             "workers": {w.definition.id: {
                 "state": w.state, "generation": w.generation, "model": w.definition.model,
@@ -160,7 +160,8 @@ class MultiWorkerManager:
     async def _probe(self, worker, generation):
         if worker.generation != generation or worker.state not in {"ready", "suspect"}:
             return
-        if self.mode == "local" and not worker.engine.is_alive():
+        alive = self.mode != "local" or worker.engine.is_alive()
+        if not alive:
             valid = False
         else:
             token = os.environ.get(worker.definition.service_token_env, "")
@@ -182,7 +183,7 @@ class MultiWorkerManager:
                 worker.last_error = None
                 self.emit("recovered", worker, generation=generation)
         else:
-            worker.state = "suspect"
+            worker.state = "suspect" if alive else "unavailable"
             worker.consecutive_successes = 0
             worker.last_error = "health_check_failed"
             self.emit("unready", worker, generation=generation)
@@ -290,17 +291,23 @@ class MultiWorkerManager:
             worker.available.set()
 
     def _promote(self, worker):
-        if not worker.pending_recycle:
-            while worker.queue and len(worker.active) < worker.definition.max_sequences:
-                lease = worker.queue.popleft()
-                worker.active.add(lease)
+        while worker.queue and len(worker.active) < worker.definition.max_sequences:
+            lease = worker.queue.popleft()
+            worker.active.add(lease)
         worker.available.set()
 
     def _fail_queued(self, worker, code):
+        failed = False
         while worker.queue:
             lease = worker.queue.popleft()
+            failed = True
             if not lease.ready.done():
                 lease.ready.set_exception(RouterError(503, code, "The selected worker became unavailable."))
+            task = lease.prepare_task
+            if task is not None and task is not asyncio.current_task() and not task.done():
+                task.cancel()
+        if failed:
+            worker.available.set()
 
     async def release(self, lease, completed):
         worker = lease.worker
@@ -320,13 +327,14 @@ class MultiWorkerManager:
         worker.requests[outcome] += 1
         self.emit("released", worker, request_id=lease.request_id, outcome=outcome)
         if not completed and lease.dispatched and not self.closing:
-            worker.pending_recycle = True
+            worker.state = "unavailable"
+            worker.last_error = outcome
+            self._fail_queued(worker, "not_ready")
+            if worker.cleanup_task is None:
+                worker.cleanup_task = asyncio.create_task(self._retire(worker))
+                self.tasks.add(worker.cleanup_task)
+                worker.cleanup_task.add_done_callback(self.tasks.discard)
         self._promote(worker)
-        if worker.pending_recycle and not worker.active and not self.closing:
-            worker.pending_recycle = False
-            task = asyncio.create_task(self.recycle(worker))
-            self.tasks.add(task)
-            task.add_done_callback(self.tasks.discard)
 
     def fail(self, reason="upstream_failed", exclude=None):
         worker = getattr(exclude, "worker", None) if exclude is not None else None
@@ -338,32 +346,19 @@ class MultiWorkerManager:
         self.emit("worker_failed", worker, reason=reason, generation=worker.generation)
         self._fail_queued(worker, "not_ready")
 
-    async def recycle(self, worker):
-        if worker.active or self.closing:
-            if worker.active and not self.closing:
-                worker.pending_recycle = True
-            return
-        worker.pending_recycle = False
-        worker.state = "unavailable"
-        self._fail_queued(worker, "not_ready")
+    async def _retire(self, worker):
         worker.generation += 1
-        generation = worker.generation
         try:
-            await worker.engine.stop()
-            worker.state = "starting"
-            async with asyncio.timeout(worker.definition.startup_timeout_s):
-                await worker.engine.start(worker.definition.model)
-            if worker.generation == generation and worker.engine.is_alive():
-                worker.state = "ready"
-                worker.last_error = None
-                worker.consecutive_successes = 0
-        except Exception as error:
-            worker.state = "unavailable"
-            worker.last_error = type(error).__name__
-            try:
+            async with asyncio.timeout(DRAIN_TIMEOUT):
+                while worker.active:
+                    await asyncio.sleep(0.01)
+        except TimeoutError:
+            pass
+        try:
+            async with asyncio.timeout(STOP_TIMEOUT):
                 await worker.engine.stop()
-            except Exception:
-                worker.last_error = "cleanup_failed"
+        except Exception:
+            worker.last_error = "cleanup_failed"
 
     def metrics(self):
         workers = self.snapshot()["workers"]

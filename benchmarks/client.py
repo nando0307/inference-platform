@@ -152,7 +152,8 @@ async def run_request(
     cancel_after_text=False, request_options=None, capture_events=False,
 ):
     row = {
-        "case": case["name"], "phase": phase, "iteration": iteration,
+        "case": case["name"], "model": case.get("model", workload["model"]),
+        "phase": phase, "iteration": iteration,
         "status": "error", "http_status": None, "request_id": None,
         "e2e_ms": None, "first_text_ms": None, "prompt_tokens": None,
         "completion_tokens": None, "total_tokens": None, "finish_reason": None,

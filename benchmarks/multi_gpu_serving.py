@@ -38,6 +38,12 @@ def _summary(rows, elapsed):
             "output_tokens_per_second": tokens / elapsed if elapsed else None}
 
 
+def _partition_by_model(rows, failed_model):
+    affected = [row for row in rows if row["model"] == failed_model]
+    unaffected = [row for row in rows if row["model"] != failed_model]
+    return affected, unaffected
+
+
 async def run_protocol(url, placement, config, small, large, failure_worker, output):
     parsed_url = httpx.URL(url)
     if (parsed_url.scheme not in {"http", "https"} or not parsed_url.host
@@ -142,8 +148,7 @@ async def run_protocol(url, placement, config, small, large, failure_worker, out
         failure_targets = [(failed_config.model, singles[(failed_config.model, "short")][1]),
                           (other_model, singles[(other_model, "short")][1])]
         failure_entry = await execute("replica/failure isolation", failure_targets, concurrent=True)
-        affected = [row for row in failure_entry["rows"] if row["case"] == singles[(failed_config.model, "short")][1]["name"]]
-        unaffected = [row for row in failure_entry["rows"] if row not in affected]
+        affected, unaffected = _partition_by_model(failure_entry["rows"], failed_config.model)
         artifact["checks"]["case_8_worker_unready"] = initial_metrics.get("workers", {}).get(failure_worker, {}).get("state") in {"suspect", "unavailable"}
         artifact["checks"]["case_8_expected_availability"] = (
             failed_ready > 0 and bool(affected) and all(row["status"] == "success" for row in affected)

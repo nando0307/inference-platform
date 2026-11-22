@@ -616,13 +616,14 @@ MULTI_GPU_CONFIG=/path/to/serving-a.json MULTI_GPU_MODE=remote \
 ```
 
 `/ready` reports only global routability and per-model availability status, so
-it can stay public for probes; a model without a ready worker makes it return
-503, and a model with only some replicas ready is reported `degraded`. Worker
-state, endpoints, physical UUIDs, device ordinals, revisions, queue depths, and
-failure detail stay on `/metrics`, which reports request state per worker,
-model, and physical UUID. NVML telemetry is optional and missing values remain
-unknown, not zero. No prompts, outputs, request headers, or service credentials
-are included in these metrics.
+it can stay public for probes. It returns 200 only when every configured model
+is fully available (every configured replica is ready) and 503 otherwise,
+including when a model has no ready replica (`unavailable`) or only some
+replicas ready (`degraded`). Worker state, endpoints, physical UUIDs, device
+ordinals, revisions, queue depths, and failure detail stay on `/metrics`, which
+reports request state per worker, model, and physical UUID. NVML telemetry is
+optional and missing values remain unknown, not zero. No prompts, outputs,
+request headers, or service credentials are included in these metrics.
 
 #### Approved two-card T4 validation protocol
 
@@ -673,20 +674,24 @@ benchmark terminal. Use a fresh output path:
 ```
 
 `/health` probes are cheap liveness checks. Each worker also gets a full health
-probe every `health_interval_s`. A worker that fails its probe, including a
-local child process that exited, is marked `suspect`, removed from routing
-immediately, and its queued requests fail with 503 `not_ready`. Healthy
-same-model replicas keep serving. When no replica of the requested model is
-ready, the gateway returns 503 `not_ready` and `/ready` reports that model as
-`degraded` or `unavailable`. Failure state is recorded in the worker metrics and
-gateway logs. Recovery is operator-controlled with no automatic restart,
-backoff, or retry loop: restart the failed remote worker process, or for a local
-worker restart the gateway, which owns the local child process groups. Verify
-`/ready` recovers after the restart.
+probe every `health_interval_s`. A worker that fails its probe is removed from
+routing immediately and its queued requests fail with 503 `not_ready`; healthy
+same-model replicas keep serving. A worker that had become ready is marked
+`suspect` and rejoins after two consecutive successful probes, for example once
+its restarted remote process answers again. A local child process that exited,
+or a worker that never completed startup, is marked `unavailable` and is not
+probed again. A dispatched request that does not complete, such as a client
+cancellation, quarantines its worker: the worker leaves routing at once and is
+terminated after its remaining leases drain; it is never relaunched. When no
+replica of the requested model is ready, the gateway returns 503 `not_ready`.
+Failure state is recorded in the worker metrics and gateway logs. Recovery is
+operator-controlled with no automatic restart, backoff, or retry loop: restart
+a remote worker process (a `suspect` worker rejoins through health probes), or
+restart the gateway to recover an `unavailable` or quarantined worker.
 
 The client never stops a worker. After the protocol, restart the failed remote
-worker, or the gateway for a local worker, and verify `/ready` recovers. Treat
-returned measurements as one observed run,
+worker, or the gateway for a local worker, and verify the affected model becomes
+`ready` again. Treat returned measurements as one observed run,
 not a general SLO or a proof of safe co-residency. No GPU run is performed by
 the CPU-only checks described here.
 
