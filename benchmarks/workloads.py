@@ -38,8 +38,10 @@ def build_workload(model_id=MODEL_ID):
     context_limit = min(2048, config.max_position_embeddings)
     for input_name, prompt in (("short", SHORT_PROMPT), ("long", LONG_PROMPT)):
         messages = [{"role": "user", "content": prompt}]
+        # Must match the served request's template: the router prepares and forwards
+        # enable_thinking=False, which changes Qwen3's rendered prompt length.
         formatted = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
         )
         count = len(tokenizer(formatted, add_special_tokens=False)["input_ids"])
         for output_name, cap in (("short", 32), ("long", 128)):
