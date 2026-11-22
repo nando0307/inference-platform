@@ -572,10 +572,12 @@ worker's `service_token_env`. Endpoints and process-local ports are already
 distinct. The gateway bearer credential is optional on a private loopback-only
 setup, but REQUIRED for any less-trusted network. Set `INFERENCE_API_TOKEN`
 for the client-facing bearer gate. Never put credentials in the config, operator
-command, benchmark artifacts, or source control. vLLM requires its worker API
-key as a child-process argument, which may be visible to users with process
-inspection access on that host. Use a dedicated OS account and restrict that
-access; protect remote workers with private networking as well as their tokens.
+command, benchmark artifacts, or source control. Each worker's bearer token is
+passed to its vLLM child through the `VLLM_API_KEY` child environment rather than
+the command line, so it does not appear in `ps` or `/proc/<pid>/cmdline`; it
+remains readable through that process's environment, so use a dedicated OS
+account and restrict process inspection on the host. Protect remote workers with
+private networking as well as their tokens.
 
 The model revisions, FP16 dtype, 2048-token context, two concurrent sequences,
 and per-process memory-utilization limits are pinned in each config. A vLLM
@@ -685,18 +687,23 @@ same-model replicas keep serving. A worker that had become ready is marked
 its restarted remote process answers again. A local child process that exited,
 or a worker that never completed startup, is marked `unavailable` and is not
 probed again. A dispatched request that does not complete, such as a client
-cancellation, quarantines its worker (`/metrics` reports `unavailable`): the
-worker leaves routing at once and is terminated after its remaining leases
-drain; it is never relaunched. When no replica of the requested model is ready,
-the gateway returns 503 `not_ready`. Failure state is recorded in the worker
-metrics and gateway logs. Recovery is operator-controlled with no automatic
-restart, backoff, or retry loop: restart a remote worker process (a `suspect`
-worker rejoins through health probes), or restart the gateway to recover an
+cancellation or a request deadline, does not permanently take a healthy replica
+offline: the gateway closes that upstream generation, keeps the worker out of
+routing (`/metrics` reports `recycling`), and recycles the worker at most once
+(stop, then start and wait for fresh readiness). A successful recycle returns
+the worker to `ready`; a failed one, or any later non-completion after that
+single recycle, reports `unavailable`: the worker leaves routing at once and is
+terminated after its remaining leases drain. When no replica of the requested
+model is ready, the gateway returns 503 `not_ready`. Failure state is recorded
+in the worker metrics and gateway logs. An unexpectedly dead process is never
+restarted automatically; recovery is operator-controlled with no restart loop,
+backoff, or retry budget: restart a remote worker process (a `suspect` worker
+rejoins through health probes), or restart the gateway to recover an
 `unavailable` worker.
 
 The client never stops a worker. After the protocol, restart the failed remote
-worker, or the gateway for a local worker, and verify the affected model becomes
-`ready` again. Treat returned measurements as one observed run,
+worker, or the gateway for a local worker whose process actually died, and verify
+the affected model becomes `ready` again. Treat returned measurements as one observed run,
 not a general SLO or a proof of safe co-residency. No GPU run is performed by
 the CPU-only checks described here.
 

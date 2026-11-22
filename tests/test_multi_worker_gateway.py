@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -20,11 +21,14 @@ class FakeWorkerEngine:
         self.base_url = definition.endpoint
         self.model = None
         self.alive = False
+        self.starts = 0
+        self.stops = 0
 
     def is_alive(self):
         return self.alive
 
     async def start(self, model):
+        self.starts += 1
         self.model, self.alive = model, True
 
     async def prepare(self, model, messages, max_tokens):
@@ -33,6 +37,7 @@ class FakeWorkerEngine:
                 "chat_template_sha256": "template"}
 
     async def stop(self):
+        self.stops += 1
         self.model, self.alive = None, False
 
 
@@ -100,6 +105,53 @@ class MultiWorkerGatewayTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(set(manager.workers), {row.id for row in self.config.workers})
             self.assertTrue(manager.readiness()["models"][LOW_MODEL]["ready"])
             self.assertTrue(manager.readiness()["models"][HIGH_MODEL]["ready"])
+
+    async def test_stream_deadline_reports_request_timeout_and_recycles_replica(self):
+        config = replace(self.config, workers=tuple(
+            replace(row, request_timeout_s=0.1) for row in self.config.workers))
+        stall = asyncio.Event()
+
+        async def stalling_upstream(request):
+            body = json.loads(request.content)
+            self.forwarded.append((request.url.host, request.headers.get("authorization"), body["model"]))
+            common = {"id": "chatcmpl-" + request.headers["x-request-id"],
+                      "object": "chat.completion.chunk", "created": 1, "model": body["model"],
+                      "prompt_token_ids": [10, 11, 12]}
+            first = {**common, "choices": [{"index": 0, "delta": {"role": "assistant", "content": "hello"},
+                                            "finish_reason": None, "token_ids": [13]}]}
+
+            async def body_stream():
+                yield _sse(first).encode()
+                await stall.wait()
+
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body_stream())
+
+        app = create_app(config=config, worker_engine_factory=FakeWorkerEngine)
+        async with app.router.lifespan_context(app):
+            await app.state.client.aclose()
+            app.state.client = httpx.AsyncClient(
+                transport=httpx.MockTransport(stalling_upstream), trust_env=False)
+            client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://gateway")
+            try:
+                response = await client.post("/v1/chat/completions", json={
+                    "model": LOW_MODEL, "messages": [{"role": "user", "content": "hello"}],
+                    "max_tokens": 1, "stream": True,
+                }, headers={"authorization": "Bearer CLIENT-SECRET"})
+            finally:
+                stall.set()
+                await client.aclose()
+            await app.state.client.aclose()
+            self.assertEqual(response.status_code, 200)
+            self.assertIn('"code": "request_timeout"', response.text)
+            manager = app.state.manager
+            worker = manager.workers["small-0"]
+            self.assertEqual(worker.recycles, 1)
+            async with asyncio.timeout(2):
+                while worker.state != "ready":
+                    await asyncio.sleep(0.01)
+            self.assertEqual(worker.engine.starts, 2)
+            self.assertEqual(worker.engine.stops, 1)
+            self.assertIsNone(worker.last_error)
 
     async def test_gateway_auth_rejects_before_worker_dispatch(self):
         response = await self.post(LOW_MODEL, token="wrong-token")

@@ -125,7 +125,7 @@ class WorkerManagerTests(unittest.IsolatedAsyncioTestCase):
         for lease in leases:
             await manager.release(lease, True)
 
-    async def test_cancelled_dispatched_worker_is_quarantined_without_restart(self):
+    async def test_cancelled_dispatch_recycles_worker_once_and_keeps_replica_routable(self):
         engines = {}
         def factory(row):
             engines[row.id] = FakeEngine(row)
@@ -141,20 +141,40 @@ class WorkerManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(queued, worker.queue)
         first.dispatched = True
         await manager.release(first, False)
-        self.assertEqual(worker.state, "unavailable")
+        self.assertEqual(worker.state, "recycling")
         with self.assertRaises(RouterError) as caught:
             await queued.ready
         self.assertEqual(caught.exception.status, 503)
         await asyncio.gather(queued.prepare_task, return_exceptions=True)
         self.assertNotIn(queued, worker.queue)
-        self.assertEqual(worker.engine.starts, 1)
-        self.assertEqual(worker.engine.stops, 0)
         second.dispatched = True
         await manager.release(second, True)
         await asyncio.gather(*manager.tasks)
-        self.assertEqual(worker.state, "unavailable")
-        self.assertEqual(worker.engine.starts, 1)
+        self.assertEqual(worker.state, "ready")
+        self.assertEqual(worker.engine.starts, 2)
         self.assertEqual(worker.engine.stops, 1)
+        revived = manager.submit(request(), "after-recycle")
+        await revived.ready
+        self.assertIs(revived.worker, worker)
+        await manager.release(revived, True)
+
+    async def test_second_non_completion_after_recycle_quarantines_worker(self):
+        manager = MultiWorkerManager(self.config("D"), engine_factory=FakeEngine)
+        self.addAsyncCleanup(manager.shutdown)
+        await manager.start()
+        worker = next(w for w in manager.workers.values() if w.definition.model == LOW_MODEL)
+        for name in ("first", "second"):
+            lease = manager.submit(request(), name)
+            await lease.ready
+            lease.dispatched = True
+            await manager.release(lease, False)
+            await asyncio.gather(*manager.tasks)
+        self.assertEqual(worker.state, "unavailable")
+        self.assertEqual(worker.engine.starts, 2)
+        self.assertEqual(worker.engine.stops, 2)
+        with self.assertRaises(RouterError) as caught:
+            manager.submit(request(), "third")
+        self.assertEqual(caught.exception.code, "not_ready")
 
     async def test_quarantined_worker_leaves_its_model_replica_routable(self):
         engines = {}
@@ -171,8 +191,16 @@ class WorkerManagerTests(unittest.IsolatedAsyncioTestCase):
         lease.dispatched = True
         await manager.release(lease, False)
         await asyncio.gather(*manager.tasks)
+        self.assertEqual(failed.state, "ready")
+        again = manager.submit(request(), "second")
+        await again.ready
+        self.assertIs(again.worker, failed)
+        again.dispatched = True
+        await manager.release(again, False)
+        await asyncio.gather(*manager.tasks)
         self.assertEqual(failed.state, "unavailable")
-        self.assertEqual(failed.engine.starts, 1)
+        self.assertEqual(failed.engine.starts, 2)
+        self.assertEqual(failed.engine.stops, 2)
         replacement = manager.submit(request(), "failover")
         await replacement.ready
         self.assertEqual(replacement.worker.definition.id, "small-1")
@@ -212,6 +240,7 @@ class WorkerManagerTests(unittest.IsolatedAsyncioTestCase):
         first = manager.submit(request(), "first")
         second = manager.submit(request(), "second")
         await asyncio.gather(first.ready, second.ready)
+        worker.recycles = 1
         first.dispatched = True
         await manager.release(first, False)
         self.assertEqual(worker.state, "unavailable")
@@ -254,6 +283,7 @@ class WorkerManagerTests(unittest.IsolatedAsyncioTestCase):
         await lease.ready
         self.assertIs(lease.worker, worker)
         generation = worker.generation
+        worker.recycles = 1
         served = {w.definition.endpoint: w.definition.model for w in manager.workers.values()}
         probed = asyncio.Event()
         resumed = asyncio.Event()

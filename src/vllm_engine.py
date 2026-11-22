@@ -175,19 +175,16 @@ class VLLMEngine:
                 token = os.environ.get(self.worker.service_token_env)
                 if not token:
                     raise RuntimeError("Worker service credential is not configured.")
-                command += ["--api-key", token]
+                child_env["VLLM_API_KEY"] = token
                 child_env["CUDA_VISIBLE_DEVICES"] = self.worker.gpu_uuid
             if model_id == HIGH_MODEL:
                 command += [
                     "--reasoning-parser", "qwen3",
                     "--default-chat-template-kwargs", '{"enable_thinking": false}',
                 ]
-            reported_command = list(command)
-            if "--api-key" in reported_command:
-                reported_command[reported_command.index("--api-key") + 1] = "[REDACTED]"
             self.metadata = {
                 "model": model_id, "revision": revision, "tokenizer_revision": revision,
-                "engine_version": ENGINE_VERSION, "launch_command": reported_command,
+                "engine_version": ENGINE_VERSION, "launch_command": command,
                 "declared_dtype": "float16", "declared_kv_cache_dtype": "float16",
                 "context_limit": 2048, "max_num_seqs": 2, "thinking": False,
                 "gpu": torch.cuda.get_device_name(0) if self.worker is None else None,

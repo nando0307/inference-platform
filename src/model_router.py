@@ -520,6 +520,11 @@ async def _stream(request, lease):
         request.state.completed = True
     except asyncio.CancelledError:
         raise
+    except TimeoutError:
+        request.state.trace_error_code = "request_timeout"
+        request.app.state.manager.fail("request_timeout", exclude=lease)
+        yield _sse(_error(RouterError(504, "request_timeout", "The request exceeded its deadline."), lease.request_id))
+        yield "data: [DONE]\n\n"
     except Exception:
         request.state.trace_error_code = "upstream_failed"
         request.app.state.manager.fail("upstream_failed", exclude=lease)

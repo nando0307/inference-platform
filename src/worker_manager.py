@@ -32,6 +32,7 @@ class Worker:
     requests: dict = field(default_factory=lambda: {"completed": 0, "failed": 0, "canceled": 0, "rejected": 0})
     last_error: str | None = None
     cleanup_task: asyncio.Task | None = None
+    recycles: int = 0
 
     @property
     def inflight(self):
@@ -333,11 +334,18 @@ class MultiWorkerManager:
         worker.requests[outcome] += 1
         self.emit("released", worker, request_id=lease.request_id, outcome=outcome)
         if not completed and lease.dispatched and not self.closing:
-            worker.state = "unavailable"
-            worker.last_error = outcome
             self._fail_queued(worker, "not_ready")
             if worker.cleanup_task is None:
-                worker.cleanup_task = asyncio.create_task(self._retire(worker))
+                worker.last_error = outcome
+                if worker.recycles == 0:
+                    worker.recycles = 1
+                    worker.state = "recycling"
+                    self.emit("recycling", worker, generation=worker.generation)
+                    task = self._recycle(worker)
+                else:
+                    worker.state = "unavailable"
+                    task = self._retire(worker)
+                worker.cleanup_task = asyncio.create_task(task)
                 self.tasks.add(worker.cleanup_task)
                 worker.cleanup_task.add_done_callback(self.tasks.discard)
         self._promote(worker)
@@ -366,6 +374,34 @@ class MultiWorkerManager:
                 await worker.engine.stop()
         except Exception:
             worker.last_error = "cleanup_failed"
+
+    async def _recycle(self, worker):
+        worker.generation += 1
+        try:
+            async with asyncio.timeout(DRAIN_TIMEOUT):
+                while worker.active:
+                    await asyncio.sleep(0.01)
+            async with asyncio.timeout(STOP_TIMEOUT):
+                await worker.engine.stop()
+            async with asyncio.timeout(worker.definition.startup_timeout_s):
+                await worker.engine.start(worker.definition.model)
+            if worker.engine.model != worker.definition.model or not worker.engine.is_alive():
+                raise RuntimeError("Recycled worker did not serve the configured model.")
+        except Exception:
+            worker.last_error = "recycle_failed"
+            try:
+                async with asyncio.timeout(STOP_TIMEOUT):
+                    await worker.engine.stop()
+            except Exception:
+                worker.last_error = "cleanup_failed"
+            worker.state = "unavailable"
+        else:
+            worker.last_error = None
+            worker.consecutive_successes = 0
+            worker.state = "ready"
+            self.emit("recycled", worker, generation=worker.generation)
+        finally:
+            worker.cleanup_task = None
 
     def metrics(self):
         workers = self.snapshot()["workers"]
