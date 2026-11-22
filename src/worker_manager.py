@@ -111,7 +111,7 @@ class MultiWorkerManager:
             models[model.id] = {"ready": ready, "configured": len(replicas),
                                 "status": "ready" if ready == len(replicas) else "degraded" if ready else "unavailable"}
         return {
-            "ready": self.accepting and all(row["ready"] > 0 for row in models.values()),
+            "ready": self.accepting and any(row["ready"] > 0 for row in models.values()),
             "placement": self.config.placement, "models": models,
             "workers": {w.definition.id: {
                 "state": w.state, "generation": w.generation, "model": w.definition.model,
@@ -363,7 +363,7 @@ class MultiWorkerManager:
     async def _recycle(self, worker):
         worker.generation += 1
         try:
-            drain = max(DRAIN_TIMEOUT, worker.definition.request_timeout_s)
+            drain = max(DRAIN_TIMEOUT, 2 * worker.definition.request_timeout_s + CLOSE_TIMEOUT)
             async with asyncio.timeout(drain):
                 while worker.active:
                     await asyncio.sleep(0.01)

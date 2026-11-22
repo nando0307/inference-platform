@@ -180,7 +180,7 @@ class MultiWorkerGatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.json()["error"]["code"], "not_ready")
         self.assertEqual(len(self.forwarded), 0)
 
-    async def test_public_readiness_hides_worker_topology_and_requires_every_model(self):
+    async def test_public_readiness_hides_worker_topology_and_reports_routable_models(self):
         response = await self.client.get("/ready")
         self.assertEqual(response.status_code, 200)
         body = response.json()
@@ -192,10 +192,11 @@ class MultiWorkerGatewayTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(private, serialized)
         manager = self.app.state.manager
         manager.workers["large-0"].state = "unavailable"
-        unavailable = await self.client.get("/ready")
-        self.assertEqual(unavailable.status_code, 503)
-        self.assertEqual(unavailable.json()["models"][HIGH_MODEL]["status"], "unavailable")
-        self.assertEqual(unavailable.json()["models"][LOW_MODEL]["status"], "ready")
+        partial = await self.client.get("/ready")
+        self.assertEqual(partial.status_code, 200)
+        self.assertTrue(partial.json()["ready"])
+        self.assertEqual(partial.json()["models"][HIGH_MODEL]["status"], "unavailable")
+        self.assertEqual(partial.json()["models"][LOW_MODEL]["status"], "ready")
         manager.workers["large-0"].state = "ready"
         manager.workers["small-0"].state = "unavailable"
         degraded = await self.client.get("/ready")
@@ -206,6 +207,13 @@ class MultiWorkerGatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(degraded.json()["models"][HIGH_MODEL]["status"], "ready")
         metrics = (await self.client.get("/metrics", headers={"authorization": "Bearer CLIENT-SECRET"})).json()
         self.assertEqual(metrics["workers"]["small-0"]["state"], "unavailable")
+        for worker in manager.workers.values():
+            worker.state = "unavailable"
+        offline = await self.client.get("/ready")
+        self.assertEqual(offline.status_code, 503)
+        self.assertFalse(offline.json()["ready"])
+        self.assertEqual(offline.json()["models"][LOW_MODEL]["status"], "unavailable")
+        self.assertEqual(offline.json()["models"][HIGH_MODEL]["status"], "unavailable")
 
 
 if __name__ == "__main__":

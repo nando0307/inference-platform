@@ -64,8 +64,8 @@ class WorkerManagerTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(manager.shutdown)
         self.assertTrue(await manager.start())
         state = manager.snapshot()
-        self.assertFalse(state["ready"])
-        self.assertFalse(manager.readiness()["ready"])
+        self.assertTrue(state["ready"])
+        self.assertTrue(manager.readiness()["ready"])
         self.assertEqual(state["models"][LOW_MODEL]["status"], "ready")
         self.assertEqual(state["models"][HIGH_MODEL]["status"], "unavailable")
         lease = manager.submit(request(LOW_MODEL), "small-request")
@@ -251,9 +251,13 @@ class WorkerManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.status, 503)
         self.assertEqual(caught.exception.code, "not_ready")
         state = manager.readiness()
-        self.assertFalse(state["ready"])
+        self.assertTrue(state["ready"])
         self.assertEqual(state["models"][LOW_MODEL]["status"], "unavailable")
         self.assertEqual(state["models"][HIGH_MODEL]["status"], "ready")
+        large = manager.workers["large-0"]
+        large.engine.alive = False
+        await manager._probe(large, large.generation)
+        self.assertFalse(manager.readiness()["ready"])
 
     async def test_recycling_worker_is_not_revived_by_concurrent_failure_or_probe(self):
         manager = MultiWorkerManager(self.config("D"), engine_factory=FakeEngine)
@@ -352,7 +356,7 @@ class WorkerManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(worker.state, "recycling")
         self.assertEqual(worker.engine.starts, 1)
 
-    async def test_recycle_drains_sibling_lease_past_shutdown_drain_constant(self):
+    async def test_recycle_drain_covers_two_sequential_request_budgets(self):
         config = self.config("D")
         config = replace(config, workers=tuple(
             replace(row, request_timeout_s=1.0) for row in config.workers))
@@ -367,7 +371,7 @@ class WorkerManagerTests(unittest.IsolatedAsyncioTestCase):
             first.dispatched = True
             await manager.release(first, False)
             self.assertEqual(worker.state, "recycling")
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(1.5)
             self.assertEqual(worker.state, "recycling")
             second.dispatched = True
             await manager.release(second, True)
@@ -411,7 +415,8 @@ class WorkerManagerTests(unittest.IsolatedAsyncioTestCase):
         second = manager.submit(request(), "second")
         await asyncio.gather(first.ready, second.ready)
         first.dispatched = True
-        with patch("src.worker_manager.DRAIN_TIMEOUT", 0.01):
+        with patch("src.worker_manager.DRAIN_TIMEOUT", 0.01), \
+                patch("src.worker_manager.CLOSE_TIMEOUT", 0.01):
             await manager.release(first, False)
             await asyncio.gather(*manager.tasks)
         self.assertEqual(worker.state, "unavailable")
