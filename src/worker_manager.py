@@ -1,6 +1,7 @@
 """Event-loop-owned registry and bounded dispatcher for independent GPU workers."""
 
 import asyncio
+import logging
 import os
 from collections import deque
 from dataclasses import dataclass, field
@@ -15,6 +16,8 @@ from .vllm_engine import VLLMEngine
 
 _nvml_initialized = False
 
+logger = logging.getLogger("inference.workers")
+
 
 @dataclass(eq=False)
 class Worker:
@@ -28,6 +31,7 @@ class Worker:
     consecutive_successes: int = 0
     requests: dict = field(default_factory=lambda: {"completed": 0, "failed": 0, "canceled": 0, "rejected": 0})
     last_error: str | None = None
+    pending_recycle: bool = False
 
     @property
     def inflight(self):
@@ -95,6 +99,9 @@ class MultiWorkerManager:
     def emit(self, event, worker=None, **fields):
         self.events.append({"timestamp": perf_counter(), "event": event,
                             "worker": worker.definition.id if worker else None, **fields})
+        if event in {"startup_failed", "unready", "worker_failed"}:
+            logger.warning("worker %s %s %s", worker.definition.id if worker else None,
+                           event, " ".join(f"{key}={value}" for key, value in fields.items()))
 
     def snapshot(self):
         models = {}
@@ -114,6 +121,10 @@ class MultiWorkerManager:
                 "queue_capacity": self.config.queue_capacity_per_worker, "error": w.last_error,
             } for w in self.workers.values()},
         }
+
+    def readiness(self):
+        state = self.snapshot()
+        return {"ready": state["ready"], "models": state["models"]}
 
     def _revision(self, model_id):
         return next(model.revision for model in self.config.models.values() if model.id == model_id)
@@ -149,16 +160,19 @@ class MultiWorkerManager:
     async def _probe(self, worker, generation):
         if worker.generation != generation or worker.state not in {"ready", "suspect"}:
             return
-        token = os.environ.get(worker.definition.service_token_env, "")
-        headers = {"authorization": f"Bearer {token}"} if token else {}
-        try:
-            async with httpx.AsyncClient(timeout=self.config.health_timeout_s, trust_env=False) as client:
-                health = await client.get(worker.engine.base_url + "/health", headers=headers)
-                models = await client.get(worker.engine.base_url + "/v1/models", headers=headers)
-                valid = (health.status_code == 200 and models.status_code == 200
-                         and [item["id"] for item in models.json()["data"]] == [worker.definition.model])
-        except Exception:
+        if self.mode == "local" and not worker.engine.is_alive():
             valid = False
+        else:
+            token = os.environ.get(worker.definition.service_token_env, "")
+            headers = {"authorization": f"Bearer {token}"} if token else {}
+            try:
+                async with httpx.AsyncClient(timeout=self.config.health_timeout_s, trust_env=False) as client:
+                    health = await client.get(worker.engine.base_url + "/health", headers=headers)
+                    models = await client.get(worker.engine.base_url + "/v1/models", headers=headers)
+                    valid = (health.status_code == 200 and models.status_code == 200
+                             and [item["id"] for item in models.json()["data"]] == [worker.definition.model])
+            except Exception:
+                valid = False
         if worker.generation != generation:
             return
         if valid:
@@ -276,9 +290,10 @@ class MultiWorkerManager:
             worker.available.set()
 
     def _promote(self, worker):
-        while worker.queue and len(worker.active) < worker.definition.max_sequences:
-            lease = worker.queue.popleft()
-            worker.active.add(lease)
+        if not worker.pending_recycle:
+            while worker.queue and len(worker.active) < worker.definition.max_sequences:
+                lease = worker.queue.popleft()
+                worker.active.add(lease)
         worker.available.set()
 
     def _fail_queued(self, worker, code):
@@ -304,9 +319,14 @@ class MultiWorkerManager:
         outcome = "completed" if completed else "canceled" if lease.task and lease.task.cancelled() else "failed"
         worker.requests[outcome] += 1
         self.emit("released", worker, request_id=lease.request_id, outcome=outcome)
-        worker.available.set()
         if not completed and lease.dispatched and not self.closing:
-            await self.recycle(worker)
+            worker.pending_recycle = True
+        self._promote(worker)
+        if worker.pending_recycle and not worker.active and not self.closing:
+            worker.pending_recycle = False
+            task = asyncio.create_task(self.recycle(worker))
+            self.tasks.add(task)
+            task.add_done_callback(self.tasks.discard)
 
     def fail(self, reason="upstream_failed", exclude=None):
         worker = getattr(exclude, "worker", None) if exclude is not None else None
@@ -320,7 +340,10 @@ class MultiWorkerManager:
 
     async def recycle(self, worker):
         if worker.active or self.closing:
+            if worker.active and not self.closing:
+                worker.pending_recycle = True
             return
+        worker.pending_recycle = False
         worker.state = "unavailable"
         self._fail_queued(worker, "not_ready")
         worker.generation += 1

@@ -637,7 +637,8 @@ def create_app(engine=None, config=None, worker_engine_factory=None, mode=None):
 
     app = FastAPI(lifespan=lifespan)
     app.add_middleware(_LeaseMiddleware)
-    app.add_middleware(_AuthMiddleware)
+    if config is not None:
+        app.add_middleware(_AuthMiddleware)
 
     @app.get("/health")
     async def health():
@@ -645,7 +646,8 @@ def create_app(engine=None, config=None, worker_engine_factory=None, mode=None):
 
     @app.get("/ready")
     async def ready():
-        state = app.state.manager.snapshot()
+        manager = app.state.manager
+        state = manager.readiness() if hasattr(manager, "readiness") else manager.snapshot()
         return JSONResponse(state, status_code=200 if state["ready"] else 503)
 
     @app.get("/metrics")

@@ -120,6 +120,24 @@ class MultiWorkerGatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.json()["error"]["code"], "not_ready")
         self.assertEqual(len(self.forwarded), 0)
+    async def test_public_readiness_hides_worker_topology_and_reports_partial_failure(self):
+        response = await self.client.get("/ready")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(set(body), {"ready", "models"})
+        self.assertTrue(body["ready"])
+        serialized = json.dumps(body)
+        for private in ("GPU-", "127.0.0.1", "cuda_device", "physical_gpu_uuid",
+                        "host", "error", "endpoint", "revision", "queued"):
+            self.assertNotIn(private, serialized)
+        self.app.state.manager.workers["small-0"].state = "unavailable"
+        degraded = await self.client.get("/ready")
+        self.assertEqual(degraded.status_code, 200)
+        self.assertEqual(degraded.json()["models"][LOW_MODEL]["status"], "degraded")
+        self.assertEqual(degraded.json()["models"][LOW_MODEL]["ready"], 1)
+        self.assertEqual(degraded.json()["models"][HIGH_MODEL]["status"], "ready")
+        metrics = (await self.client.get("/metrics", headers={"authorization": "Bearer CLIENT-SECRET"})).json()
+        self.assertEqual(metrics["workers"]["small-0"]["state"], "unavailable")
 
 
 if __name__ == "__main__":

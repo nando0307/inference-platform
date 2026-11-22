@@ -25,12 +25,13 @@ MIXED_PER_MODEL = 4
 
 
 def _summary(rows, elapsed):
-    successful = [row for row in rows if row["status"] == "success"]
+    measured = [row for row in rows if row["phase"] == "measured"]
+    successful = [row for row in measured if row["status"] == "success"]
     tokens = sum(row["completion_tokens"] or 0 for row in successful)
-    return {"requests": len(rows), "successes": len(successful),
-            "http_429": sum(row["http_status"] == 429 for row in rows),
-            "errors": sum(row["status"] == "error" for row in rows),
-            "canceled": sum(row["status"] == "canceled" for row in rows),
+    return {"requests": len(measured), "successes": len(successful),
+            "http_429": sum(row["http_status"] == 429 for row in measured),
+            "errors": sum(row["status"] == "error" for row in measured),
+            "canceled": sum(row["status"] == "canceled" for row in measured),
             "e2e_ms": distribution([row["e2e_ms"] for row in successful]),
             "first_text_ms": distribution([row["first_text_ms"] for row in successful]),
             "successful_completion_tokens": tokens,
@@ -77,8 +78,9 @@ async def run_protocol(url, placement, config, small, large, failure_worker, out
     async with httpx.AsyncClient(timeout=180, headers=headers, trust_env=False,
                                  limits=httpx.Limits(max_connections=BURST, max_keepalive_connections=BURST)) as client:
         before = await client.get(url.rstrip("/") + "/ready")
-        before_state = before.json()
-        if before.status_code != 200 or before_state.get("workers", {}).get(failure_worker, {}).get("state") != "ready":
+        before_metrics = (await client.get(url.rstrip("/") + "/metrics")).json()
+        if (before.status_code != 200
+                or before_metrics.get("workers", {}).get(failure_worker, {}).get("state") != "ready"):
             raise RuntimeError("The selected failure worker must be ready before the benchmark starts.")
         artifact["case_8_worker_ready_before_run"] = True
         async def execute(name, targets, *, warmups=0, concurrent=False):
@@ -130,10 +132,11 @@ async def run_protocol(url, placement, config, small, large, failure_worker, out
         await asyncio.to_thread(input, "Wait until /ready reports it unready, then press Enter: ")
         ready = await client.get(url.rstrip("/") + "/ready")
         initial = ready.json()
+        initial_metrics = (await client.get(url.rstrip("/") + "/metrics")).json()
         artifact["case_8_before"] = initial
-        if ready.status_code == 200 and initial.get("workers", {}).get(failure_worker, {}).get("state") == "ready":
+        if ready.status_code == 200 and initial_metrics.get("workers", {}).get(failure_worker, {}).get("state") == "ready":
             raise RuntimeError("Selected failure worker is still ready; case 8 was not run.")
-        failed_ready = initial.get("models", {}).get(failed_config.model, {}).get("ready", 0)
+        failed_ready = initial_metrics.get("models", {}).get(failed_config.model, {}).get("ready", 0)
         should_retain = placement in {"B", "C"}
         artifact["case_8_expectation"] = "same-model replica remains routable" if should_retain else "model returns 503; no substitution to the idle/dedicated other GPU"
         failure_targets = [(failed_config.model, singles[(failed_config.model, "short")][1]),
@@ -141,7 +144,7 @@ async def run_protocol(url, placement, config, small, large, failure_worker, out
         failure_entry = await execute("replica/failure isolation", failure_targets, concurrent=True)
         affected = [row for row in failure_entry["rows"] if row["case"] == singles[(failed_config.model, "short")][1]["name"]]
         unaffected = [row for row in failure_entry["rows"] if row not in affected]
-        artifact["checks"]["case_8_worker_unready"] = initial.get("workers", {}).get(failure_worker, {}).get("state") in {"suspect", "unavailable"}
+        artifact["checks"]["case_8_worker_unready"] = initial_metrics.get("workers", {}).get(failure_worker, {}).get("state") in {"suspect", "unavailable"}
         artifact["checks"]["case_8_expected_availability"] = (
             failed_ready > 0 and bool(affected) and all(row["status"] == "success" for row in affected)
             if should_retain else failed_ready == 0 and bool(affected) and all(row["http_status"] == 503 for row in affected)

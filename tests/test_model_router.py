@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import unittest
 from contextlib import suppress
 from threading import Event
@@ -384,6 +385,24 @@ class LifespanTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(RuntimeError, "cleanup"):
                 await context.__aexit__(None, None, None)
         self.assertTrue(flushed.is_set())
+
+
+class LegacyAuthTests(unittest.IsolatedAsyncioTestCase):
+    async def test_single_resident_router_stays_ungated_when_token_is_configured(self):
+        upstream = LocalUpstream()
+        engine = FakeEngine()
+        engine.base_url = await upstream.start()
+        self.addAsyncCleanup(upstream.close)
+        with patch.dict(os.environ, {router.AUTH_TOKEN_ENV: "CLIENT-SECRET"}):
+            app = router.create_app(engine)
+            context = app.router.lifespan_context(app)
+            await context.__aenter__()
+            self.addAsyncCleanup(context.__aexit__, None, None, None)
+            engine.manager = app.state.manager
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://router") as client:
+                response = await client.post("/v1/chat/completions", json=data())
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual((await client.get("/metrics")).status_code, 200)
 
 
 class EndpointTests(unittest.IsolatedAsyncioTestCase):

@@ -528,9 +528,11 @@ prevent graceful shutdown and require process termination.
 
 In the CPU app (`src.api:app`), `INFERENCE_API_TOKEN` gates
 `POST /v1/chat/completions` and `GET /metrics`. Unset or empty leaves both open,
-which is the documented mode for loopback use. The model router uses the same
-bearer gate for chat and `/metrics`; in static multi-GPU mode, metrics include
-worker, model, and physical-device state.
+which is the documented mode for loopback use. Only the static multi-GPU mode of
+the model router (`MULTI_GPU_CONFIG` set) uses the same bearer gate for chat and
+`/metrics`; the legacy single-resident router keeps its previous ungated
+behavior and ignores `INFERENCE_API_TOKEN`. In static multi-GPU mode, metrics
+include worker, model, and physical-device state.
 
 ```bash
 INFERENCE_API_TOKEN="$TOKEN" .venv/bin/python -m uvicorn src.api:app \
@@ -613,8 +615,11 @@ MULTI_GPU_CONFIG=/path/to/serving-a.json MULTI_GPU_MODE=remote \
   --host 127.0.0.1 --port 8000 --workers 1
 ```
 
-`/ready` reports global routability and per-model/per-worker state; a model
-without a ready worker returns 503. `/metrics` reports request state per worker,
+`/ready` reports only global routability and per-model availability status, so
+it can stay public for probes; a model without a ready worker makes it return
+503, and a model with only some replicas ready is reported `degraded`. Worker
+state, endpoints, physical UUIDs, device ordinals, revisions, queue depths, and
+failure detail stay on `/metrics`, which reports request state per worker,
 model, and physical UUID. NVML telemetry is optional and missing values remain
 unknown, not zero. No prompts, outputs, request headers, or service credentials
 are included in these metrics.
@@ -654,8 +659,9 @@ pgid=$(ps -o pgid= -p "$pid" | tr -d ' ')
 kill -TERM -- "-$pgid"
 ```
 
-Wait until `/ready` reports the selected worker unready, then press Enter in
-the benchmark terminal. Use a fresh output path:
+Wait until `/ready` reports the affected model as `degraded` or `unavailable`
+(`/metrics` reports the selected worker state), then press Enter in the
+benchmark terminal. Use a fresh output path:
 
 ```bash
 .venv/bin/python -m benchmarks.multi_gpu_serving \
@@ -666,8 +672,21 @@ the benchmark terminal. Use a fresh output path:
   --output benchmark-results/multi-gpu/approved-run.json
 ```
 
-The client never stops a worker. Restart the failed worker after the protocol
-and verify `/ready` recovers. Treat returned measurements as one observed run,
+`/health` probes are cheap liveness checks. Each worker also gets a full health
+probe every `health_interval_s`. A worker that fails its probe, including a
+local child process that exited, is marked `suspect`, removed from routing
+immediately, and its queued requests fail with 503 `not_ready`. Healthy
+same-model replicas keep serving. When no replica of the requested model is
+ready, the gateway returns 503 `not_ready` and `/ready` reports that model as
+`degraded` or `unavailable`. Failure state is recorded in the worker metrics and
+gateway logs. Recovery is operator-controlled with no automatic restart,
+backoff, or retry loop: restart the failed remote worker process, or for a local
+worker restart the gateway, which owns the local child process groups. Verify
+`/ready` recovers after the restart.
+
+The client never stops a worker. After the protocol, restart the failed remote
+worker, or the gateway for a local worker, and verify `/ready` recovers. Treat
+returned measurements as one observed run,
 not a general SLO or a proof of safe co-residency. No GPU run is performed by
 the CPU-only checks described here.
 
