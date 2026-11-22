@@ -90,8 +90,10 @@ async def _consume_stream(response, row, case, started, *, cancel_after_text=Fal
             raise StreamError("malformed_stream") from None
         if not isinstance(chunk, dict):
             raise StreamError("malformed_stream")
-        if "error" in chunk:
-            raise StreamError(_error_code(chunk, "stream_error"))
+        if isinstance(chunk.get("error"), dict):
+            raise StreamError(_error_code(chunk, "upstream_failed"))
+        if case.get("model") is not None and chunk.get("model") != case["model"]:
+            raise StreamError("response_identity_mismatch")
         if "events" in row and chunk.get("prompt_token_ids") is not None:
             prompt_ids = _token_ids(chunk["prompt_token_ids"])
             if row["prompt_token_ids"] is not None and row["prompt_token_ids"] != prompt_ids:
@@ -158,9 +160,12 @@ async def run_request(
     }
     payload = {
         **(request_options or {}),
-        "model": workload["model"], "messages": case["messages"],
-        "max_tokens": case["max_tokens"], "temperature": workload["generation"]["temperature"],
-        "top_p": workload["generation"]["top_p"], "stream": True,
+        "model": case.get("model", workload["model"]),
+        "messages": case["messages"],
+        "max_tokens": case["max_tokens"],
+        "temperature": workload["generation"]["temperature"],
+        "top_p": workload["generation"]["top_p"],
+        "stream": True,
     }
     started = perf_counter()
     if capture_events:
@@ -301,11 +306,14 @@ def _load_workload(path):
         raise ValueError("Workload must be a JSON object")
     baseline = workload.get("baseline", {})
     generation = workload.get("generation", {})
+    from src.vllm_engine import MODEL_SPECS
+
+    model_id = workload.get("model")
     if (
         workload.get("schema_version") != 1
-        or workload.get("model") != "Qwen/Qwen2.5-0.5B-Instruct"
-        or not isinstance(workload.get("model_revision"), str) or not workload["model_revision"]
-        or not isinstance(workload.get("tokenizer_revision"), str) or not workload["tokenizer_revision"]
+        or model_id not in MODEL_SPECS
+        or workload.get("model_revision") != MODEL_SPECS[model_id]["revision"]
+        or workload.get("tokenizer_revision") != MODEL_SPECS[model_id]["revision"]
         or not isinstance(baseline, dict)
         or baseline.get("device") != "cpu"
         or baseline.get("dtype") != "float32"
@@ -319,7 +327,7 @@ def _load_workload(path):
         or type(generation.get("top_p")) not in (int, float)
         or generation["top_p"] != 1
     ):
-        raise ValueError("Workload must declare the versioned Qwen greedy baseline and EOS-inclusive counts")
+        raise ValueError("Workload must declare a pinned Qwen model, greedy generation, and EOS-inclusive counts")
     cases = workload.get("cases")
     if not isinstance(cases, list) or not cases:
         raise ValueError("Workload needs at least one case")
@@ -330,6 +338,11 @@ def _load_workload(path):
         if case["name"] in names:
             raise ValueError("Workload case names must be unique")
         names.add(case["name"])
+        case_model = case.get("model", model_id)
+        if case_model not in MODEL_SPECS:
+            raise ValueError("Every case must use an allowlisted model")
+        if "model" in case and case.get("model_revision") != MODEL_SPECS[case_model]["revision"]:
+            raise ValueError("Cross-model cases must pin the model revision")
         if (
             type(case.get("prompt_tokens")) is not int or case["prompt_tokens"] < 1
             or type(case.get("max_tokens")) is not int or not 1 <= case["max_tokens"] <= 512
@@ -345,7 +358,6 @@ def _load_workload(path):
         ):
             raise ValueError("Workload messages must use the supported text chat contract")
     return workload
-
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)

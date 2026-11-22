@@ -542,6 +542,135 @@ Authentication runs before request logging, so unauthorized attempts produce no
 lifecycle log and no `x-request-id` header. They are counted in `/metrics` as
 `errors.unauthorized`.
 
+### Static multi-GPU vLLM serving
+
+The opt-in `src.model_router:create_app` can manage one vLLM process per
+configured worker and route each supported model to its own process. Validate
+the four reviewed placements before launch:
+
+```bash
+python3.12 -m src.serving_config --config configs/serving-a.json
+python3.12 -m src.serving_config --config configs/serving-b.json
+python3.12 -m src.serving_config --config configs/serving-c.json
+python3.12 -m src.serving_config --config configs/serving-d.json
+```
+
+| Placement | GPU 0 | GPU 1 |
+|---|---|---|
+| A | Small model | Large model |
+| B | Small and large models | Small replica |
+| C | Small and large models | Large replica |
+| D | Small and large models | Idle |
+
+These files contain placeholder physical UUIDs. Replace them with the UUIDs of
+the approved allocated devices before use, preserve the validated mapping
+between `cuda_device` and `gpu_uuid`, and set distinct secret values for every
+worker's `service_token_env`. Endpoints and process-local ports are already
+distinct. The gateway bearer credential is optional on a private loopback-only
+setup, but REQUIRED for any less-trusted network. Set `INFERENCE_API_TOKEN`
+for the client-facing bearer gate. Never put credentials in the config, operator
+command, benchmark artifacts, or source control. vLLM requires its worker API
+key as a child-process argument, which may be visible to users with process
+inspection access on that host. Use a dedicated OS account and restrict that
+access; protect remote workers with private networking as well as their tokens.
+
+The model revisions, FP16 dtype, 2048-token context, two concurrent sequences,
+and per-process memory-utilization limits are pinned in each config. A vLLM
+utilization limit is not a physical memory partition: it does not prevent
+processes from competing for memory or CUDA resources. Co-residency in B, C, and
+D is unverified. Do not start those placements, request paid GPU capacity, or
+claim multi-GPU results without explicit approval for the specific hardware and
+run. The static mapping does not substitute another model when its workers are
+unavailable; D intentionally leaves GPU 1 idle.
+
+For an approved local allocation, export secrets through a secret manager or
+interactive shell, then launch one gateway. Each local worker is an owned child
+process; Ctrl-C stops the gateway and reaps its process groups:
+
+```bash
+export INFERENCE_API_TOKEN
+export WORKER_SMALL_0_TOKEN
+export WORKER_LARGE_1_TOKEN
+MULTI_GPU_CONFIG=configs/serving-a.json MULTI_GPU_MODE=local \
+  .venv/bin/python -m uvicorn src.model_router:create_app --factory \
+  --host 127.0.0.1 --port 8000 --workers 1
+```
+
+Set every worker token named by the selected config. On one approved remote
+host with the configured two-GPU topology, run
+`python -m src.worker_process --config CONFIG --worker WORKER_ID` for each
+configured worker, with its distinct service-token environment variable set.
+The A-D schema represents one physical two-GPU host; remote mode does not model
+a multi-host GPU placement. Start the gateway with `MULTI_GPU_MODE=remote`; its
+shutdown does not stop these workers, so stop each worker process with SIGINT
+or SIGTERM. Keep worker endpoints private and enforce network-level access in
+addition to their bearer tokens.
+
+```bash
+MULTI_GPU_CONFIG=/path/to/serving-a.json MULTI_GPU_MODE=remote \
+  .venv/bin/python -m uvicorn src.model_router:create_app --factory \
+  --host 127.0.0.1 --port 8000 --workers 1
+```
+
+`/ready` reports global routability and per-model/per-worker state; a model
+without a ready worker returns 503. `/metrics` reports request state per worker,
+model, and physical UUID. NVML telemetry is optional and missing values remain
+unknown, not zero. No prompts, outputs, request headers, or service credentials
+are included in these metrics.
+
+#### Approved two-card T4 validation protocol
+
+This repository does not allocate GPUs or contain a completed multi-GPU run.
+Before any real run, obtain separate explicit approval for the selected A-D
+placement, two-card T4 allocation, expected cost, and the co-residency risk.
+Confirm the physical UUIDs with `nvidia-smi -L`, update the config, validate it,
+and record `nvidia-smi` before, during, and after the run. Test A first. B/C/D
+require a separate decision after A; their two-process same-card placement is
+not implied safe by the config's memory limits.
+
+Generate both pinned workload manifests on a host with the exact model and
+tokenizer snapshots cached:
+
+```bash
+.venv/bin/python -m benchmarks.workloads \
+  --model Qwen/Qwen2.5-0.5B-Instruct --output /tmp/small-workload.json
+.venv/bin/python -m benchmarks.workloads \
+  --model Qwen/Qwen3-1.7B --output /tmp/large-workload.json
+```
+
+The fixed protocol runs short/long single requests, eight-request same-model
+bursts, four concurrent requests per model, then pauses for a manually stopped
+worker failure-isolation case. Its worker selection is fixed: A `large-1`, B
+`small-1`, C `large-1`, D `small-0`. The selected worker must be ready before
+launch. After cases 1-7, the interactive client prints its configured endpoint
+and waits. On that host, use the endpoint port and stop its process group without
+stopping the gateway:
+
+```bash
+port=8102 # replace with the selected worker's configured endpoint port
+pid=$(lsof -tiTCP:"$port" -sTCP:LISTEN)
+pgid=$(ps -o pgid= -p "$pid" | tr -d ' ')
+kill -TERM -- "-$pgid"
+```
+
+Wait until `/ready` reports the selected worker unready, then press Enter in
+the benchmark terminal. Use a fresh output path:
+
+```bash
+.venv/bin/python -m benchmarks.multi_gpu_serving \
+  --url http://127.0.0.1:8000 --config configs/serving-a.json \
+  --small-workload /tmp/small-workload.json \
+  --large-workload /tmp/large-workload.json \
+  --failure-worker large-1 \
+  --output benchmark-results/multi-gpu/approved-run.json
+```
+
+The client never stops a worker. Restart the failed worker after the protocol
+and verify `/ready` recovers. Treat returned measurements as one observed run,
+not a general SLO or a proof of safe co-residency. No GPU run is performed by
+the CPU-only checks described here.
+
+
 ### Metrics
 
 `GET /metrics` returns one JSON snapshot from the current process. Counters reset
