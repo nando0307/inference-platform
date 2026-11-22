@@ -1,6 +1,9 @@
 import asyncio
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+import httpx
 
 from src.model_router import RouterError, RoutingRequest
 from src.serving_config import load_config
@@ -200,6 +203,47 @@ class WorkerManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(state["ready"])
         self.assertEqual(state["models"][LOW_MODEL]["status"], "unavailable")
         self.assertEqual(state["models"][HIGH_MODEL]["status"], "ready")
+
+    async def test_quarantined_worker_is_not_revived_by_concurrent_failure_or_probe(self):
+        manager = MultiWorkerManager(self.config("D"), engine_factory=FakeEngine)
+        self.addAsyncCleanup(manager.shutdown)
+        await manager.start()
+        worker = next(w for w in manager.workers.values() if w.definition.model == LOW_MODEL)
+        first = manager.submit(request(), "first")
+        second = manager.submit(request(), "second")
+        await asyncio.gather(first.ready, second.ready)
+        first.dispatched = True
+        await manager.release(first, False)
+        self.assertEqual(worker.state, "unavailable")
+        self.assertIsNotNone(worker.cleanup_task)
+        manager.fail("upstream_failed", exclude=second)
+        self.assertEqual(worker.state, "unavailable")
+        served = {w.definition.endpoint: w.definition.model for w in manager.workers.values()}
+
+        class HealthyUpstream:
+            def __init__(self, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def get(self, url, headers=None):
+                if url.endswith("/health"):
+                    return httpx.Response(200)
+                return httpx.Response(200, json={"data": [{"id": served[url[: -len("/v1/models")]]}]})
+
+        with patch("src.worker_manager.httpx.AsyncClient", HealthyUpstream):
+            await manager._probe(worker, worker.generation)
+            await manager._probe(worker, worker.generation)
+        self.assertEqual(worker.state, "unavailable")
+        second.dispatched = True
+        await manager.release(second, True)
+        await asyncio.gather(*manager.tasks)
+        self.assertEqual(worker.engine.starts, 1)
+        self.assertEqual(worker.engine.stops, 1)
 
     async def test_metrics_deduplicate_physical_device_and_leave_unavailable_unknown(self):
         manager = MultiWorkerManager(self.config("B"), engine_factory=FakeEngine)

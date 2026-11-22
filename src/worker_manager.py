@@ -157,6 +157,10 @@ class MultiWorkerManager:
         self.health_task = asyncio.create_task(self._health_loop(), name="multi-gpu-worker-health")
         return any(w.state == "ready" for w in self.workers.values())
 
+    @staticmethod
+    def _quarantined(worker):
+        return worker.cleanup_task is not None or worker.state == "unavailable"
+
     async def _probe(self, worker, generation):
         if worker.generation != generation or worker.state not in {"ready", "suspect"}:
             return
@@ -262,8 +266,9 @@ class MultiWorkerManager:
                     public = RouterError(400, "context_length_exceeded", "Prompt and output exceed the supported context.")
                 else:
                     public = RouterError(503, "engine_failed", "The selected worker could not prepare the request.")
-                    worker.state = "suspect"
-                    worker.last_error = type(error).__name__
+                    if not self._quarantined(worker):
+                        worker.state = "suspect"
+                        worker.last_error = type(error).__name__
                 lease.ready.set_exception(public)
             worker.requests["failed"] += 1
             worker.available.set()
@@ -320,8 +325,9 @@ class MultiWorkerManager:
                     await lease.upstream.aclose()
             except Exception:
                 completed = False
-                worker.state = "suspect"
-                worker.last_error = "upstream_close_failed"
+                if not self._quarantined(worker):
+                    worker.state = "suspect"
+                    worker.last_error = "upstream_close_failed"
         worker.active.remove(lease)
         outcome = "completed" if completed else "canceled" if lease.task and lease.task.cancelled() else "failed"
         worker.requests[outcome] += 1
@@ -340,9 +346,10 @@ class MultiWorkerManager:
         worker = getattr(exclude, "worker", None) if exclude is not None else None
         if worker is None:
             return
-        worker.state = "suspect"
-        worker.last_error = reason
-        worker.consecutive_successes = 0
+        if not self._quarantined(worker):
+            worker.state = "suspect"
+            worker.last_error = reason
+            worker.consecutive_successes = 0
         self.emit("worker_failed", worker, reason=reason, generation=worker.generation)
         self._fail_queued(worker, "not_ready")
 
