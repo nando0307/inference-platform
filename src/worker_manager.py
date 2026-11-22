@@ -334,13 +334,19 @@ class MultiWorkerManager:
         self.emit("released", worker, request_id=lease.request_id, outcome=outcome)
         if not completed and lease.dispatched and not self.closing:
             self._fail_queued(worker, "not_ready")
-            if worker.cleanup_task is None:
-                worker.last_error = outcome
-                worker.state = "recycling"
-                self.emit("recycling", worker, generation=worker.generation)
-                worker.cleanup_task = asyncio.create_task(self._recycle(worker))
-                self.tasks.add(worker.cleanup_task)
-                worker.cleanup_task.add_done_callback(self.tasks.discard)
+            if worker.cleanup_task is None and not self._quarantined(worker):
+                if self.mode == "local" and not worker.engine.is_alive():
+                    worker.state = "unavailable"
+                    worker.last_error = "process_exited"
+                    worker.consecutive_successes = 0
+                    self.emit("unready", worker, generation=worker.generation)
+                else:
+                    worker.last_error = outcome
+                    worker.state = "recycling"
+                    self.emit("recycling", worker, generation=worker.generation)
+                    worker.cleanup_task = asyncio.create_task(self._recycle(worker))
+                    self.tasks.add(worker.cleanup_task)
+                    worker.cleanup_task.add_done_callback(self.tasks.discard)
         self._promote(worker)
 
     def fail(self, reason="upstream_failed", exclude=None):
@@ -357,7 +363,8 @@ class MultiWorkerManager:
     async def _recycle(self, worker):
         worker.generation += 1
         try:
-            async with asyncio.timeout(DRAIN_TIMEOUT):
+            drain = max(DRAIN_TIMEOUT, worker.definition.request_timeout_s)
+            async with asyncio.timeout(drain):
                 while worker.active:
                     await asyncio.sleep(0.01)
             async with asyncio.timeout(STOP_TIMEOUT):

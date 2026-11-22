@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -350,6 +351,80 @@ class WorkerManagerTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(probe, 2)
         self.assertEqual(worker.state, "recycling")
         self.assertEqual(worker.engine.starts, 1)
+
+    async def test_recycle_drains_sibling_lease_past_shutdown_drain_constant(self):
+        config = self.config("D")
+        config = replace(config, workers=tuple(
+            replace(row, request_timeout_s=1.0) for row in config.workers))
+        manager = MultiWorkerManager(config, engine_factory=FakeEngine)
+        self.addAsyncCleanup(manager.shutdown)
+        await manager.start()
+        worker = next(w for w in manager.workers.values() if w.definition.model == LOW_MODEL)
+        with patch("src.worker_manager.DRAIN_TIMEOUT", 0.05):
+            first = manager.submit(request(), "first")
+            second = manager.submit(request(), "second")
+            await asyncio.gather(first.ready, second.ready)
+            first.dispatched = True
+            await manager.release(first, False)
+            self.assertEqual(worker.state, "recycling")
+            await asyncio.sleep(0.3)
+            self.assertEqual(worker.state, "recycling")
+            second.dispatched = True
+            await manager.release(second, True)
+            await asyncio.gather(*manager.tasks)
+        self.assertEqual(worker.state, "ready")
+        self.assertIsNone(worker.last_error)
+        self.assertEqual(worker.engine.starts, 2)
+        self.assertEqual(worker.engine.stops, 1)
+        served = manager.submit(request(), "after-recycle")
+        await served.ready
+        await manager.release(served, True)
+
+    async def test_release_after_local_process_death_never_restarts_worker(self):
+        manager = MultiWorkerManager(self.config("D"), engine_factory=FakeEngine)
+        self.addAsyncCleanup(manager.shutdown)
+        await manager.start()
+        worker = next(w for w in manager.workers.values() if w.definition.model == LOW_MODEL)
+        lease = manager.submit(request(), "dispatched")
+        await lease.ready
+        worker.engine.alive = False
+        lease.dispatched = True
+        await manager.release(lease, False)
+        self.assertEqual(worker.state, "unavailable")
+        self.assertIsNone(worker.cleanup_task)
+        self.assertEqual(worker.engine.starts, 1)
+        self.assertEqual(worker.engine.stops, 0)
+        with self.assertRaises(RouterError) as caught:
+            manager.submit(request(), "after-death")
+        self.assertEqual(caught.exception.status, 503)
+        self.assertEqual(manager.readiness()["models"][LOW_MODEL]["status"], "unavailable")
+
+    async def test_failed_recycle_quarantine_survives_later_lease_release(self):
+        config = self.config("D")
+        config = replace(config, workers=tuple(
+            replace(row, request_timeout_s=0.01) for row in config.workers))
+        manager = MultiWorkerManager(config, engine_factory=FakeEngine)
+        self.addAsyncCleanup(manager.shutdown)
+        await manager.start()
+        worker = next(w for w in manager.workers.values() if w.definition.model == LOW_MODEL)
+        first = manager.submit(request(), "first")
+        second = manager.submit(request(), "second")
+        await asyncio.gather(first.ready, second.ready)
+        first.dispatched = True
+        with patch("src.worker_manager.DRAIN_TIMEOUT", 0.01):
+            await manager.release(first, False)
+            await asyncio.gather(*manager.tasks)
+        self.assertEqual(worker.state, "unavailable")
+        self.assertEqual(worker.last_error, "recycle_failed")
+        self.assertEqual(worker.engine.starts, 1)
+        second.dispatched = True
+        await manager.release(second, False)
+        self.assertIsNone(worker.cleanup_task)
+        self.assertEqual(worker.state, "unavailable")
+        self.assertEqual(worker.engine.starts, 1)
+        with self.assertRaises(RouterError) as caught:
+            manager.submit(request(), "after-failure")
+        self.assertEqual(caught.exception.code, "not_ready")
 
     async def test_metrics_deduplicate_physical_device_and_leave_unavailable_unknown(self):
         manager = MultiWorkerManager(self.config("B"), engine_factory=FakeEngine)

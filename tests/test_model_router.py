@@ -632,6 +632,17 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
         response = await asyncio.wait_for(waiting, 5)
         self.assertEqual(response.status_code, 200)
 
+    async def test_legacy_stream_deadline_keeps_upstream_failed_code(self):
+        self.upstream.hold_stream = True
+        with patch.object(router, "LEGACY_COMPLETION_TIMEOUT", 0.05):
+            response = await asyncio.wait_for(
+                self.client.post("/v1/chat/completions", json=data(stream=True)), 5)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("upstream_failed", response.text)
+        self.assertNotIn("request_timeout", response.text)
+        self.assertFalse(self.app.state.manager.snapshot()["accepting"])
+        self.assert_trace(self.tracer.observations[-1], "failed", 200, "upstream_failed")
+
     async def test_stream_disconnect_closes_upstream_before_releasing_lease(self):
         self.upstream.hold_stream = True
         task, disconnected = await self.asgi_request()

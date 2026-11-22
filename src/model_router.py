@@ -480,7 +480,7 @@ async def _stream(request, lease):
     trace = getattr(request.state, "request_trace", None)
     try:
         worker = getattr(lease, "worker", None)
-        deadline = worker.definition.request_timeout_s if worker is not None else 180
+        deadline = worker.definition.request_timeout_s if worker is not None else LEGACY_COMPLETION_TIMEOUT
         async with asyncio.timeout(deadline):
             async for event in _upstream_events(lease.upstream):
                 if done:
@@ -521,9 +521,13 @@ async def _stream(request, lease):
     except asyncio.CancelledError:
         raise
     except TimeoutError:
-        request.state.trace_error_code = "request_timeout"
-        request.app.state.manager.fail("request_timeout", exclude=lease)
-        yield _sse(_error(RouterError(504, "request_timeout", "The request exceeded its deadline."), lease.request_id))
+        if worker is None:
+            failure = RouterError(502, "upstream_failed", "The inference upstream failed.")
+        else:
+            failure = RouterError(504, "request_timeout", "The request exceeded its deadline.")
+        request.state.trace_error_code = failure.code
+        request.app.state.manager.fail(failure.code, exclude=lease)
+        yield _sse(_error(failure, lease.request_id))
         yield "data: [DONE]\n\n"
     except Exception:
         request.state.trace_error_code = "upstream_failed"
