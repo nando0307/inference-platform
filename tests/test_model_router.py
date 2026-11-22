@@ -617,20 +617,20 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_legacy_queue_wait_is_not_timeboxed(self):
         self.upstream.hold_stream = True
-        with patch.object(router, "LEGACY_COMPLETION_TIMEOUT", 0.05):
-            active, disconnected = await self.asgi_request()
-            waiting = asyncio.create_task(self.client.post(
-                "/v1/chat/completions", json=data(HIGH_MODEL),
-            ))
-            try:
+        active, disconnected = await self.asgi_request()
+        waiting = asyncio.create_task(self.client.post(
+            "/v1/chat/completions", json=data(HIGH_MODEL),
+        ))
+        try:
+            with patch.object(router, "LEGACY_COMPLETION_TIMEOUT", 0.05):
                 await until(lambda: self.app.state.manager.snapshot()["queued"] == 1)
                 await asyncio.sleep(0.15)
                 self.assertFalse(waiting.done())
-            finally:
-                disconnected.set()
-                await asyncio.wait_for(active, 2)
-            response = await asyncio.wait_for(waiting, 5)
-            self.assertEqual(response.status_code, 200)
+        finally:
+            disconnected.set()
+            await asyncio.wait_for(active, 2)
+        response = await asyncio.wait_for(waiting, 5)
+        self.assertEqual(response.status_code, 200)
 
     async def test_stream_disconnect_closes_upstream_before_releasing_lease(self):
         self.upstream.hold_stream = True
