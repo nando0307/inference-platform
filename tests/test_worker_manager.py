@@ -108,6 +108,20 @@ class WorkerManagerTests(unittest.IsolatedAsyncioTestCase):
         await manager.release(leases[2], True)
         self.assertEqual(len(worker.active), 0)
 
+    async def test_saturated_model_counts_one_rejection_per_request(self):
+        manager = MultiWorkerManager(self.config("B"), engine_factory=FakeEngine)
+        self.addAsyncCleanup(manager.shutdown)
+        await manager.start()
+        leases = [manager.submit(request(), f"request-{n}") for n in range(8)]
+        with self.assertRaises(RouterError) as caught:
+            manager.submit(request(), "overflow")
+        self.assertEqual(caught.exception.status, 429)
+        metrics = manager.metrics()
+        self.assertEqual(metrics["models"][LOW_MODEL]["requests"]["rejected"], 1)
+        self.assertEqual(sum(row["rejected"] for row in metrics["worker_requests"].values()), 1)
+        for lease in leases:
+            await manager.release(lease, True)
+
     async def test_cancelled_dispatched_worker_is_quarantined_without_restart(self):
         engines = {}
         def factory(row):

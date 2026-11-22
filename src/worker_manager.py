@@ -206,11 +206,11 @@ class MultiWorkerManager:
                  or len(w.queue) < self.config.queue_capacity_per_worker)),
             key=lambda w: (w.inflight, w.definition.id))
         if not candidates:
-            replicas = [w for w in self.workers.values() if w.definition.model == body.model]
-            if any(w.state == "ready" for w in replicas):
-                for worker in replicas:
-                    if worker.state == "ready":
-                        worker.requests["rejected"] += 1
+            ready = [w for w in self.workers.values()
+                     if w.definition.model == body.model and w.state == "ready"]
+            if ready:
+                rejected = min(ready, key=lambda w: (w.inflight, w.definition.id))
+                rejected.requests["rejected"] += 1
                 raise RouterError(429, "server_busy", "All replicas for the requested model are saturated.")
             raise RouterError(503, "not_ready", "The requested model is unavailable.")
         worker = candidates[0]

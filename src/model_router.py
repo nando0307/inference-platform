@@ -24,6 +24,7 @@ MAX_BODY_BYTES = 65536
 MAX_PROMPT_CHARS = 16384
 MAX_RESPONSE_BYTES = 1024 * 1024
 SEND_TIMEOUT = 5.0
+LEGACY_COMPLETION_TIMEOUT = 180
 DRAIN_TIMEOUT = 5.0
 CLOSE_TIMEOUT = 3.0
 STOP_TIMEOUT = 20.0
@@ -680,8 +681,14 @@ def create_app(engine=None, config=None, worker_engine_factory=None, mode=None):
             request.state.lease = lease
             lease.task = asyncio.current_task()
             worker = getattr(lease, "worker", None)
-            deadline = worker.definition.request_timeout_s if worker is not None else 180
-            async with asyncio.timeout(deadline):
+            if worker is None:
+                await _connected(request, lease.ready)
+                if trace is not None:
+                    trace.update(queue_wait_ms=(perf_counter() - submitted) * 1000)
+                work = asyncio.create_task(_complete(request, lease))
+                async with asyncio.timeout(LEGACY_COMPLETION_TIMEOUT):
+                    return await _connected(request, work)
+            async with asyncio.timeout(worker.definition.request_timeout_s):
                 await _connected(request, lease.ready)
                 if trace is not None:
                     trace.update(queue_wait_ms=(perf_counter() - submitted) * 1000)
