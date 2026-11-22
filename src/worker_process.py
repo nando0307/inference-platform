@@ -15,17 +15,17 @@ async def serve(config_path, worker_id):
     if worker is None:
         raise ValueError("Worker ID is not present in the selected configuration.")
     engine = VLLMEngine(worker=worker)
-    await engine.start(worker.model)
-    revision = next(model.revision for model in config.models.values() if model.id == worker.model)
-    print(json.dumps({"worker": worker.id, "model": worker.model,
-                      "revision": revision, "host": worker.host,
-                      "physical_gpu_uuid": worker.gpu_uuid,
-                      "process_local_cuda_device": 0, "ready": True}), flush=True)
     stopped = asyncio.Event()
     loop = asyncio.get_running_loop()
     for signum in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(signum, stopped.set)
     try:
+        await engine.start(worker.model)
+        revision = next(model.revision for model in config.models.values() if model.id == worker.model)
+        print(json.dumps({"worker": worker.id, "model": worker.model,
+                          "revision": revision, "host": worker.host,
+                          "physical_gpu_uuid": worker.gpu_uuid,
+                          "process_local_cuda_device": 0, "ready": True}), flush=True)
         await stopped.wait()
     finally:
         await engine.stop()

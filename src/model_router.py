@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 from collections import deque
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -550,7 +551,6 @@ async def _complete(request, lease):
     engine = worker.engine if worker is not None else request.app.state.manager.engine
     headers = {"x-request-id": lease.request_id}
     if worker is not None:
-        import os
         token = os.environ[worker.definition.service_token_env]
         headers["authorization"] = f"Bearer {token}"
     upstream = client.build_request(
@@ -592,7 +592,6 @@ async def _complete(request, lease):
 def create_app(engine=None, config=None, worker_engine_factory=None, mode=None):
     """Create the legacy single-resident router or the selected static worker pool."""
     if config is None and engine is None:
-        import os
         config_path = os.environ.get("MULTI_GPU_CONFIG")
         if config_path:
             from .serving_config import load_config
@@ -601,7 +600,6 @@ def create_app(engine=None, config=None, worker_engine_factory=None, mode=None):
         from .serving_config import load_config
         config = load_config(config)
     if mode is None:
-        import os
         mode = os.environ.get("MULTI_GPU_MODE", "local")
     if engine is None and config is None:
         engine = VLLMEngine()

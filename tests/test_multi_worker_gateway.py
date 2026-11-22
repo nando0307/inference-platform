@@ -93,6 +93,14 @@ class MultiWorkerGatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("CLIENT-SECRET", str(self.forwarded))
         self.assertTrue((await self.client.get("/ready")).json()["ready"])
 
+    async def test_explicit_mode_starts_the_configured_worker_pool(self):
+        app = create_app(config=self.config, worker_engine_factory=FakeWorkerEngine, mode="local")
+        async with app.router.lifespan_context(app):
+            manager = app.state.manager
+            self.assertEqual(set(manager.workers), {row.id for row in self.config.workers})
+            self.assertTrue(manager.readiness()["models"][LOW_MODEL]["ready"])
+            self.assertTrue(manager.readiness()["models"][HIGH_MODEL]["ready"])
+
     async def test_gateway_auth_rejects_before_worker_dispatch(self):
         response = await self.post(LOW_MODEL, token="wrong-token")
         self.assertEqual(response.status_code, 401)
