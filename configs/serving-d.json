@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "placement": "D",
+  "models": {
+    "small": {"id": "Qwen/Qwen2.5-0.5B-Instruct", "revision": "7ae557604adf67be50417f59c2c2f167def9a775", "dtype": "float16", "context_tokens": 2048},
+    "large": {"id": "Qwen/Qwen3-1.7B", "revision": "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e", "dtype": "float16", "context_tokens": 2048}
+  },
+  "hosts": {"local": {"gpu_uuids": ["GPU-00000000-0000-0000-0000-000000000001", "GPU-00000000-0000-0000-0000-000000000002"]}},
+  "workers": [
+    {"id": "small-0", "model": "Qwen/Qwen2.5-0.5B-Instruct", "host": "local", "cuda_device": 0, "gpu_uuid": "GPU-00000000-0000-0000-0000-000000000001", "endpoint": "http://127.0.0.1:8101", "memory_utilization": 0.5, "max_sequences": 2, "startup_timeout_s": 360, "request_timeout_s": 180, "service_token_env": "WORKER_SMALL_0_TOKEN"},
+    {"id": "large-0", "model": "Qwen/Qwen3-1.7B", "host": "local", "cuda_device": 0, "gpu_uuid": "GPU-00000000-0000-0000-0000-000000000001", "endpoint": "http://127.0.0.1:8102", "memory_utilization": 0.5, "max_sequences": 2, "startup_timeout_s": 360, "request_timeout_s": 180, "service_token_env": "WORKER_LARGE_0_TOKEN"}
+  ],
+  "routing": {"policy": "least-inflight", "queue_capacity_per_worker": 2, "health_interval_s": 1, "health_timeout_s": 1}
+}
