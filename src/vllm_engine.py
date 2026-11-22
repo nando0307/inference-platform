@@ -58,17 +58,26 @@ def stop_process_group(process, *, terminate_seconds=10, kill_seconds=5):
 class VLLMEngine:
     """The router owns admission; this object owns one private engine process group."""
 
-    def __init__(self, *, port=8001, startup_timeout=360):
-        if type(port) is not int or not 1 <= port <= 65535:
-            raise ValueError("Engine port must be in 1..65535.")
-        if not 0 < startup_timeout <= 360:
+    def __init__(self, *, port=8001, startup_timeout=360, worker=None):
+        if worker is None:
+            if type(port) is not int or not 1 <= port <= 65535:
+                raise ValueError("Engine port must be in 1..65535.")
+            self.port = port
+            self.startup_timeout = startup_timeout
+            self.base_url = f"http://127.0.0.1:{port}"
+        else:
+            from urllib.parse import urlsplit
+            endpoint = urlsplit(worker.endpoint)
+            if endpoint.scheme != "http" or not endpoint.port:
+                raise ValueError("Worker endpoint must be HTTP with an explicit port.")
+            self.port = endpoint.port
+            self.startup_timeout = worker.startup_timeout_s
+            self.base_url = worker.endpoint.rstrip("/")
+        if not 0 < self.startup_timeout <= 360:
             raise ValueError("Startup timeout must be in (0, 360].")
-        self.port = port
-        self.startup_timeout = startup_timeout
-        self.base_url = f"http://127.0.0.1:{port}"
+        self.worker = worker
         self.model = None
         self.process = None
-        # ponytail: retain the last 256 transitions; use a log sink for long-lived history.
         self.events = deque(maxlen=256)
         self.metadata = {}
         self._tokenizers = {}
@@ -126,6 +135,8 @@ class VLLMEngine:
     async def start(self, model_id):
         if model_id not in MODEL_SPECS:
             raise ValueError("Unsupported model.")
+        if self.worker is not None and self.worker.model != model_id:
+            raise ValueError("Worker model does not match its pinned configuration.")
         if self.process is not None:
             if self.model == model_id and self.is_alive():
                 return
@@ -138,50 +149,66 @@ class VLLMEngine:
 
             if version("vllm") != ENGINE_VERSION or not torch.cuda.is_available():
                 raise RuntimeError("The pinned vLLM CUDA environment is required; no CPU fallback.")
+            from urllib.parse import urlsplit
+            endpoint_host = "127.0.0.1" if self.worker is None else urlsplit(self.worker.endpoint).hostname
             with socket.socket() as probe:
                 probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                probe.bind(("127.0.0.1", self.port))
+                probe.bind((endpoint_host, self.port))
             revision = MODEL_SPECS[model_id]["revision"]
             command = [
                 "vllm", "serve", model_id,
                 "--revision", revision, "--tokenizer-revision", revision,
                 "--served-model-name", model_id,
-                "--host", "127.0.0.1", "--port", str(self.port),
+                "--host", endpoint_host, "--port", str(self.port),
                 "--dtype", "float16", "--kv-cache-dtype", "float16",
                 "--max-model-len", "2048", "--max-num-seqs", "2",
-                "--max-num-batched-tokens", "256", "--gpu-memory-utilization", "0.5",
+                "--max-num-batched-tokens", "256",
+                "--gpu-memory-utilization", str(self.worker.memory_utilization if self.worker else 0.5),
                 "--enforce-eager", "--disable-prefix-caching", "--enable-chunked-prefill",
                 "--no-async-scheduling", "--generation-config", "vllm",
                 "--enable-request-id-headers",
             ]
+            token = None
+            child_env = {**os.environ, "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
+                         "TOKENIZERS_PARALLELISM": "false", "VLLM_NO_USAGE_STATS": "1"}
+            if self.worker is not None:
+                token = os.environ.get(self.worker.service_token_env)
+                if not token:
+                    raise RuntimeError("Worker service credential is not configured.")
+                command += ["--api-key", token]
+                child_env["CUDA_VISIBLE_DEVICES"] = self.worker.gpu_uuid
             if model_id == HIGH_MODEL:
                 command += [
                     "--reasoning-parser", "qwen3",
                     "--default-chat-template-kwargs", '{"enable_thinking": false}',
                 ]
+            reported_command = list(command)
+            if "--api-key" in reported_command:
+                reported_command[reported_command.index("--api-key") + 1] = "[REDACTED]"
             self.metadata = {
                 "model": model_id, "revision": revision, "tokenizer_revision": revision,
-                "engine_version": ENGINE_VERSION, "launch_command": command,
+                "engine_version": ENGINE_VERSION, "launch_command": reported_command,
                 "declared_dtype": "float16", "declared_kv_cache_dtype": "float16",
                 "context_limit": 2048, "max_num_seqs": 2, "thinking": False,
-                "gpu": torch.cuda.get_device_name(0), "cuda_version": torch.version.cuda,
+                "gpu": torch.cuda.get_device_name(0) if self.worker is None else None,
+                "cuda_version": torch.version.cuda,
+                "configured_physical_gpu_uuid": self.worker.gpu_uuid if self.worker else None,
+                "process_local_cuda_device": 0 if self.worker else None,
                 "package_versions": {name: version(name) for name in (
                     "torch", "transformers", "tokenizers", "vllm", "httpx",
                 )},
             }
-            self.process = subprocess.Popen(command, start_new_session=True, env={
-                **os.environ, "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
-                "TOKENIZERS_PARALLELISM": "false", "VLLM_NO_USAGE_STATS": "1",
-            })
+            self.process = subprocess.Popen(command, start_new_session=True, env=child_env)
+            auth = {"authorization": f"Bearer {token}"} if token else {}
             async with asyncio.timeout(max(0.001, self.startup_timeout - (perf_counter() - started))):
                 async with httpx.AsyncClient(timeout=2, trust_env=False) as client:
                     while True:
                         if not self.is_alive():
                             raise RuntimeError(f"Engine exited before readiness: {self.process.returncode}.")
                         try:
-                            health = await client.get(self.base_url + "/health")
+                            health = await client.get(self.base_url + "/health", headers=auth)
                             if health.status_code == 200:
-                                models = await client.get(self.base_url + "/v1/models")
+                                models = await client.get(self.base_url + "/v1/models", headers=auth)
                                 models.raise_for_status()
                                 if [item["id"] for item in models.json()["data"]] != [model_id]:
                                     raise RuntimeError("Ready engine reports the wrong served model.")

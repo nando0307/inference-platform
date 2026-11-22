@@ -66,7 +66,9 @@ def _positive(value, name, *, maximum=None):
 
 def validate_config(raw: dict) -> ServingConfig:
     """Validate all placement invariants before a worker/process can be created."""
-    if not isinstance(raw, dict) or raw.get("schema_version") != SCHEMA_VERSION:
+    if not isinstance(raw, dict) or set(raw) != {"schema_version", "placement", "models", "hosts", "workers", "routing"}:
+        raise ValueError("Serving configuration has unsupported schema or fields.")
+    if type(raw["schema_version"]) is not int or raw["schema_version"] != SCHEMA_VERSION:
         raise ValueError("Unsupported serving configuration schema.")
     placement = raw.get("placement")
     if placement not in {"A", "B", "C", "D"}:
@@ -78,8 +80,8 @@ def validate_config(raw: dict) -> ServingConfig:
     models = {}
     expected_ids = {"small": LOW_MODEL, "large": HIGH_MODEL}
     for name, model in models_raw.items():
-        if not isinstance(model, dict) or model.get("id") != expected_ids[name]:
-            raise ValueError(f"{name} must use its pinned allowlisted model.")
+        if not isinstance(model, dict) or set(model) != {"id", "revision", "dtype", "context_tokens"} or model.get("id") != expected_ids[name]:
+            raise ValueError(f"{name} must use its pinned allowlisted model and schema.")
         revision = model.get("revision")
         if revision != MODEL_SPECS[expected_ids[name]]["revision"]:
             raise ValueError(f"{name} must use the immutable repository revision.")
@@ -93,10 +95,9 @@ def validate_config(raw: dict) -> ServingConfig:
     hosts_raw = raw.get("hosts")
     if not isinstance(hosts_raw, dict) or not hosts_raw:
         raise ValueError("At least one host is required.")
-    hosts = {}
-    global_uuids = set()
+    hosts, global_uuids = {}, set()
     for host_id, host in hosts_raw.items():
-        uuids = host.get("gpu_uuids") if isinstance(host, dict) else None
+        uuids = host.get("gpu_uuids") if isinstance(host, dict) and set(host) == {"gpu_uuids"} else None
         if (not isinstance(host_id, str) or not host_id or not isinstance(uuids, list)
                 or not uuids or any(not isinstance(uuid, str) or not _GPU_UUID.fullmatch(uuid) for uuid in uuids)):
             raise ValueError("Each host requires a nonempty list of physical GPU UUIDs.")
@@ -108,34 +109,42 @@ def validate_config(raw: dict) -> ServingConfig:
     workers_raw = raw.get("workers")
     if not isinstance(workers_raw, list) or not workers_raw:
         raise ValueError("At least one worker is required.")
-    workers, ids, endpoints, slots = [], set(), set(), set()
+    workers, ids, endpoints, slots, token_envs = [], set(), set(), set(), set()
     for row in workers_raw:
-        if not isinstance(row, dict):
-            raise ValueError("Each worker must be an object.")
-        worker = Worker(**{key: row[key] for key in Worker.__dataclass_fields__})
-        if not worker.id or worker.id in ids:
-            raise ValueError("Worker IDs must be nonempty and unique.")
+        if not isinstance(row, dict) or set(row) != set(Worker.__dataclass_fields__):
+            raise ValueError("Each worker must use the complete supported worker schema.")
+        worker = Worker(**row)
+        if not isinstance(worker.id, str) or not worker.id or worker.id in ids:
+            raise ValueError("Worker IDs must be nonempty strings and unique.")
         ids.add(worker.id)
-        if worker.model not in {model.id for model in models.values()}:
+        if not isinstance(worker.model, str) or worker.model not in {model.id for model in models.values()}:
             raise ValueError("Worker references an unknown model.")
-        if worker.host not in hosts or type(worker.cuda_device) is not int or not 0 <= worker.cuda_device < len(hosts[worker.host].gpu_uuids):
+        if (not isinstance(worker.host, str) or worker.host not in hosts
+                or type(worker.cuda_device) is not int
+                or not 0 <= worker.cuda_device < len(hosts[worker.host].gpu_uuids)):
             raise ValueError("Worker references an unknown host or local CUDA ordinal.")
-        if hosts[worker.host].gpu_uuids[worker.cuda_device] != worker.gpu_uuid:
-            raise ValueError("Worker CUDA ordinal and configured physical UUID disagree.")
+        if not isinstance(worker.gpu_uuid, str) or hosts[worker.host].gpu_uuids[worker.cuda_device] != worker.gpu_uuid:
+            raise ValueError("Worker CUDA ordinal and physical GPU UUID disagree.")
         if worker.gpu_uuid not in global_uuids:
             raise ValueError("Worker references an unknown physical GPU.")
         slot = (worker.host, worker.gpu_uuid, worker.model)
         if slot in slots:
             raise ValueError("A model may have only one worker per physical GPU.")
         slots.add(slot)
+        if not isinstance(worker.endpoint, str):
+            raise ValueError("Worker endpoint must be a string.")
         parsed = urlsplit(worker.endpoint)
-        if parsed.scheme != "http" or not parsed.hostname or not parsed.port or parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
-            raise ValueError("Worker endpoint must be an explicit HTTP origin with a port.")
+        if (parsed.scheme != "http" or not parsed.hostname or not parsed.port
+                or parsed.username or parsed.password or parsed.path not in {"", "/"}
+                or parsed.query or parsed.fragment):
+            raise ValueError("Worker endpoint must be an explicit credential-free HTTP origin with a port.")
         if worker.endpoint in endpoints:
             raise ValueError("Worker endpoints must be unique.")
         endpoints.add(worker.endpoint)
-        if not isinstance(worker.service_token_env, str) or not worker.service_token_env.isidentifier():
+        if (not isinstance(worker.service_token_env, str) or not worker.service_token_env.isidentifier()
+                or worker.service_token_env in token_envs):
             raise ValueError("Each worker requires a distinct service-token environment variable name.")
+        token_envs.add(worker.service_token_env)
         _positive(worker.memory_utilization, "memory_utilization", maximum=0.9)
         if type(worker.max_sequences) is not int or worker.max_sequences != MAX_SEQUENCES:
             raise ValueError("max_sequences must be 2.")
@@ -151,11 +160,18 @@ def validate_config(raw: dict) -> ServingConfig:
         "C": {("small", 0), ("large", 0), ("large", 1)},
         "D": {("small", 0), ("large", 0)},
     }[placement]
+    expected_ids = {
+        "A": {"small-0", "large-1"},
+        "B": {"small-0", "large-0", "small-1"},
+        "C": {"small-0", "large-0", "large-1"},
+        "D": {"small-0", "large-0"},
+    }[placement]
     if len(hosts) != 1 or len(hosts[next(iter(hosts))].gpu_uuids) != 2:
         raise ValueError("A-D placements require one host with exactly two physical GPUs.")
     host_id = next(iter(hosts))
-    actual = {("small" if w.model == LOW_MODEL else "large", w.cuda_device) for w in workers if w.host == host_id}
-    if actual != expected or len(workers) != len(expected):
+    actual = {("small" if worker.model == LOW_MODEL else "large", worker.cuda_device)
+              for worker in workers if worker.host == host_id}
+    if actual != expected or len(workers) != len(expected) or {worker.id for worker in workers} != expected_ids:
         raise ValueError(f"Worker topology does not match placement {placement}.")
     per_gpu_budget = {}
     for worker in workers:
@@ -165,8 +181,10 @@ def validate_config(raw: dict) -> ServingConfig:
         raise ValueError("Declared per-process memory budgets exceed the per-GPU policy cap.")
 
     routing = raw.get("routing")
-    if not isinstance(routing, dict) or routing.get("policy") != "least-inflight":
-        raise ValueError("routing.policy must be least-inflight.")
+    if not isinstance(routing, dict) or set(routing) != {
+        "policy", "queue_capacity_per_worker", "health_interval_s", "health_timeout_s",
+    } or routing.get("policy") != "least-inflight":
+        raise ValueError("routing must match the supported least-inflight schema.")
     if routing.get("queue_capacity_per_worker") != MAX_QUEUE_CAPACITY:
         raise ValueError("queue_capacity_per_worker must be 2.")
     interval = _positive(routing.get("health_interval_s"), "health_interval_s", maximum=60)
@@ -183,9 +201,21 @@ def load_config(path: str | Path) -> ServingConfig:
 
 def dry_run(config: ServingConfig) -> list[dict]:
     """Return safe, deterministic host/UUID/CUDA mapping without allocating workers."""
-    return [
-        {"worker": worker.id, "model": worker.model, "host": worker.host,
-         "physical_gpu_uuid": worker.gpu_uuid, "cuda_device": worker.cuda_device,
-         "endpoint": worker.endpoint}
-        for worker in sorted(config.workers, key=lambda item: item.id)
-    ]
+    return [{"worker": worker.id, "model": worker.model, "host": worker.host,
+             "physical_gpu_uuid": worker.gpu_uuid, "cuda_device": worker.cuda_device,
+             "endpoint": worker.endpoint}
+            for worker in sorted(config.workers, key=lambda item: item.id)]
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Validate and print the static worker/GPU mapping.")
+    parser.add_argument("--config", required=True)
+    args = parser.parse_args()
+    config = load_config(args.config)
+    print(json.dumps({"placement": config.placement, "workers": dry_run(config)}, indent=2))
+
+
+if __name__ == "__main__":
+    main()

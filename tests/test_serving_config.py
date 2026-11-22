@@ -30,6 +30,10 @@ class ServingConfigTests(unittest.TestCase):
     def test_invalid_identity_mapping_revision_and_budget_fail_before_worker_creation(self):
         mutations = [
             lambda raw: raw.update(schema_version=2),
+            lambda raw: raw.update(schema_version=True),
+            lambda raw: raw["workers"][0].update(id="renamed"),
+            lambda raw: raw["workers"][0].update(model=[]),
+            lambda raw: raw["workers"][0].update(endpoint="http://secret@127.0.0.1:8101"),
             lambda raw: raw["workers"][0].update(gpu_uuid="GPU-00000000-0000-0000-0000-000000000002"),
             lambda raw: raw["workers"][0].update(cuda_device=1),
             lambda raw: raw["models"]["small"].update(revision="main"),
