@@ -14,7 +14,9 @@ and the next task. Use [plan.md](plan.md) for the broader roadmap.
 
 The implementation now includes Phase 4 controlled concurrency: one inference
 worker, two FIFO waiting slots, cooperative cancellation, and bounded streaming.
-The suite has 182 passing tests, with real-Qwen lifecycle and HTTP smoke evidence.
+The suite has 241 passing CPU tests, with real-Qwen lifecycle and HTTP smoke evidence.
+The multi-GPU feature adds static two-GPU worker pools, exact-model dispatch, and
+operator-controlled failure handling; real two-T4 validation remains pending.
 See the [Phase 4 evidence](logs/practice.md#phase-4-bounded-concurrency-and-cancellation)
 for the fixed-workload comparison and its limitations. Stage 5 now includes CPU
 and T4 static-batching measurements at sizes 1/2/4; the API remains sequential.
@@ -44,8 +46,12 @@ two-model lifecycle: three loads, cross-model FIFO, queued cancellation, a clean
 process-group shutdown, and frozen quality tasks (8/9 low, 9/9 high).
 Stage 10 now adds a [metrics snapshot](#metrics) endpoint, optional bearer
 authentication, a 64 KiB request-body cap, and a verified local restart and
-failed-startup procedure. The roadmap in [plan.md](plan.md) ends here; the
-remaining items are independent learning checks. Report-ready numbers and their
+failed-startup procedure. Stage 11 adds opt-in
+[static multi-GPU serving](#static-multi-gpu-vllm-serving) with four placement
+configs, per-worker GPU pinning, model-aware dispatch, and no dynamic placement
+or automatic recovery. Real two-card T4 runs are still pending approval. The
+roadmap in [plan.md](plan.md) ends here; the remaining items are independent
+learning checks. Report-ready numbers and their
 scopes live in [the results summary](logs/results-summary.md).
 
 ## Explore the codebase with Understand Anything
@@ -528,8 +534,11 @@ prevent graceful shutdown and require process termination.
 
 In the CPU app (`src.api:app`), `INFERENCE_API_TOKEN` gates
 `POST /v1/chat/completions` and `GET /metrics`. Unset or empty leaves both open,
-which is the documented mode for loopback use. The separate model router does
-not implement this bearer gate or the CPU `/metrics` endpoint; keep it private.
+which is the documented mode for loopback use. Only the static multi-GPU mode of
+the model router (`MULTI_GPU_CONFIG` set) uses the same bearer gate for chat and
+`/metrics`; the legacy single-resident router keeps its previous ungated
+behavior and ignores `INFERENCE_API_TOKEN`. In static multi-GPU mode, metrics
+include worker, model, and physical-device state.
 
 ```bash
 INFERENCE_API_TOKEN="$TOKEN" .venv/bin/python -m uvicorn src.api:app \
@@ -539,8 +548,222 @@ INFERENCE_API_TOKEN="$TOKEN" .venv/bin/python -m uvicorn src.api:app \
 `/health` and `/ready` remain unauthenticated for probes. A missing or wrong
 token returns 401 with `WWW-Authenticate: Bearer`; the token is never logged.
 Authentication runs before request logging, so unauthorized attempts produce no
-lifecycle log and no `x-request-id` header. They are counted in `/metrics` as
-`errors.unauthorized`.
+lifecycle log and no `x-request-id` header. The CPU app counts them in `/metrics`
+as `errors.unauthorized`; static multi-GPU mode publishes no per-error counters.
+
+### Static multi-GPU vLLM serving
+
+The opt-in `src.model_router:create_app` can manage one vLLM process per
+configured worker and route each supported model to its own process. Validate
+the four reviewed placements before launch:
+
+```bash
+python3.12 -m src.serving_config --config configs/serving-a.json
+python3.12 -m src.serving_config --config configs/serving-b.json
+python3.12 -m src.serving_config --config configs/serving-c.json
+python3.12 -m src.serving_config --config configs/serving-d.json
+```
+
+| Placement | GPU 0 | GPU 1 |
+|---|---|---|
+| A | Small model | Large model |
+| B | Small and large models | Small replica |
+| C | Small and large models | Large replica |
+| D | Small and large models | Idle |
+
+These files contain placeholder physical UUIDs. Replace them with the UUIDs of
+the approved allocated devices before use, preserve the validated mapping
+between `cuda_device` and `gpu_uuid`, and set distinct secret values for every
+worker's `service_token_env`. Endpoints and process-local ports are already
+distinct. The gateway bearer credential is optional on a private loopback-only
+setup, but REQUIRED for any less-trusted network. Set `INFERENCE_API_TOKEN`
+for the client-facing bearer gate. Never put credentials in the config, operator
+command, benchmark artifacts, or source control. Each worker's bearer token is
+passed to its vLLM child through the `VLLM_API_KEY` child environment rather than
+the command line, so it does not appear in `ps` or `/proc/<pid>/cmdline`; it
+remains readable through that process's environment, so use a dedicated OS
+account and restrict process inspection on the host. Protect remote workers with
+private networking as well as their tokens.
+
+The model revisions, FP16 dtype, 2048-token context, two concurrent sequences,
+and per-process memory-utilization limits are pinned in each config. A vLLM
+utilization limit is not a physical memory partition: it does not prevent
+processes from competing for memory or CUDA resources. Co-residency in B, C, and
+D is unverified. Do not start those placements, request paid GPU capacity, or
+claim multi-GPU results without explicit approval for the specific hardware and
+run. The static mapping does not substitute another model when its workers are
+unavailable; D intentionally leaves GPU 1 idle.
+
+Each worker moves through `starting` -> `ready` after its own vLLM process group
+loads the pinned model, binds its configured endpoint, and answers both `/health`
+and `/v1/models` with exactly that model. `unavailable` is terminal for the
+gateway process: startup failure, a failed health probe, a dead local child, or
+a failed upstream generation removes the worker from routing permanently.
+Graceful shutdown ends in `stopped`, or `cleanup_failed` when a process group
+cannot be confirmed dead. Requests are never admitted to a worker that is not
+`ready`.
+
+Memory inputs are the pinned model weights, vLLM's own KV cache, per-request
+`max_tokens` up to 512, two sequences, CUDA context/runtime workspace, and
+fragmentation. The config caps the sum of each GPU's declared
+`memory_utilization` at 1.0, but vLLM's utilization fraction is not a hard
+partition or a guarantee that co-resident processes fit. Actual VRAM use on a
+T4 is unmeasured here; if allocation is insufficient, vLLM startup fails and the
+worker is reported `unavailable` rather than retried. No dynamic placement,
+automatic restart, GPU reassignment, or model replacement is implemented.
+
+For an approved local allocation, export secrets through a secret manager or
+interactive shell, then launch one gateway. Each local worker is an owned child
+process; Ctrl-C stops the gateway and reaps its process groups:
+
+```bash
+export INFERENCE_API_TOKEN
+export WORKER_SMALL_0_TOKEN
+export WORKER_LARGE_1_TOKEN
+MULTI_GPU_CONFIG=configs/serving-a.json MULTI_GPU_MODE=local \
+  .venv/bin/python -m uvicorn src.model_router:create_app --factory \
+  --host 127.0.0.1 --port 8000 --workers 1
+```
+
+Set every worker token named by the selected config. On one approved remote
+host with the configured two-GPU topology, run
+`python -m src.worker_process --config CONFIG --worker WORKER_ID` for each
+configured worker, with its distinct service-token environment variable set.
+The A-D schema represents one physical two-GPU host; remote mode does not model
+a multi-host GPU placement. Start the gateway with `MULTI_GPU_MODE=remote`; its
+shutdown does not stop these workers, so stop each worker process with SIGINT
+or SIGTERM. Keep worker endpoints private and enforce network-level access in
+addition to their bearer tokens.
+
+```bash
+MULTI_GPU_CONFIG=/path/to/serving-a.json MULTI_GPU_MODE=remote \
+  .venv/bin/python -m uvicorn src.model_router:create_app --factory \
+  --host 127.0.0.1 --port 8000 --workers 1
+```
+
+`/health` remains a cheap unauthenticated liveness check. The public `/ready`
+response is deliberately minimal: `{"status": "ready"}` with 200 only when the
+gateway accepts traffic and every configured model has at least one ready
+replica, otherwise `{"status": "not_ready"}` with 503. A failed replica does not
+make the gateway unready while another replica of the same model remains ready;
+a model with no ready replica does. Per-model readiness counts, worker state,
+physical UUIDs, device ordinals, revisions, queue depths, startup durations,
+token totals, and failure detail stay on `/metrics`, which reports request and
+token state per worker, model, and physical UUID. NVML telemetry is optional and
+missing values remain unknown, not zero. No prompts, outputs, request headers,
+or service credentials are included in these metrics. Each worker admits at most
+two active sequences and queues at most two more; when every ready replica of
+the requested model is saturated the gateway returns 429 `server_busy` instead
+of exceeding that bound, and a request that exceeds its worker's
+`request_timeout_s` returns 504 `request_timeout`.
+
+#### Approved two-card T4 validation protocol
+
+This repository does not allocate GPUs or contain a completed multi-GPU run.
+Before any real run, obtain separate explicit approval for the selected A-D
+placement, two-card T4 allocation, expected cost, and the co-residency risk.
+Confirm the physical UUIDs with `nvidia-smi -L`, update the config, validate it,
+and record `nvidia-smi` before, during, and after the run. Test A first. B/C/D
+require a separate decision after A; their two-process same-card placement is
+not implied safe by the config's memory limits.
+
+Generate both pinned workload manifests on a host with the exact model and
+tokenizer snapshots cached:
+
+```bash
+.venv/bin/python -m benchmarks.workloads \
+  --model Qwen/Qwen2.5-0.5B-Instruct --output /tmp/small-workload.json
+.venv/bin/python -m benchmarks.workloads \
+  --model Qwen/Qwen3-1.7B --output /tmp/large-workload.json
+```
+
+The fixed protocol runs short/long single requests, eight-request same-model
+bursts, four concurrent requests per model, then pauses for a manually stopped
+worker failure-isolation case. Its worker selection is fixed: A `large-1`, B
+`small-1`, C `large-1`, D `small-0`. The selected worker must be ready before
+launch. After cases 1-7, the interactive client prints its configured endpoint
+and waits. On that host, use the endpoint port and stop its process group without
+stopping the gateway:
+
+```bash
+port=8102 # replace with the selected worker's configured endpoint port
+pid=$(lsof -tiTCP:"$port" -sTCP:LISTEN)
+pgid=$(ps -o pgid= -p "$pid" | tr -d ' ')
+kill -TERM -- "-$pgid"
+```
+
+Wait until `/ready` returns 503 `not_ready` when the affected model has no
+remaining replica, or remains 200 when another replica still serves it
+(`/metrics` reports the selected worker state), then press Enter in the
+benchmark terminal. Use a fresh output path:
+
+```bash
+.venv/bin/python -m benchmarks.multi_gpu_serving \
+  --url http://127.0.0.1:8000 --config configs/serving-a.json \
+  --small-workload /tmp/small-workload.json \
+  --large-workload /tmp/large-workload.json \
+  --failure-worker large-1 \
+  --output benchmark-results/multi-gpu/approved-run.json
+```
+
+The client never stops a worker or the gateway. Case 8 is interactive, and so is
+the closing lifecycle-evidence step. After the failure-isolation case, stop the
+gateway with its normal stop signal. The client then asks you to confirm that
+the gateway process exited and to type its exit status, and it probes every
+configured worker endpoint until each one stops answering. It records the
+startup measurement taken from `/metrics` at run start (`uptime_seconds` and
+each worker's `ready_seconds_after_start`) under `lifecycle.startup`, and the
+gateway exit status plus per-worker stop confirmation under
+`lifecycle.cleanup`. A run keeps `lifecycle.complete` and the
+`lifecycle_evidence` check false, and never reports `status: completed`, unless
+startup is measured for every configured worker and cleanup is confirmed by an
+orderly gateway exit status together with every configured worker no longer
+answering. An orderly status is `0`, or `-15` when the stop signal was SIGTERM
+and every configured worker is confirmed stopped: Uvicorn re-raises a captured
+SIGTERM after graceful teardown, so it reports `-15` even though cleanup
+completed. Any other nonzero or unknown exit status, and any worker that still
+answers, keeps the run failed. A health probe that stops answering is not
+accepted as cleanup on its own, so a crashed gateway or surviving worker process
+cannot be silently scored as a clean shutdown.
+
+`/health` probes are cheap liveness checks. Each worker also gets a full health
+probe every `health_interval_s`. A worker that fails its probe leaves routing
+immediately, is marked `unavailable`, and its queued requests fail with 503
+`not_ready`; healthy same-model replicas keep serving. A local child process
+that exited, a worker that never completed startup, or a worker whose upstream
+produced a failed generation is likewise marked `unavailable` and is not probed
+again. A client cancellation or request deadline closes that upstream generation
+and counts the request as canceled or timed out, but does not take a healthy
+replica offline. When no replica of the requested model is ready, the gateway
+returns 503 `not_ready`. Failure state is recorded in the worker metrics and
+gateway logs.
+
+There is no automatic process restart, retry loop, backoff, auto-reassignment,
+or model replacement in this static release. An `unavailable` worker is never
+restarted or re-probed by the gateway: recovery is operator-controlled by
+restarting the gateway (local mode) or, for remote mode, restarting that worker
+process and the gateway. Active requests on a died worker fail; partially
+completed generations are never silently rerouted or duplicated.
+
+The client never stops a worker. The run finishes by observing the gateway stop,
+so recover the failed worker afterwards: restart the remote worker process, or
+the gateway for a local worker whose process actually died, and verify the
+affected model becomes `ready` again. Treat returned measurements as one observed run,
+not a general SLO or a proof of safe co-residency. No GPU run is performed by
+the CPU-only checks described here. The opt-in HTTP integration checks cover
+both model identities, concurrent requests, streaming identity, and the minimal
+public readiness contract without starting or allocating workers:
+
+```bash
+RUN_MULTI_GPU_TESTS=1 MULTI_GPU_INTEGRATION_URL=http://127.0.0.1:8000 \
+  .venv/bin/python -m unittest tests.test_multi_gpu_integration -v
+```
+
+Run that command only against an approved live two-GPU deployment. Startup
+failure, insufficient-memory, and worker-termination cases remain explicit
+operator fault-injection scenarios; the CPU suite does not simulate GPU VRAM or
+claim those hardware results.
+
 
 ### Metrics
 
@@ -613,9 +836,8 @@ process-owned resources shut down at process exit.
 Only `POST /v1/chat/completions` creates an observation, not probes or metrics.
 Each request has one manual `chat.completion` generation observation. Its trace
 ID equals the server-generated `x-request-id` response header; supplied request
-IDs are ignored. CPU authentication remains outside tracing, so unauthorized
-CPU requests still have no trace or request ID. Router authentication behavior
-is unchanged.
+IDs are ignored. CPU and router authentication both run outside tracing, so
+unauthorized requests have no trace or request ID.
 
 Exported application fields are restricted to request ID, static backend,
 validated model and stream flag, sanitized outcome/error code and HTTP status,
@@ -1664,10 +1886,12 @@ for per-request measurements, runtime versions, and limitations.
 
 ## Explicit two-model routing
 
-`src/model_router.py` is an opt-in FastAPI app that owns two pinned checkpoints
-behind one private, single-resident vLLM process group from
-`src/vllm_engine.py`. It runs only on the pinned Linux/T4 image; the production
-CPU API is unchanged.
+`src/model_router.py` is an opt-in FastAPI app. Its default mode owns two pinned
+checkpoints behind one private, single-resident vLLM process group from
+`src/vllm_engine.py`; the opt-in
+[static multi-GPU mode](#static-multi-gpu-vllm-serving) runs one process per
+configured worker instead. It runs only on the pinned Linux/T4 image; the
+production CPU API is unchanged.
 
 ### Policy and bounds
 

@@ -1,7 +1,8 @@
-"""Opt-in, single-resident vLLM routing with bounded FIFO admission."""
+"""Opt-in vLLM routing: single-resident FIFO, or a static multi-worker pool."""
 
 import asyncio
 import json
+import os
 from collections import deque
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -14,9 +15,9 @@ from pydantic import Field, ValidationError, field_validator
 from starlette.requests import ClientDisconnect
 from starlette.responses import JSONResponse, StreamingResponse
 
-from .api import ChatCompletionRequest, ChatMessage, _DisconnectedResponse
-from .inference import ContextLimitError
+from .api import AUTH_TOKEN_ENV, ChatCompletionRequest, ChatMessage, _AuthMiddleware, _DisconnectedResponse
 from .telemetry import close_tracer, create_tracer, start_request
+from .inference import ContextLimitError
 from .vllm_engine import MODEL_SPECS, VLLMEngine
 
 
@@ -24,6 +25,7 @@ MAX_BODY_BYTES = 65536
 MAX_PROMPT_CHARS = 16384
 MAX_RESPONSE_BYTES = 1024 * 1024
 SEND_TIMEOUT = 5.0
+LEGACY_COMPLETION_TIMEOUT = 180
 DRAIN_TIMEOUT = 5.0
 CLOSE_TIMEOUT = 3.0
 STOP_TIMEOUT = 20.0
@@ -46,6 +48,11 @@ class RoutingRequest(ChatCompletionRequest):
         if sum(len(message.content) for message in value) > MAX_PROMPT_CHARS:
             raise ValueError("Prompt is too large.")
         return value
+
+
+def request_lifetime(worker):
+    """Upper bound on one admitted request: completion, delivery frames and upstream close."""
+    return 2 * worker.definition.request_timeout_s + 4 * SEND_TIMEOUT + CLOSE_TIMEOUT
 
 
 class RouterError(Exception):
@@ -71,6 +78,7 @@ class Lease:
     prepared: dict | None = None
     task: asyncio.Task | None = None
     upstream: httpx.Response | None = None
+    usage: dict | None = None
     dispatched: bool = False
 
 
@@ -146,7 +154,7 @@ class ModelManager:
                 lease.task.cancel()
         self.wake.set()
 
-    async def release(self, lease, completed):
+    async def release(self, lease, completed, outcome=None):
         self.cancel_waiting(lease)
         if lease not in self.active:
             return
@@ -370,8 +378,17 @@ class _LeaseMiddleware:
                 trace.finish(outcome=outcome, http_status=status, error_code=code)
             lease = state.get("lease")
             if lease is not None:
+                code = state.get("trace_error_code")
+                if code in ("client_disconnected", "request_canceled"):
+                    outcome = "canceled"
+                elif code == "request_timeout":
+                    outcome = "timeout"
+                elif success and state.get("completed", False):
+                    outcome = "completed"
+                else:
+                    outcome = "failed"
                 cleanup = asyncio.create_task(scope["app"].state.manager.release(
-                    lease, success and state.get("completed", False),
+                    lease, outcome == "completed", outcome,
                 ))
                 try:
                     await asyncio.shield(cleanup)
@@ -477,7 +494,9 @@ async def _stream(request, lease):
     first = True
     trace = getattr(request.state, "request_trace", None)
     try:
-        async with asyncio.timeout(180):
+        worker = getattr(lease, "worker", None)
+        deadline = worker.definition.request_timeout_s if worker is not None else LEGACY_COMPLETION_TIMEOUT
+        async with asyncio.timeout(deadline):
             async for event in _upstream_events(lease.upstream):
                 if done:
                     raise ValueError("Data after terminal marker.")
@@ -503,6 +522,7 @@ async def _stream(request, lease):
                     if finish is None or usage is not None:
                         raise ValueError("Invalid usage ordering.")
                     usage = _usage(payload["usage"], lease, finish)
+                    lease.usage = usage
                     payload["usage"] = usage
                     if trace is not None:
                         trace.update(prompt_tokens=usage["prompt_tokens"],
@@ -516,6 +536,16 @@ async def _stream(request, lease):
         request.state.completed = True
     except asyncio.CancelledError:
         raise
+    except TimeoutError:
+        if worker is None:
+            failure = RouterError(502, "upstream_failed", "The inference upstream failed.")
+        else:
+            failure = RouterError(504, "request_timeout", "The request exceeded its deadline.")
+        request.state.trace_error_code = failure.code
+        if worker is None:
+            request.app.state.manager.fail(failure.code, exclude=lease)
+        yield _sse(_error(failure, lease.request_id))
+        yield "data: [DONE]\n\n"
     except Exception:
         request.state.trace_error_code = "upstream_failed"
         request.app.state.manager.fail("upstream_failed", exclude=lease)
@@ -543,9 +573,18 @@ async def _complete(request, lease):
     if body.stream:
         payload["stream_options"] = {"include_usage": True}
     client = request.app.state.client
+    worker = getattr(lease, "worker", None)
+    if worker is not None and (worker.generation != lease.generation
+                               or lease not in worker.active or worker.state != "ready"):
+        raise RouterError(503, "not_ready", "The selected worker became unavailable.")
+    engine = worker.engine if worker is not None else request.app.state.manager.engine
+    headers = {"x-request-id": lease.request_id}
+    if worker is not None:
+        token = os.environ[worker.definition.service_token_env]
+        headers["authorization"] = f"Bearer {token}"
     upstream = client.build_request(
-        "POST", request.app.state.manager.engine.base_url.rstrip("/") + "/v1/chat/completions",
-        json=payload, headers={"x-request-id": lease.request_id},
+        "POST", engine.base_url.rstrip("/") + "/v1/chat/completions",
+        json=payload, headers=headers,
     )
     lease.dispatched = True
     lease.upstream = await client.send(upstream, stream=True)
@@ -570,6 +609,7 @@ async def _complete(request, lease):
     if choice["finish_reason"] is None or not isinstance(choice["message"].get("content"), str):
         raise ValueError("Incomplete completion.")
     usage = _usage(payload.get("usage"), lease, choice["finish_reason"])
+    lease.usage = usage
     trace = getattr(request.state, "request_trace", None)
     if trace is not None:
         trace.update(prompt_tokens=usage["prompt_tokens"], completion_tokens=usage["completion_tokens"])
@@ -579,31 +619,55 @@ async def _complete(request, lease):
                          "prompt_token_ids": payload["prompt_token_ids"]})
 
 
-def create_app(engine=None):
-    engine = engine if engine is not None else VLLMEngine()
+def create_app(engine=None, config=None, worker_engine_factory=None, mode=None):
+    """Create the legacy single-resident router or the selected static worker pool."""
+    if config is None and engine is None:
+        config_path = os.environ.get("MULTI_GPU_CONFIG")
+        if config_path:
+            from .serving_config import load_config
+            config = load_config(config_path)
+    if isinstance(config, (str, bytes)) or hasattr(config, "__fspath__"):
+        from .serving_config import load_config
+        config = load_config(config)
+    if mode is None:
+        mode = os.environ.get("MULTI_GPU_MODE", "local")
+    if engine is None and config is None:
+        engine = VLLMEngine()
 
     @asynccontextmanager
     async def lifespan(app):
-        manager = ModelManager(engine)
+        if config is None:
+            manager = ModelManager(engine)
+        else:
+            from .worker_manager import MultiWorkerManager
+            manager = MultiWorkerManager(config, engine_factory=worker_engine_factory, mode=mode)
         app.state.manager = manager
-        app.state.tracer = create_tracer()
+        app.state.tracer = None
+        app.state.auth_token = os.environ.get(AUTH_TOKEN_ENV, "").strip() or None
         try:
+            app.state.tracer = create_tracer()
             async with httpx.AsyncClient(
-                timeout=httpx.Timeout(connect=5, read=120, write=10, pool=1),
-                limits=httpx.Limits(max_connections=2, max_keepalive_connections=2),
+                timeout=httpx.Timeout(connect=5, read=185 if config is not None else 120, write=10, pool=1),
+                limits=httpx.Limits(max_connections=32, max_keepalive_connections=32),
                 trust_env=False, follow_redirects=False,
             ) as client:
                 app.state.client = client
-                manager.start()
+                if config is None:
+                    manager.start()
+                else:
+                    await manager.start()
                 try:
                     yield
                 finally:
                     await manager.shutdown()
         finally:
+            app.state.auth_token = None
             await close_tracer(getattr(app.state, "tracer", None))
 
     app = FastAPI(lifespan=lifespan)
     app.add_middleware(_LeaseMiddleware)
+    if config is not None:
+        app.add_middleware(_AuthMiddleware)
 
     @app.get("/health")
     async def health():
@@ -611,8 +675,18 @@ def create_app(engine=None):
 
     @app.get("/ready")
     async def ready():
-        state = app.state.manager.snapshot()
+        manager = app.state.manager
+        if config is not None:
+            state = manager.readiness()
+            return JSONResponse({"status": "ready" if state["ready"] else "not_ready"},
+                                status_code=200 if state["ready"] else 503)
+        state = manager.snapshot()
         return JSONResponse(state, status_code=200 if state["ready"] else 503)
+
+    if config is not None:
+        @app.get("/metrics")
+        async def metrics():
+            return app.state.manager.metrics()
 
     @app.post("/v1/chat/completions")
     async def completion(request: Request):
@@ -636,11 +710,19 @@ def create_app(engine=None):
             lease = app.state.manager.submit(body, request.state.request_id)
             request.state.lease = lease
             lease.task = asyncio.current_task()
-            await _connected(request, lease.ready)
-            if trace is not None:
-                trace.update(queue_wait_ms=(perf_counter() - submitted) * 1000)
-            work = asyncio.create_task(_complete(request, lease))
-            async with asyncio.timeout(180):
+            worker = getattr(lease, "worker", None)
+            if worker is None:
+                await _connected(request, lease.ready)
+                if trace is not None:
+                    trace.update(queue_wait_ms=(perf_counter() - submitted) * 1000)
+                work = asyncio.create_task(_complete(request, lease))
+                async with asyncio.timeout(LEGACY_COMPLETION_TIMEOUT):
+                    return await _connected(request, work)
+            async with asyncio.timeout(worker.definition.request_timeout_s):
+                await _connected(request, lease.ready)
+                if trace is not None:
+                    trace.update(queue_wait_ms=(perf_counter() - submitted) * 1000)
+                work = asyncio.create_task(_complete(request, lease))
                 return await _connected(request, work)
         except ClientDisconnect:
             request.state.trace_error_code = "client_disconnected"
@@ -655,7 +737,7 @@ def create_app(engine=None):
             request.state.trace_error_code = error.code
             return JSONResponse(_error(error, request.state.request_id), status_code=error.status)
         except Exception:
-            app.state.manager.fail("upstream_failed")
+            app.state.manager.fail("upstream_failed", exclude=lease)
             error = RouterError(502, "upstream_failed", "The inference upstream failed.")
             request.state.trace_error_code = error.code
             return JSONResponse(_error(error, request.state.request_id), status_code=error.status)

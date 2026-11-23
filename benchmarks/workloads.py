@@ -21,23 +21,27 @@ BACKGROUND = (
 LONG_PROMPT = "Background notes:\n" + "\n".join([BACKGROUND] * 16) + "\n\n" + SHORT_PROMPT
 
 
-def build_workload():
+def build_workload(model_id=MODEL_ID):
     from huggingface_hub import snapshot_download
     from transformers import AutoConfig, AutoTokenizer
+    from src.vllm_engine import MODEL_SPECS
 
-    # Download/setup is a separate operation, never hidden in a benchmark run.
-    snapshot = snapshot_download(MODEL_ID, local_files_only=True)
-    revision = Path(snapshot).name
+    if model_id not in MODEL_SPECS:
+        raise ValueError("Workload model must be one of the two pinned Qwen checkpoints.")
+    revision = MODEL_SPECS[model_id]["revision"]
+    snapshot = snapshot_download(model_id, revision=revision, local_files_only=True)
+    if Path(snapshot).name != revision:
+        raise ValueError("Cached workload snapshot does not match the pinned revision.")
     config = AutoConfig.from_pretrained(snapshot, local_files_only=True)
-    tokenizer = AutoTokenizer.from_pretrained(
-        snapshot, local_files_only=True
-    )
+    tokenizer = AutoTokenizer.from_pretrained(snapshot, local_files_only=True)
     cases = []
     context_limit = min(2048, config.max_position_embeddings)
     for input_name, prompt in (("short", SHORT_PROMPT), ("long", LONG_PROMPT)):
         messages = [{"role": "user", "content": prompt}]
+        # Must match the served request's template: the router prepares and forwards
+        # enable_thinking=False, which changes Qwen3's rendered prompt length.
         formatted = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
         )
         count = len(tokenizer(formatted, add_special_tokens=False)["input_ids"])
         for output_name, cap in (("short", 32), ("long", 128)):
@@ -51,7 +55,7 @@ def build_workload():
             })
     return {
         "schema_version": 1,
-        "model": MODEL_ID,
+        "model": model_id,
         "model_revision": revision,
         "tokenizer_revision": revision,
         "chat_template_sha256": hashlib.sha256(tokenizer.chat_template.encode()).hexdigest(),
@@ -67,9 +71,10 @@ def build_workload():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", choices=(MODEL_ID, "Qwen/Qwen3-1.7B"), default=MODEL_ID)
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
-    manifest = build_workload()
+    manifest = build_workload(args.model)
     write_json(args.output, manifest)
     print(f"Model revision: {manifest['model_revision']}")
     for case in manifest["cases"]:

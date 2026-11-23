@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import unittest
 from contextlib import suppress
 from threading import Event
@@ -386,6 +387,24 @@ class LifespanTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(flushed.is_set())
 
 
+class LegacyAuthTests(unittest.IsolatedAsyncioTestCase):
+    async def test_single_resident_router_stays_ungated_when_token_is_configured(self):
+        upstream = LocalUpstream()
+        engine = FakeEngine()
+        engine.base_url = await upstream.start()
+        self.addAsyncCleanup(upstream.close)
+        with patch.dict(os.environ, {router.AUTH_TOKEN_ENV: "CLIENT-SECRET"}):
+            app = router.create_app(engine)
+            context = app.router.lifespan_context(app)
+            await context.__aenter__()
+            self.addAsyncCleanup(context.__aexit__, None, None, None)
+            engine.manager = app.state.manager
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://router") as client:
+                response = await client.post("/v1/chat/completions", json=data())
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual((await client.get("/metrics")).status_code, 404)
+
+
 class EndpointTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tracer = RecordingTracer()
@@ -596,6 +615,34 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
             disconnected.set()
             await asyncio.wait_for(active, 2)
 
+    async def test_legacy_queue_wait_is_not_timeboxed(self):
+        self.upstream.hold_stream = True
+        active, disconnected = await self.asgi_request()
+        waiting = asyncio.create_task(self.client.post(
+            "/v1/chat/completions", json=data(HIGH_MODEL),
+        ))
+        try:
+            with patch.object(router, "LEGACY_COMPLETION_TIMEOUT", 0.05):
+                await until(lambda: self.app.state.manager.snapshot()["queued"] == 1)
+                await asyncio.sleep(0.15)
+                self.assertFalse(waiting.done())
+        finally:
+            disconnected.set()
+            await asyncio.wait_for(active, 2)
+        response = await asyncio.wait_for(waiting, 5)
+        self.assertEqual(response.status_code, 200)
+
+    async def test_legacy_stream_deadline_keeps_upstream_failed_code(self):
+        self.upstream.hold_stream = True
+        with patch.object(router, "LEGACY_COMPLETION_TIMEOUT", 0.05):
+            response = await asyncio.wait_for(
+                self.client.post("/v1/chat/completions", json=data(stream=True)), 5)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("upstream_failed", response.text)
+        self.assertNotIn("request_timeout", response.text)
+        self.assertFalse(self.app.state.manager.snapshot()["accepting"])
+        self.assert_trace(self.tracer.observations[-1], "failed", 200, "upstream_failed")
+
     async def test_stream_disconnect_closes_upstream_before_releasing_lease(self):
         self.upstream.hold_stream = True
         task, disconnected = await self.asgi_request()
@@ -639,9 +686,9 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
     async def test_trace_ends_before_failed_lease_cleanup(self):
         release = self.app.state.manager.release
 
-        async def failing_release(lease, completed):
+        async def failing_release(lease, completed, outcome=None):
             self.assert_trace(self.tracer.observations[-1], "completed", 200)
-            await release(lease, completed)
+            await release(lease, completed, outcome)
             raise RuntimeError("PRIVATE-CLEANUP")
 
         with patch.object(self.app.state.manager, "release", side_effect=failing_release):
