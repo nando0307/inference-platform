@@ -1,0 +1,118 @@
+{
+  "schema_version": 1,
+  "id": "mixed_60min",
+  "duration_s": 3600,
+  "seed": 42,
+  "arrival_process": "poisson",
+  "phases": [
+    {
+      "id": "balanced",
+      "start_s": 0,
+      "end_s": 600,
+      "rate_rps": 0.5,
+      "model_probabilities": {
+        "Qwen/Qwen2.5-0.5B-Instruct": 0.5,
+        "Qwen/Qwen3-1.7B": 0.5
+      },
+      "arrival_process": "poisson",
+      "input_profile": "mixed",
+      "output_profile": "mixed",
+      "stream_probability": 0.8,
+      "cancellation_probability": 0
+    },
+    {
+      "id": "small_peak",
+      "start_s": 600,
+      "end_s": 1200,
+      "rate_rps": 1,
+      "model_probabilities": {
+        "Qwen/Qwen2.5-0.5B-Instruct": 0.9,
+        "Qwen/Qwen3-1.7B": 0.09999999999999998
+      },
+      "arrival_process": "poisson",
+      "input_profile": "mixed",
+      "output_profile": "mixed",
+      "stream_probability": 0.8,
+      "cancellation_probability": 0
+    },
+    {
+      "id": "large_peak",
+      "start_s": 1200,
+      "end_s": 1800,
+      "rate_rps": 1,
+      "model_probabilities": {
+        "Qwen/Qwen2.5-0.5B-Instruct": 0.1,
+        "Qwen/Qwen3-1.7B": 0.9
+      },
+      "arrival_process": "poisson",
+      "input_profile": "mixed",
+      "output_profile": "mixed",
+      "stream_probability": 0.8,
+      "cancellation_probability": 0
+    },
+    {
+      "id": "heavy_mixed",
+      "start_s": 1800,
+      "end_s": 2400,
+      "rate_rps": 2,
+      "model_probabilities": {
+        "Qwen/Qwen2.5-0.5B-Instruct": 0.5,
+        "Qwen/Qwen3-1.7B": 0.5
+      },
+      "arrival_process": "poisson",
+      "input_profile": "mixed",
+      "output_profile": "mixed",
+      "stream_probability": 0.8,
+      "cancellation_probability": 0
+    },
+    {
+      "id": "alternating_small",
+      "start_s": 2400,
+      "end_s": 2700,
+      "rate_rps": 1.5,
+      "model_probabilities": {
+        "Qwen/Qwen2.5-0.5B-Instruct": 0.9,
+        "Qwen/Qwen3-1.7B": 0.09999999999999998
+      },
+      "arrival_process": "poisson",
+      "input_profile": "mixed",
+      "output_profile": "mixed",
+      "stream_probability": 0.8,
+      "cancellation_probability": 0
+    },
+    {
+      "id": "alternating_large",
+      "start_s": 2700,
+      "end_s": 3000,
+      "rate_rps": 1.5,
+      "model_probabilities": {
+        "Qwen/Qwen2.5-0.5B-Instruct": 0.1,
+        "Qwen/Qwen3-1.7B": 0.9
+      },
+      "arrival_process": "poisson",
+      "input_profile": "mixed",
+      "output_profile": "mixed",
+      "stream_probability": 0.8,
+      "cancellation_probability": 0
+    },
+    {
+      "id": "idle",
+      "start_s": 3000,
+      "end_s": 3600,
+      "rate_rps": 0,
+      "model_probabilities": {
+        "Qwen/Qwen2.5-0.5B-Instruct": 0.5,
+        "Qwen/Qwen3-1.7B": 0.5
+      },
+      "arrival_process": "poisson",
+      "input_profile": "mixed",
+      "output_profile": "mixed",
+      "stream_probability": 0,
+      "cancellation_probability": 0
+    }
+  ],
+  "prompt_corpus_id": "synthetic-v1",
+  "request_timeout_s": 180,
+  "max_inflight": 64,
+  "max_connections": 64
+}

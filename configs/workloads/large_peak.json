@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "id": "large_peak",
+  "duration_s": 180,
+  "seed": 42,
+  "arrival_process": "poisson",
+  "phases": [
+    {
+      "id": "large_peak",
+      "start_s": 0,
+      "end_s": 180,
+      "rate_rps": 1,
+      "model_probabilities": {
+        "Qwen/Qwen2.5-0.5B-Instruct": 0.1,
+        "Qwen/Qwen3-1.7B": 0.9
+      },
+      "arrival_process": "poisson",
+      "input_profile": "mixed",
+      "output_profile": "mixed",
+      "stream_probability": 0.8,
+      "cancellation_probability": 0
+    }
+  ],
+  "prompt_corpus_id": "synthetic-v1",
+  "request_timeout_s": 180,
+  "max_inflight": 64,
+  "max_connections": 64
+}
