@@ -96,17 +96,16 @@ class MultiWorkerGatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row[2] for row in self.forwarded], [LOW_MODEL, HIGH_MODEL])
         self.assertEqual([row[1] for row in self.forwarded], ["Bearer internal-small-0", "Bearer internal-large-0"])
         self.assertNotIn("CLIENT-SECRET", str(self.forwarded))
-        self.assertTrue((await self.client.get("/ready")).json()["ready"])
+        self.assertEqual((await self.client.get("/ready")).json(), {"status": "ready"})
 
     async def test_explicit_mode_starts_the_configured_worker_pool(self):
         app = create_app(config=self.config, worker_engine_factory=FakeWorkerEngine, mode="local")
         async with app.router.lifespan_context(app):
             manager = app.state.manager
             self.assertEqual(set(manager.workers), {row.id for row in self.config.workers})
-            self.assertTrue(manager.readiness()["models"][LOW_MODEL]["ready"])
-            self.assertTrue(manager.readiness()["models"][HIGH_MODEL]["ready"])
+            self.assertTrue(manager.readiness()["ready"])
 
-    async def test_stream_deadline_reports_request_timeout_and_recycles_replica(self):
+    async def test_stream_deadline_reports_request_timeout_and_keeps_replica(self):
         config = replace(self.config, workers=tuple(
             replace(row, request_timeout_s=0.1) for row in self.config.workers))
         stall = asyncio.Event()
@@ -145,11 +144,9 @@ class MultiWorkerGatewayTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('"code": "request_timeout"', response.text)
             manager = app.state.manager
             worker = manager.workers["small-0"]
-            async with asyncio.timeout(2):
-                while worker.state != "ready":
-                    await asyncio.sleep(0.01)
-            self.assertEqual(worker.engine.starts, 2)
-            self.assertEqual(worker.engine.stops, 1)
+            self.assertEqual(worker.state, "ready")
+            self.assertEqual(worker.engine.starts, 1)
+            self.assertEqual(worker.engine.stops, 0)
             self.assertIsNone(worker.last_error)
 
     async def test_gateway_auth_rejects_before_worker_dispatch(self):
@@ -180,40 +177,37 @@ class MultiWorkerGatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.json()["error"]["code"], "not_ready")
         self.assertEqual(len(self.forwarded), 0)
 
-    async def test_public_readiness_hides_worker_topology_and_reports_routable_models(self):
+    async def test_public_readiness_is_minimal_and_requires_every_model(self):
         response = await self.client.get("/ready")
         self.assertEqual(response.status_code, 200)
-        body = response.json()
-        self.assertEqual(set(body), {"ready", "models"})
-        self.assertTrue(body["ready"])
-        serialized = json.dumps(body)
-        for private in ("GPU-", "127.0.0.1", "cuda_device", "physical_gpu_uuid",
-                        "host", "error", "endpoint", "revision", "queued"):
-            self.assertNotIn(private, serialized)
+        self.assertEqual(response.json(), {"status": "ready"})
         manager = self.app.state.manager
-        manager.workers["large-0"].state = "unavailable"
-        partial = await self.client.get("/ready")
-        self.assertEqual(partial.status_code, 200)
-        self.assertTrue(partial.json()["ready"])
-        self.assertEqual(partial.json()["models"][HIGH_MODEL]["status"], "unavailable")
-        self.assertEqual(partial.json()["models"][LOW_MODEL]["status"], "ready")
-        manager.workers["large-0"].state = "ready"
+
         manager.workers["small-0"].state = "unavailable"
         degraded = await self.client.get("/ready")
         self.assertEqual(degraded.status_code, 200)
-        self.assertTrue(degraded.json()["ready"])
-        self.assertEqual(degraded.json()["models"][LOW_MODEL]["status"], "degraded")
-        self.assertEqual(degraded.json()["models"][LOW_MODEL]["ready"], 1)
-        self.assertEqual(degraded.json()["models"][HIGH_MODEL]["status"], "ready")
+        self.assertEqual(degraded.json(), {"status": "ready"})
+
+        manager.workers["large-0"].state = "unavailable"
+        missing = await self.client.get("/ready")
+        self.assertEqual(missing.status_code, 503)
+        self.assertEqual(missing.json(), {"status": "not_ready"})
+        serialized = json.dumps(missing.json())
+        for private in ("GPU-", "127.0.0.1", "cuda_device", "physical_gpu_uuid",
+                        "host", "error", "endpoint", "revision", "queued", HIGH_MODEL):
+            self.assertNotIn(private, serialized)
+
         metrics = (await self.client.get("/metrics", headers={"authorization": "Bearer CLIENT-SECRET"})).json()
         self.assertEqual(metrics["workers"]["small-0"]["state"], "unavailable")
-        for worker in manager.workers.values():
-            worker.state = "unavailable"
+        self.assertEqual(metrics["workers"]["large-0"]["state"], "unavailable")
+        self.assertEqual(metrics["models"][LOW_MODEL]["ready"], 1)
+        self.assertEqual(metrics["models"][HIGH_MODEL]["ready"], 0)
+
+        manager.workers["large-0"].state = "ready"
+        manager.workers["small-1"].state = "unavailable"
         offline = await self.client.get("/ready")
         self.assertEqual(offline.status_code, 503)
-        self.assertFalse(offline.json()["ready"])
-        self.assertEqual(offline.json()["models"][LOW_MODEL]["status"], "unavailable")
-        self.assertEqual(offline.json()["models"][HIGH_MODEL]["status"], "unavailable")
+        self.assertEqual(offline.json(), {"status": "not_ready"})
 
 
 if __name__ == "__main__":

@@ -73,6 +73,7 @@ class Lease:
     prepared: dict | None = None
     task: asyncio.Task | None = None
     upstream: httpx.Response | None = None
+    usage: dict | None = None
     dispatched: bool = False
 
 
@@ -507,6 +508,7 @@ async def _stream(request, lease):
                     if finish is None or usage is not None:
                         raise ValueError("Invalid usage ordering.")
                     usage = _usage(payload["usage"], lease, finish)
+                    lease.usage = usage
                     payload["usage"] = usage
                     if trace is not None:
                         trace.update(prompt_tokens=usage["prompt_tokens"],
@@ -526,7 +528,8 @@ async def _stream(request, lease):
         else:
             failure = RouterError(504, "request_timeout", "The request exceeded its deadline.")
         request.state.trace_error_code = failure.code
-        request.app.state.manager.fail(failure.code, exclude=lease)
+        if worker is None:
+            request.app.state.manager.fail(failure.code, exclude=lease)
         yield _sse(_error(failure, lease.request_id))
         yield "data: [DONE]\n\n"
     except Exception:
@@ -589,6 +592,7 @@ async def _complete(request, lease):
     if choice["finish_reason"] is None or not isinstance(choice["message"].get("content"), str):
         raise ValueError("Incomplete completion.")
     usage = _usage(payload.get("usage"), lease, choice["finish_reason"])
+    lease.usage = usage
     trace = getattr(request.state, "request_trace", None)
     if trace is not None:
         trace.update(prompt_tokens=usage["prompt_tokens"], completion_tokens=usage["completion_tokens"])
@@ -655,7 +659,11 @@ def create_app(engine=None, config=None, worker_engine_factory=None, mode=None):
     @app.get("/ready")
     async def ready():
         manager = app.state.manager
-        state = manager.readiness() if hasattr(manager, "readiness") else manager.snapshot()
+        if config is not None:
+            state = manager.readiness()
+            return JSONResponse({"status": "ready" if state["ready"] else "not_ready"},
+                                status_code=200 if state["ready"] else 503)
+        state = manager.snapshot()
         return JSONResponse(state, status_code=200 if state["ready"] else 503)
 
     if config is not None:

@@ -135,7 +135,7 @@ async def run_protocol(url, placement, config, small, large, failure_worker, out
         )
 
         print(f"Case 8: stop worker {failure_worker} at {failed_config.endpoint}; do not stop the gateway.")
-        await asyncio.to_thread(input, "Wait until /ready reports it unready, then press Enter: ")
+        await asyncio.to_thread(input, "Wait until /ready reports not_ready, then press Enter: ")
         ready = await client.get(url.rstrip("/") + "/ready")
         initial = ready.json()
         initial_metrics = (await client.get(url.rstrip("/") + "/metrics")).json()
@@ -149,7 +149,7 @@ async def run_protocol(url, placement, config, small, large, failure_worker, out
                           (other_model, singles[(other_model, "short")][1])]
         failure_entry = await execute("replica/failure isolation", failure_targets, concurrent=True)
         affected, unaffected = _partition_by_model(failure_entry["rows"], failed_config.model)
-        artifact["checks"]["case_8_worker_unready"] = initial_metrics.get("workers", {}).get(failure_worker, {}).get("state") in {"suspect", "unavailable"}
+        artifact["checks"]["case_8_worker_unready"] = initial_metrics.get("workers", {}).get(failure_worker, {}).get("state") == "unavailable"
         artifact["checks"]["case_8_expected_availability"] = (
             failed_ready > 0 and bool(affected) and all(row["status"] == "success" for row in affected)
             if should_retain else failed_ready == 0 and bool(affected) and all(row["http_status"] == 503 for row in affected)

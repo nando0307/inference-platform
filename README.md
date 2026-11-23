@@ -14,7 +14,9 @@ and the next task. Use [plan.md](plan.md) for the broader roadmap.
 
 The implementation now includes Phase 4 controlled concurrency: one inference
 worker, two FIFO waiting slots, cooperative cancellation, and bounded streaming.
-The suite has 182 passing tests, with real-Qwen lifecycle and HTTP smoke evidence.
+The suite has 231 passing CPU tests, with real-Qwen lifecycle and HTTP smoke evidence.
+The multi-GPU feature adds static two-GPU worker pools, exact-model dispatch, and
+operator-controlled failure handling; real two-T4 validation remains pending.
 See the [Phase 4 evidence](logs/practice.md#phase-4-bounded-concurrency-and-cancellation)
 for the fixed-workload comparison and its limitations. Stage 5 now includes CPU
 and T4 static-batching measurements at sizes 1/2/4; the API remains sequential.
@@ -44,8 +46,12 @@ two-model lifecycle: three loads, cross-model FIFO, queued cancellation, a clean
 process-group shutdown, and frozen quality tasks (8/9 low, 9/9 high).
 Stage 10 now adds a [metrics snapshot](#metrics) endpoint, optional bearer
 authentication, a 64 KiB request-body cap, and a verified local restart and
-failed-startup procedure. The roadmap in [plan.md](plan.md) ends here; the
-remaining items are independent learning checks. Report-ready numbers and their
+failed-startup procedure. Stage 11 adds opt-in
+[static multi-GPU serving](#static-multi-gpu-vllm-serving) with four placement
+configs, per-worker GPU pinning, model-aware dispatch, and no dynamic placement
+or automatic recovery. Real two-card T4 runs are still pending approval. The
+roadmap in [plan.md](plan.md) ends here; the remaining items are independent
+learning checks. Report-ready numbers and their
 scopes live in [the results summary](logs/results-summary.md).
 
 ## Explore the codebase with Understand Anything
@@ -588,6 +594,24 @@ claim multi-GPU results without explicit approval for the specific hardware and
 run. The static mapping does not substitute another model when its workers are
 unavailable; D intentionally leaves GPU 1 idle.
 
+Each worker moves through `starting` -> `ready` after its own vLLM process group
+loads the pinned model, binds its configured endpoint, and answers both `/health`
+and `/v1/models` with exactly that model. `unavailable` is terminal for the
+gateway process: startup failure, a failed health probe, a dead local child, or
+a failed upstream generation removes the worker from routing permanently.
+Graceful shutdown ends in `stopped`, or `cleanup_failed` when a process group
+cannot be confirmed dead. Requests are never admitted to a worker that is not
+`ready`.
+
+Memory inputs are the pinned model weights, vLLM's own KV cache, per-request
+`max_tokens` up to 512, two sequences, CUDA context/runtime workspace, and
+fragmentation. The config caps the sum of each GPU's declared
+`memory_utilization` at 1.0, but vLLM's utilization fraction is not a hard
+partition or a guarantee that co-resident processes fit. Actual VRAM use on a
+T4 is unmeasured here; if allocation is insufficient, vLLM startup fails and the
+worker is reported `unavailable` rather than retried. No dynamic placement,
+automatic restart, GPU reassignment, or model replacement is implemented.
+
 For an approved local allocation, export secrets through a secret manager or
 interactive shell, then launch one gateway. Each local worker is an owned child
 process; Ctrl-C stops the gateway and reaps its process groups:
@@ -617,20 +641,21 @@ MULTI_GPU_CONFIG=/path/to/serving-a.json MULTI_GPU_MODE=remote \
   --host 127.0.0.1 --port 8000 --workers 1
 ```
 
-`/ready` reports only global routability and per-model availability status, so
-it can stay public for probes. It returns 200 when at least one configured model
-has a ready replica, and 503 only when no configured model is routable. Per-model
-status stays independent of that flag: `ready` when every replica of the model is
-ready, `degraded` when only some replicas are available, and `unavailable` when
-that model alone has no ready replica. Worker state, physical UUIDs, device
-ordinals, revisions, queue depths, and failure detail stay on `/metrics`, which
-reports request state per worker, model, and physical UUID. NVML telemetry is
-optional and missing values remain unknown, not zero. No prompts, outputs,
-request headers, or service credentials are included in these metrics. Each
-worker admits at most two active sequences and queues at most two more; when
-every ready replica of the requested model is saturated the gateway returns
-429 `server_busy` instead of exceeding that bound, and a request that exceeds
-its worker's `request_timeout_s` returns 504 `request_timeout`.
+`/health` remains a cheap unauthenticated liveness check. The public `/ready`
+response is deliberately minimal: `{"status": "ready"}` with 200 only when the
+gateway accepts traffic and every configured model has at least one ready
+replica, otherwise `{"status": "not_ready"}` with 503. A failed replica does not
+make the gateway unready while another replica of the same model remains ready;
+a model with no ready replica does. Per-model readiness counts, worker state,
+physical UUIDs, device ordinals, revisions, queue depths, startup durations,
+token totals, and failure detail stay on `/metrics`, which reports request and
+token state per worker, model, and physical UUID. NVML telemetry is optional and
+missing values remain unknown, not zero. No prompts, outputs, request headers,
+or service credentials are included in these metrics. Each worker admits at most
+two active sequences and queues at most two more; when every ready replica of
+the requested model is saturated the gateway returns 429 `server_busy` instead
+of exceeding that bound, and a request that exceeds its worker's
+`request_timeout_s` returns 504 `request_timeout`.
 
 #### Approved two-card T4 validation protocol
 
@@ -667,7 +692,8 @@ pgid=$(ps -o pgid= -p "$pid" | tr -d ' ')
 kill -TERM -- "-$pgid"
 ```
 
-Wait until `/ready` reports the affected model as `degraded` or `unavailable`
+Wait until `/ready` returns 503 `not_ready` when the affected model has no
+remaining replica, or remains 200 when another replica still serves it
 (`/metrics` reports the selected worker state), then press Enter in the
 benchmark terminal. Use a fresh output path:
 
@@ -681,33 +707,41 @@ benchmark terminal. Use a fresh output path:
 ```
 
 `/health` probes are cheap liveness checks. Each worker also gets a full health
-probe every `health_interval_s`. A worker that fails its probe is removed from
-routing immediately and its queued requests fail with 503 `not_ready`; healthy
-same-model replicas keep serving. A worker that had become ready is marked
-`suspect` and rejoins after two consecutive successful probes, for example once
-its restarted remote process answers again. A local child process that exited,
-or a worker that never completed startup, is marked `unavailable` and is not
-probed again. A dispatched request that does not complete, such as a client
-cancellation or a request deadline, does not permanently take a healthy replica
-offline: the gateway closes that upstream generation, keeps the worker out of
-routing (`/metrics` reports `recycling`), and recycles that worker once for that
-request (drain, stop, then start and wait for fresh identity/readiness). One
-recycle runs at a time per worker, and each later non-completion gets its own
-single recycle; there is no automatic retry after a failed one. A successful
-recycle returns the worker to `ready`; a failed recycle reports `unavailable`:
-the worker leaves routing at once and is terminated. When no replica of the requested
-model is ready, the gateway returns 503 `not_ready`. Failure state is recorded
-in the worker metrics and gateway logs. An unexpectedly dead process is never
-restarted automatically; recovery is operator-controlled with no restart loop,
-backoff, or retry budget: restart a remote worker process (a `suspect` worker
-rejoins through health probes), or restart the gateway to recover an
-`unavailable` worker.
+probe every `health_interval_s`. A worker that fails its probe leaves routing
+immediately, is marked `unavailable`, and its queued requests fail with 503
+`not_ready`; healthy same-model replicas keep serving. A local child process
+that exited, a worker that never completed startup, or a worker whose upstream
+produced a failed generation is likewise marked `unavailable` and is not probed
+again. A client cancellation or request deadline closes that upstream generation
+and counts the request as canceled or timed out, but does not take a healthy
+replica offline. When no replica of the requested model is ready, the gateway
+returns 503 `not_ready`. Failure state is recorded in the worker metrics and
+gateway logs.
+
+There is no automatic process restart, retry loop, backoff, auto-reassignment,
+or model replacement in this static release. An `unavailable` worker is never
+restarted or re-probed by the gateway: recovery is operator-controlled by
+restarting the gateway (local mode) or, for remote mode, restarting that worker
+process and the gateway. Active requests on a died worker fail; partially
+completed generations are never silently rerouted or duplicated.
 
 The client never stops a worker. After the protocol, restart the failed remote
 worker, or the gateway for a local worker whose process actually died, and verify
 the affected model becomes `ready` again. Treat returned measurements as one observed run,
 not a general SLO or a proof of safe co-residency. No GPU run is performed by
-the CPU-only checks described here.
+the CPU-only checks described here. The opt-in HTTP integration checks cover
+both model identities, concurrent requests, streaming identity, and the minimal
+public readiness contract without starting or allocating workers:
+
+```bash
+RUN_MULTI_GPU_TESTS=1 MULTI_GPU_INTEGRATION_URL=http://127.0.0.1:8000 \
+  .venv/bin/python -m unittest tests.test_multi_gpu_integration -v
+```
+
+Run that command only against an approved live two-GPU deployment. Startup
+failure, insufficient-memory, and worker-termination cases remain explicit
+operator fault-injection scenarios; the CPU suite does not simulate GPU VRAM or
+claim those hardware results.
 
 
 ### Metrics

@@ -24,14 +24,12 @@ class Worker:
     definition: object
     engine: VLLMEngine
     state: str = "starting"
-    generation: int = 0
     active: set = field(default_factory=set)
     queue: deque = field(default_factory=deque)
     available: asyncio.Event = field(default_factory=asyncio.Event)
-    consecutive_successes: int = 0
     requests: dict = field(default_factory=lambda: {"completed": 0, "failed": 0, "canceled": 0, "rejected": 0})
+    tokens: dict = field(default_factory=lambda: {"prompt": 0, "completion": 0})
     last_error: str | None = None
-    cleanup_task: asyncio.Task | None = None
 
     @property
     def inflight(self):
@@ -111,58 +109,53 @@ class MultiWorkerManager:
             models[model.id] = {"ready": ready, "configured": len(replicas),
                                 "status": "ready" if ready == len(replicas) else "degraded" if ready else "unavailable"}
         return {
-            "ready": self.accepting and any(row["ready"] > 0 for row in models.values()),
+            "ready": self.accepting and all(row["ready"] > 0 for row in models.values()),
             "placement": self.config.placement, "models": models,
             "workers": {w.definition.id: {
-                "state": w.state, "generation": w.generation, "model": w.definition.model,
+                "state": w.state, "model": w.definition.model,
                 "revision": self._revision(w.definition.model), "host": w.definition.host,
                 "physical_gpu_uuid": w.definition.gpu_uuid, "cuda_device": w.definition.cuda_device,
                 "in_flight": len(w.active), "queued": len(w.queue),
                 "queue_capacity": self.config.queue_capacity_per_worker, "error": w.last_error,
+                "startup_ms": getattr(w.engine, "metadata", {}).get("startup_ms"),
             } for w in self.workers.values()},
         }
 
     def readiness(self):
-        state = self.snapshot()
-        return {"ready": state["ready"], "models": state["models"]}
+        return {"ready": self.snapshot()["ready"]}
 
     def _revision(self, model_id):
         return next(model.revision for model in self.config.models.values() if model.id == model_id)
 
     async def start(self):
-        async def start_worker(worker, generation):
+        async def start_worker(worker):
             try:
                 async with asyncio.timeout(worker.definition.startup_timeout_s):
                     await worker.engine.start(worker.definition.model)
-                if generation == worker.generation:
-                    if worker.engine.model != worker.definition.model or not worker.engine.is_alive():
-                        raise RuntimeError("Worker did not serve the configured model.")
-                    worker.state = "ready"
-                    worker.last_error = None
-                    self.emit("ready", worker, generation=generation)
+                if worker.engine.model != worker.definition.model or not worker.engine.is_alive():
+                    raise RuntimeError("Worker did not serve the configured model.")
+                worker.state = "ready"
+                worker.last_error = None
+                self.emit("ready", worker)
             except Exception as error:
-                if generation == worker.generation:
-                    worker.state = "unavailable"
-                    worker.last_error = type(error).__name__
-                    self.emit("startup_failed", worker, generation=generation)
-                    try:
-                        await worker.engine.stop()
-                    except Exception:
-                        worker.last_error = "cleanup_failed"
-            finally:
-                if worker.state == "starting":
-                    worker.state = "unavailable"
+                worker.state = "unavailable"
+                worker.last_error = type(error).__name__
+                self.emit("startup_failed", worker)
+                try:
+                    await worker.engine.stop()
+                except Exception:
+                    worker.last_error = "cleanup_failed"
 
-        await asyncio.gather(*(start_worker(w, w.generation) for w in self.workers.values()))
+        await asyncio.gather(*(start_worker(w) for w in self.workers.values()))
         self.health_task = asyncio.create_task(self._health_loop(), name="multi-gpu-worker-health")
         return any(w.state == "ready" for w in self.workers.values())
 
     @staticmethod
     def _quarantined(worker):
-        return worker.cleanup_task is not None or worker.state == "unavailable"
+        return worker.state == "unavailable"
 
-    async def _probe(self, worker, generation):
-        if worker.generation != generation or worker.state not in {"ready", "suspect"}:
+    async def _probe(self, worker):
+        if worker.state != "ready":
             return
         alive = self.mode != "local" or worker.engine.is_alive()
         if not alive:
@@ -178,26 +171,19 @@ class MultiWorkerManager:
                              and [item["id"] for item in models.json()["data"]] == [worker.definition.model])
             except Exception:
                 valid = False
-        if worker.generation != generation or self._quarantined(worker):
+        if self._quarantined(worker):
             return
-        if valid:
-            worker.consecutive_successes += 1
-            if worker.state == "suspect" and worker.consecutive_successes >= 2:
-                worker.state = "ready"
-                worker.last_error = None
-                self.emit("recovered", worker, generation=generation)
-        else:
-            worker.state = "suspect" if alive else "unavailable"
-            worker.consecutive_successes = 0
+        if not valid:
+            worker.state = "unavailable"
             worker.last_error = "health_check_failed"
-            self.emit("unready", worker, generation=generation)
+            self.emit("unready", worker)
             self._fail_queued(worker, "not_ready")
 
     async def _health_loop(self):
         try:
             while not self.closing:
                 await asyncio.sleep(self.config.health_interval_s)
-                await asyncio.gather(*(self._probe(w, w.generation) for w in self.workers.values()))
+                await asyncio.gather(*(self._probe(w) for w in self.workers.values()))
         except asyncio.CancelledError:
             pass
 
@@ -220,7 +206,7 @@ class MultiWorkerManager:
         worker = candidates[0]
         lease = Lease(request_id, body, asyncio.get_running_loop().create_future())
         lease.ready.add_done_callback(_observe)
-        lease.worker, lease.generation = worker, worker.generation
+        lease.worker = worker
         if len(worker.active) < worker.definition.max_sequences:
             worker.active.add(lease)
         else:
@@ -244,7 +230,7 @@ class MultiWorkerManager:
                 if lease not in worker.queue:
                     break
                 await worker.available.wait()
-            if worker.generation != lease.generation or worker.state != "ready":
+            if worker.state != "ready":
                 raise RouterError(503, "not_ready", "The selected worker became unavailable.")
             if lease not in worker.active:
                 raise RouterError(503, "not_ready", "The selected worker lost its admission slot.")
@@ -267,8 +253,10 @@ class MultiWorkerManager:
                 else:
                     public = RouterError(503, "engine_failed", "The selected worker could not prepare the request.")
                     if not self._quarantined(worker):
-                        worker.state = "suspect"
+                        worker.state = "unavailable"
                         worker.last_error = type(error).__name__
+                        self.emit("worker_failed", worker, reason=worker.last_error)
+                        self._fail_queued(worker, "not_ready")
                 lease.ready.set_exception(public)
             worker.requests["failed"] += 1
             worker.available.set()
@@ -326,27 +314,23 @@ class MultiWorkerManager:
             except Exception:
                 completed = False
                 if not self._quarantined(worker):
-                    worker.state = "suspect"
+                    worker.state = "unavailable"
                     worker.last_error = "upstream_close_failed"
+                    self.emit("worker_failed", worker, reason=worker.last_error)
+                    self._fail_queued(worker, "not_ready")
         worker.active.remove(lease)
         outcome = "completed" if completed else "canceled" if lease.task and lease.task.cancelled() else "failed"
         worker.requests[outcome] += 1
+        if lease.usage is not None:
+            worker.tokens["prompt"] += lease.usage["prompt_tokens"]
+            worker.tokens["completion"] += lease.usage["completion_tokens"]
         self.emit("released", worker, request_id=lease.request_id, outcome=outcome)
         if not completed and lease.dispatched and not self.closing:
-            self._fail_queued(worker, "not_ready")
-            if not self._quarantined(worker):
-                if self.mode == "local" and not worker.engine.is_alive():
-                    worker.state = "unavailable"
-                    worker.last_error = "process_exited"
-                    worker.consecutive_successes = 0
-                    self.emit("unready", worker, generation=worker.generation)
-                else:
-                    worker.last_error = outcome
-                    worker.state = "recycling"
-                    self.emit("recycling", worker, generation=worker.generation)
-                    worker.cleanup_task = asyncio.create_task(self._recycle(worker))
-                    self.tasks.add(worker.cleanup_task)
-                    worker.cleanup_task.add_done_callback(self.tasks.discard)
+            if self.mode == "local" and not worker.engine.is_alive():
+                worker.state = "unavailable"
+                worker.last_error = "process_exited"
+                self.emit("unready", worker)
+                self._fail_queued(worker, "not_ready")
         self._promote(worker)
 
     def fail(self, reason="upstream_failed", exclude=None):
@@ -354,51 +338,24 @@ class MultiWorkerManager:
         if worker is None:
             return
         if not self._quarantined(worker):
-            worker.state = "suspect"
-            worker.last_error = reason
-            worker.consecutive_successes = 0
-        self.emit("worker_failed", worker, reason=reason, generation=worker.generation)
-        self._fail_queued(worker, "not_ready")
-
-    async def _recycle(self, worker):
-        worker.generation += 1
-        try:
-            drain = max(DRAIN_TIMEOUT, 2 * worker.definition.request_timeout_s + CLOSE_TIMEOUT)
-            async with asyncio.timeout(drain):
-                while worker.active:
-                    await asyncio.sleep(0.01)
-            async with asyncio.timeout(STOP_TIMEOUT):
-                await worker.engine.stop()
-            async with asyncio.timeout(worker.definition.startup_timeout_s):
-                await worker.engine.start(worker.definition.model)
-            if worker.engine.model != worker.definition.model or not worker.engine.is_alive():
-                raise RuntimeError("Recycled worker did not serve the configured model.")
-        except Exception:
-            worker.last_error = "recycle_failed"
-            try:
-                async with asyncio.timeout(STOP_TIMEOUT):
-                    await worker.engine.stop()
-            except Exception:
-                worker.last_error = "cleanup_failed"
             worker.state = "unavailable"
-            self.emit("worker_failed", worker, reason=worker.last_error, generation=worker.generation)
-        else:
-            worker.last_error = None
-            worker.consecutive_successes = 0
-            worker.state = "ready"
-            self.emit("recycled", worker, generation=worker.generation)
-        finally:
-            worker.cleanup_task = None
+            worker.last_error = reason
+        self.emit("worker_failed", worker, reason=reason)
+        self._fail_queued(worker, "not_ready")
 
     def metrics(self):
         workers = self.snapshot()["workers"]
-        worker_counts = {w.definition.id: dict(w.requests) for w in self.workers.values()}
+        worker_counts = {w.definition.id: {
+            **w.requests, "prompt_tokens": w.tokens["prompt"], "completion_tokens": w.tokens["completion"],
+        } for w in self.workers.values()}
         models = {}
         for model in self.config.models.values():
             members = [w for w in self.workers.values() if w.definition.model == model.id]
             models[model.id] = {"ready": sum(w.state == "ready" for w in members),
                 "requests": {key: sum(w.requests[key] for w in members)
-                             for key in ("completed", "failed", "canceled", "rejected")}}
+                             for key in ("completed", "failed", "canceled", "rejected")},
+                "tokens": {"prompt": sum(w.tokens["prompt"] for w in members),
+                           "completion": sum(w.tokens["completion"] for w in members)}}
         devices = {}
         for worker in self.workers.values():
             key = (worker.definition.host, worker.definition.gpu_uuid)
