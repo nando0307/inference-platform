@@ -23,6 +23,10 @@ WARMUPS = 2
 BURST = 8
 MIXED_PER_MODEL = 4
 LIFECYCLE_POLL_TIMEOUT = 30.0
+# Uvicorn re-raises a captured SIGTERM after graceful teardown, so an orderly stop
+# reports -15. It is only accepted alongside confirmed worker shutdown; every other
+# nonzero status and an unknown status remain failures.
+GRACEFUL_EXIT_STATUSES = (0, -15)
 
 
 def _lifecycle(before_metrics, expected_workers, shutdown):
@@ -43,7 +47,7 @@ def _lifecycle(before_metrics, expected_workers, shutdown):
             and set(worker_ready) == set(expected_workers)
             and all(isinstance(value, (int, float)) for value in worker_ready.values())
             and isinstance(startup["gateway_uptime_seconds"], (int, float))
-            and shutdown["gateway_exit_status"] == 0
+            and shutdown["gateway_exit_status"] in GRACEFUL_EXIT_STATUSES
             and set(workers_stopped) == set(expected_workers)
             and all(workers_stopped.values())
         ),
@@ -54,7 +58,8 @@ async def _shutdown_evidence(config):
     await asyncio.to_thread(input, "Press Enter once the gateway process has exited: ")
     try:
         exit_status = int((await asyncio.to_thread(
-            input, "Enter that gateway process exit status (0 means orderly shutdown): ")).strip())
+            input, "Enter that gateway process exit status (0 means orderly shutdown; "
+                   "-15 is orderly teardown after SIGTERM): ")).strip())
     except ValueError:
         exit_status = None
     stopped = {}

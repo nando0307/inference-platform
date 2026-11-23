@@ -695,11 +695,15 @@ each worker's `ready_seconds_after_start`) under `lifecycle.startup`, and the
 gateway exit status plus per-worker stop confirmation under
 `lifecycle.cleanup`. A run keeps `lifecycle.complete` and the
 `lifecycle_evidence` check false, and never reports `status: completed`, unless
-startup is measured for every configured worker and cleanup is confirmed by a
-zero exit status together with every configured worker no longer answering. A
-health probe that stops answering is not accepted as cleanup on its own, so a
-crashed gateway or surviving worker process cannot be silently scored as a
-clean shutdown.
+startup is measured for every configured worker and cleanup is confirmed by an
+orderly gateway exit status together with every configured worker no longer
+answering. An orderly status is `0`, or `-15` when the stop signal was SIGTERM
+and every configured worker is confirmed stopped: Uvicorn re-raises a captured
+SIGTERM after graceful teardown, so it reports `-15` even though cleanup
+completed. Any other nonzero or unknown exit status, and any worker that still
+answers, keeps the run failed. A health probe that stops answering is not
+accepted as cleanup on its own, so a crashed gateway or surviving worker process
+cannot be silently scored as a clean shutdown.
 
 `/health` probes are cheap liveness checks. Each worker also gets a full health
 probe every `health_interval_s`. A worker that fails its probe is removed from
