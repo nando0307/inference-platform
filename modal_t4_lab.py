@@ -164,7 +164,7 @@ def _serve(mode):
                 raise TimeoutError("The 900-second lab deadline expired.")
             try:
                 non_streaming_status, body = _request(base, common, timeout=min(180, remaining))
-            except urllib.error.URLError as e:
+            except (urllib.error.URLError, TimeoutError) as e:
                 raise RuntimeError(f"Inference request failed for {name}") from e
             if non_streaming_status != 200 or not json.loads(body).get("choices"):
                 raise RuntimeError(f"Non-streaming inference failed for {name}.")
@@ -173,7 +173,7 @@ def _serve(mode):
                 raise TimeoutError("The 900-second lab deadline expired.")
             try:
                 streaming_status, streamed = _request(base, {**common, "stream": True}, timeout=min(180, remaining))
-            except urllib.error.URLError as e:
+            except (urllib.error.URLError, TimeoutError) as e:
                 raise RuntimeError(f"Streaming inference request failed for {name}") from e
             if streaming_status != 200 or "data:" not in streamed:
                 raise RuntimeError(f"Streaming inference failed for {name}.")
