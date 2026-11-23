@@ -52,6 +52,6 @@ Rates are synthetic offered-load defaults. They are not T4 capacity measurements
 
 ## Trace and result semantics
 
-Relative monotonic offsets drive scheduling. Wall-clock timestamps are not used for latency calculations. Results distinguish scheduled, submitted, completed, rejected, canceled, timed-out, transport-failed, and client-limit requests. Streaming timestamps identify observed SSE events and first text, not exact engine token generation time.
+Relative monotonic offsets drive scheduling. Wall-clock timestamps are not used for latency calculations. Results distinguish scheduled, submitted, completed, rejected, canceled, timed-out, transport-failed, and client-limit requests. Streaming timestamps identify observed SSE events and first text, not exact engine token generation time. A streamed response succeeds only after `[DONE]`; malformed JSON, a model identity mismatch, an event after `[DONE]`, or an incomplete stream is recorded as an error. Requests still running when the drain timeout expires are canceled and included in the results.
 
 The generator does not calculate placement comparisons, confidence intervals, goodput, cost, dashboards, or performance conclusions. Those belong to `feat/benchmark-suite`.

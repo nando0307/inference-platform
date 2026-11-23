@@ -32,13 +32,19 @@ async def _request(client, endpoint, record, origin, *, cancel_after_s=None):
                     payload = json.loads(body)
                     result.update({"status": "success", "completion_ms": (perf_counter() - started) * 1000, "prompt_tokens": payload.get("usage", {}).get("prompt_tokens"), "completion_tokens": payload.get("usage", {}).get("completion_tokens"), "total_tokens": payload.get("usage", {}).get("total_tokens")})
                     return result
+                terminal = False
                 async for event in _sse_events(response):
                     now_ms = (perf_counter() - started) * 1000
+                    if terminal:
+                        raise ValueError("event_after_terminal")
                     if event == "[DONE]":
+                        terminal = True
                         result["completion_ms"] = now_ms
                         result["status"] = "success"
                         continue
                     chunk = json.loads(event)
+                    if chunk.get("model") != record["model"]:
+                        raise ValueError("model_mismatch")
                     if result["first_event_ms"] is None:
                         result["first_event_ms"] = now_ms
                     choices = chunk.get("choices") or []
@@ -47,6 +53,8 @@ async def _request(client, endpoint, record, origin, *, cancel_after_s=None):
                     usage = chunk.get("usage")
                     if usage:
                         result.update({key: usage.get(key) for key in ("prompt_tokens", "completion_tokens", "total_tokens")})
+                if not terminal:
+                    raise ValueError("missing_terminal_marker")
     except asyncio.TimeoutError:
         result["status"], result["error_code"] = "timeout", "timeout"
     except asyncio.CancelledError:
@@ -60,13 +68,14 @@ async def _request(client, endpoint, record, origin, *, cancel_after_s=None):
     return result
 
 
-async def replay_trace(records, endpoint, *, auth_token=None, max_inflight=64, max_connections=64, time_scale=1.0, drain_timeout_s=180.0):
+async def replay_trace(records, endpoint, *, auth_token=None, max_inflight=64, max_connections=64, time_scale=1.0, drain_timeout_s=180.0, transport=None):
     if time_scale <= 0 or max_inflight < 1 or max_connections < 1:
         raise ValueError("time_scale, max_inflight, and max_connections must be positive.")
     headers = {"authorization": f"Bearer {auth_token}"} if auth_token else {}
     limits = httpx.Limits(max_connections=max_connections, max_keepalive_connections=max_connections)
     origin = perf_counter()
     active = set()
+    tasks = []
     results = []
 
     async def run_one(client, record):
@@ -78,7 +87,7 @@ async def replay_trace(records, endpoint, *, auth_token=None, max_inflight=64, m
                 task.cancel()
         return await task
 
-    async with httpx.AsyncClient(headers=headers, timeout=None, limits=limits, trust_env=False) as client:
+    async with httpx.AsyncClient(headers=headers, timeout=None, limits=limits, trust_env=False, transport=transport) as client:
         for record in records:
             target = record["scheduled_offset_s"] / time_scale
             await asyncio.sleep(max(0.0, target - (perf_counter() - origin)))
@@ -86,19 +95,15 @@ async def replay_trace(records, endpoint, *, auth_token=None, max_inflight=64, m
                 results.append({"result_schema_version": 1, "request_id": record["request_id"], "trace_id": record.get("trace_id"), "scenario_id": record["scenario_id"], "phase_id": record["phase_id"], "model": record["model"], "scheduled_offset_s": record["scheduled_offset_s"], "actual_submit_offset_s": None, "scheduling_delay_ms": None, "status": "not_submitted", "error_code": "client_inflight_limit"})
                 continue
             task = asyncio.create_task(run_one(client, record))
+            tasks.append(task)
             active.add(task)
             task.add_done_callback(active.discard)
-
-            def capture(done_task):
-                if not done_task.cancelled() and done_task.exception() is None:
-                    results.append(done_task.result())
-
-            task.add_done_callback(capture)
-        if active:
-            _, pending = await asyncio.wait(active, timeout=drain_timeout_s)
+        if tasks:
+            _, pending = await asyncio.wait(tasks, timeout=drain_timeout_s)
             for task in pending:
                 task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
+            completed = await asyncio.gather(*tasks, return_exceptions=True)
+            results.extend(result for result in completed if isinstance(result, dict))
     return results
 
 
