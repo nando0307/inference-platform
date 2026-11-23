@@ -13,7 +13,7 @@ modal profile current
 modal token info >/dev/null 2>&1 && echo 'Modal authentication accepted (details suppressed).'
 ```
 
-The script suppresses token details. The model cache check is local and does not download weights. The lab container is strictly offline and fails if its pinned snapshots are absent from `/opt/huggingface/hub`. Do not launch until the required model snapshot is present in the pinned image's cache; this lab intentionally has no build-time or runtime model download.
+The script suppresses token details. The preflight runs local-only Modal CLI, profile, and authentication checks; it does not inspect any model cache. The remote diagnostic reports the offline cache presence, and no weight download happens at any point. The lab container is strictly offline. Because the pinned upstream image contains no model snapshots and this lab adds no build-time or runtime download, the diagnostic reports both snapshots missing until the operator supplies a derived image (or an approved download step) that places each revision in `/opt/huggingface/hub`; model modes refuse to start with "Required offline model snapshots missing" until then.
 
 Check remaining credits, billing configuration, workspace usage budget, and out-of-pocket spend limit in the Modal dashboard's [Usage & Billing](https://modal.com/settings/usage) page; the official [budget guide](https://modal.com/docs/guide/budgets) explains that usage budgets apply before credits, while spend limits cap net charges after credits. Verify the intended workspace, current-cycle credit balance, usage limit, spend limit, and payment method yourself before launch. Modal CLI authentication does not reveal these values, and this task did not inspect them.
 
