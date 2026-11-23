@@ -16,19 +16,6 @@ case "${1:-}" in
     modal profile current >/dev/null
     modal token info >/dev/null 2>&1
     printf 'Modal profile selected; authentication accepted (token details suppressed).\n'
-    python3 - <<'PY'
-from pathlib import Path
-import os
-
-root = Path(os.environ.get("HF_HOME", Path.home() / ".cache/huggingface")) / "hub"
-models = {
-    "Qwen2.5-0.5B-Instruct": "models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/7ae557604adf67be50417f59c2c2f167def9a775",
-    "Qwen3-1.7B": "models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e",
-}
-for name, relative in models.items():
-    snapshot = root / relative
-    print(f"{name}: {'available' if snapshot.is_dir() and any(snapshot.glob('*.safetensors')) else 'missing'} ({snapshot})")
-PY
     ;;
   launch)
     case "$MODE" in diagnostic|single-small|single-large|shared) ;; *) usage >&2; exit 2 ;; esac

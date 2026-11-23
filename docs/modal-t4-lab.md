@@ -1,6 +1,6 @@
 # One-T4 Modal lab
 
-This lab is an opt-in, one-function experiment. It does not deploy a public API, open a tunnel, build a model-download layer, or modify the A-D serving configurations. The pinned image is `vllm/vllm-openai@sha256:91ee972ab751fb7180bc71c175865e36b091686600dca783d52b2511399810b3` (vLLM 0.33.0). It retains Qwen2.5-0.5B-Instruct revision `7ae557604adf67be50417f59c2c2f167def9a775` and Qwen3-1.7B revision `70d244cc86ccca08cf5af4e1e306ecf908b1ad5e`, FP16, context 2048, memory utilization 0.5 per server, and two sequences. A shared run starts two processes on one visible T4, not two allocated GPUs.
+This lab is an opt-in, one-function experiment. It does not deploy a public API, open a tunnel, build a model-download layer, or modify the A-D serving configurations. The pinned image is `vllm/vllm-openai@sha256:91ee972ab751fb7180bc71c175865e36b091686600dca783d52b2511399810b3` (vLLM 0.33.0). The upstream vLLM image does not include model snapshots; model modes require the Qwen2.5-0.5B-Instruct revision `7ae557604adf67be50417f59c2c2f167def9a775` and Qwen3-1.7B revision `70d244cc86ccca08cf5af4e1e306ecf908b1ad5e` to already be present in `/opt/huggingface/hub`.
 The repository `requirements.txt` is the local application stack, not the serving image's dependency lock. This lab uses the existing digest-pinned vLLM image and does not install or update dependencies.
 
 ## Before launch

@@ -34,6 +34,14 @@ image = (
 )
 
 
+def _cache(model_path, revision):
+    hub = Path(os.environ.get("HF_HOME", str(Path.home() / ".cache/huggingface"))) / "hub"
+    org, model = model_path.split("/", 1)
+    snapshot_dir = hub / f"models--{org}--{model}" / "snapshots" / revision
+    available = snapshot_dir.is_dir() and any(snapshot_dir.iterdir())
+    return {"model": model_path, "available": available}
+
+
 def _diagnostics():
     import torch
     import vllm
@@ -103,6 +111,7 @@ def _serve(mode):
     ports = {"small": 8101, "large": 8102}
     deadline = time.monotonic() + 900
     report = {"diagnostics": diag, "mode": mode, "workers": []}
+    exc = None
     try:
         for name in chosen:
             model, revision = MODELS[name]
@@ -153,13 +162,19 @@ def _serve(mode):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("The 900-second lab deadline expired.")
-            non_streaming_status, body = _request(base, common, timeout=min(180, remaining))
+            try:
+                non_streaming_status, body = _request(base, common, timeout=min(180, remaining))
+            except urllib.error.URLError as e:
+                raise RuntimeError(f"Inference request failed for {name}") from e
             if non_streaming_status != 200 or not json.loads(body).get("choices"):
                 raise RuntimeError(f"Non-streaming inference failed for {name}.")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("The 900-second lab deadline expired.")
-            streaming_status, streamed = _request(base, {**common, "stream": True}, timeout=min(180, remaining))
+            try:
+                streaming_status, streamed = _request(base, {**common, "stream": True}, timeout=min(180, remaining))
+            except urllib.error.URLError as e:
+                raise RuntimeError(f"Streaming inference request failed for {name}") from e
             if streaming_status != 200 or "data:" not in streamed:
                 raise RuntimeError(f"Streaming inference failed for {name}.")
             if process.poll() is not None:
@@ -172,16 +187,22 @@ def _serve(mode):
         report["memory_after_requests"] = subprocess.run(
             ["nvidia-smi", "--query-gpu=uuid,memory.used,memory.total", "--format=csv,noheader"],
             check=True, text=True, capture_output=True).stdout.strip()
-        return report
-    finally:
-        cleanup_errors = []
-        for _, _, _, _, process in processes:
-            try:
-                _stop_process_group(process)
-            except Exception as error:
-                cleanup_errors.append(f"{process.pid}: {type(error).__name__}")
-        if cleanup_errors:
-            raise RuntimeError("Worker process-group cleanup failed: " + ", ".join(cleanup_errors))
+    except BaseException as e:
+        exc = e
+    cleanup_errors = []
+    for _, _, _, _, process in processes:
+        try:
+            _stop_process_group(process)
+        except Exception as error:
+            cleanup_errors.append(f"{process.pid}: {type(error).__name__}")
+    if cleanup_errors:
+        msg = "Worker process-group cleanup failed: " + ", ".join(cleanup_errors)
+        if exc:
+            raise RuntimeError(msg) from exc
+        raise RuntimeError(msg)
+    if exc:
+        raise exc
+    return report
 
 @app.function(image=image, gpu="T4", cpu=4, memory=8192, max_containers=1,
               min_containers=0, scaledown_window=2, timeout=958, retries=0)
