@@ -32,13 +32,19 @@ async def _request(client, endpoint, record, origin, *, cancel_after_s=None):
                     payload = json.loads(body)
                     result.update({"status": "success", "completion_ms": (perf_counter() - started) * 1000, "prompt_tokens": payload.get("usage", {}).get("prompt_tokens"), "completion_tokens": payload.get("usage", {}).get("completion_tokens"), "total_tokens": payload.get("usage", {}).get("total_tokens")})
                     return result
+                terminal = False
                 async for event in _sse_events(response):
                     now_ms = (perf_counter() - started) * 1000
+                    if terminal:
+                        raise ValueError("event_after_terminal")
                     if event == "[DONE]":
+                        terminal = True
                         result["completion_ms"] = now_ms
                         result["status"] = "success"
                         continue
                     chunk = json.loads(event)
+                    if chunk.get("model") != record["model"]:
+                        raise ValueError("model_mismatch")
                     if result["first_event_ms"] is None:
                         result["first_event_ms"] = now_ms
                     choices = chunk.get("choices") or []
@@ -47,6 +53,8 @@ async def _request(client, endpoint, record, origin, *, cancel_after_s=None):
                     usage = chunk.get("usage")
                     if usage:
                         result.update({key: usage.get(key) for key in ("prompt_tokens", "completion_tokens", "total_tokens")})
+                if not terminal:
+                    raise ValueError("missing_terminal_marker")
     except asyncio.TimeoutError:
         result["status"], result["error_code"] = "timeout", "timeout"
     except asyncio.CancelledError:
