@@ -686,9 +686,9 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
     async def test_trace_ends_before_failed_lease_cleanup(self):
         release = self.app.state.manager.release
 
-        async def failing_release(lease, completed):
+        async def failing_release(lease, completed, outcome=None):
             self.assert_trace(self.tracer.observations[-1], "completed", 200)
-            await release(lease, completed)
+            await release(lease, completed, outcome)
             raise RuntimeError("PRIVATE-CLEANUP")
 
         with patch.object(self.app.state.manager, "release", side_effect=failing_release):

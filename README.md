@@ -14,7 +14,7 @@ and the next task. Use [plan.md](plan.md) for the broader roadmap.
 
 The implementation now includes Phase 4 controlled concurrency: one inference
 worker, two FIFO waiting slots, cooperative cancellation, and bounded streaming.
-The suite has 231 passing CPU tests, with real-Qwen lifecycle and HTTP smoke evidence.
+The suite has 241 passing CPU tests, with real-Qwen lifecycle and HTTP smoke evidence.
 The multi-GPU feature adds static two-GPU worker pools, exact-model dispatch, and
 operator-controlled failure handling; real two-T4 validation remains pending.
 See the [Phase 4 evidence](logs/practice.md#phase-4-bounded-concurrency-and-cancellation)
@@ -706,6 +706,26 @@ benchmark terminal. Use a fresh output path:
   --output benchmark-results/multi-gpu/approved-run.json
 ```
 
+The client never stops a worker or the gateway. Case 8 is interactive, and so is
+the closing lifecycle-evidence step. After the failure-isolation case, stop the
+gateway with its normal stop signal. The client then asks you to confirm that
+the gateway process exited and to type its exit status, and it probes every
+configured worker endpoint until each one stops answering. It records the
+startup measurement taken from `/metrics` at run start (`uptime_seconds` and
+each worker's `ready_seconds_after_start`) under `lifecycle.startup`, and the
+gateway exit status plus per-worker stop confirmation under
+`lifecycle.cleanup`. A run keeps `lifecycle.complete` and the
+`lifecycle_evidence` check false, and never reports `status: completed`, unless
+startup is measured for every configured worker and cleanup is confirmed by an
+orderly gateway exit status together with every configured worker no longer
+answering. An orderly status is `0`, or `-15` when the stop signal was SIGTERM
+and every configured worker is confirmed stopped: Uvicorn re-raises a captured
+SIGTERM after graceful teardown, so it reports `-15` even though cleanup
+completed. Any other nonzero or unknown exit status, and any worker that still
+answers, keeps the run failed. A health probe that stops answering is not
+accepted as cleanup on its own, so a crashed gateway or surviving worker process
+cannot be silently scored as a clean shutdown.
+
 `/health` probes are cheap liveness checks. Each worker also gets a full health
 probe every `health_interval_s`. A worker that fails its probe leaves routing
 immediately, is marked `unavailable`, and its queued requests fail with 503
@@ -725,9 +745,10 @@ restarting the gateway (local mode) or, for remote mode, restarting that worker
 process and the gateway. Active requests on a died worker fail; partially
 completed generations are never silently rerouted or duplicated.
 
-The client never stops a worker. After the protocol, restart the failed remote
-worker, or the gateway for a local worker whose process actually died, and verify
-the affected model becomes `ready` again. Treat returned measurements as one observed run,
+The client never stops a worker. The run finishes by observing the gateway stop,
+so recover the failed worker afterwards: restart the remote worker process, or
+the gateway for a local worker whose process actually died, and verify the
+affected model becomes `ready` again. Treat returned measurements as one observed run,
 not a general SLO or a proof of safe co-residency. No GPU run is performed by
 the CPU-only checks described here. The opt-in HTTP integration checks cover
 both model identities, concurrent requests, streaming identity, and the minimal

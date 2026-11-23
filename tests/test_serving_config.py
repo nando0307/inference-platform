@@ -39,6 +39,9 @@ class ServingConfigTests(unittest.TestCase):
             lambda raw: raw["models"]["small"].update(revision="main"),
             lambda raw: raw["workers"][0].update(memory_utilization=1.1),
             lambda raw: raw["workers"][0].update(endpoint=raw["workers"][1]["endpoint"]),
+            lambda raw: raw["workers"][1].update(endpoint=raw["workers"][0]["endpoint"] + "/"),
+            lambda raw: raw["workers"][1].update(
+                endpoint=raw["workers"][0]["endpoint"].replace("127.0.0.1", "localhost")),
             lambda raw: raw["workers"].pop(),
         ]
         for mutate in mutations:

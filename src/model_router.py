@@ -50,6 +50,11 @@ class RoutingRequest(ChatCompletionRequest):
         return value
 
 
+def request_lifetime(worker):
+    """Upper bound on one admitted request: completion, delivery frames and upstream close."""
+    return 2 * worker.definition.request_timeout_s + 4 * SEND_TIMEOUT + CLOSE_TIMEOUT
+
+
 class RouterError(Exception):
     def __init__(self, status=503, code="not_ready", message="Inference is unavailable."):
         self.status, self.code, self.message = status, code, message
@@ -149,7 +154,7 @@ class ModelManager:
                 lease.task.cancel()
         self.wake.set()
 
-    async def release(self, lease, completed):
+    async def release(self, lease, completed, outcome=None):
         self.cancel_waiting(lease)
         if lease not in self.active:
             return
@@ -373,8 +378,17 @@ class _LeaseMiddleware:
                 trace.finish(outcome=outcome, http_status=status, error_code=code)
             lease = state.get("lease")
             if lease is not None:
+                code = state.get("trace_error_code")
+                if code in ("client_disconnected", "request_canceled"):
+                    outcome = "canceled"
+                elif code == "request_timeout":
+                    outcome = "timeout"
+                elif success and state.get("completed", False):
+                    outcome = "completed"
+                else:
+                    outcome = "failed"
                 cleanup = asyncio.create_task(scope["app"].state.manager.release(
-                    lease, success and state.get("completed", False),
+                    lease, outcome == "completed", outcome,
                 ))
                 try:
                     await asyncio.shield(cleanup)
@@ -560,6 +574,9 @@ async def _complete(request, lease):
         payload["stream_options"] = {"include_usage": True}
     client = request.app.state.client
     worker = getattr(lease, "worker", None)
+    if worker is not None and (worker.generation != lease.generation
+                               or lease not in worker.active or worker.state != "ready"):
+        raise RouterError(503, "not_ready", "The selected worker became unavailable.")
     engine = worker.engine if worker is not None else request.app.state.manager.engine
     headers = {"x-request-id": lease.request_id}
     if worker is not None:

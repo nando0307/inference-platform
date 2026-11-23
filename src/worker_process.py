@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import signal
+from contextlib import suppress
 
 from .serving_config import load_config
 from .vllm_engine import VLLMEngine
@@ -20,7 +21,20 @@ async def serve(config_path, worker_id):
     for signum in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(signum, stopped.set)
     try:
-        await engine.start(worker.model)
+        startup = asyncio.create_task(engine.start(worker.model))
+        stop = asyncio.create_task(stopped.wait())
+        try:
+            await asyncio.wait({startup, stop}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            stop.cancel()
+        if not startup.done():
+            startup.cancel()
+            with suppress(asyncio.CancelledError):
+                await startup
+            return
+        startup.result()
+        if stopped.is_set():
+            return
         revision = next(model.revision for model in config.models.values() if model.id == worker.model)
         print(json.dumps({"worker": worker.id, "model": worker.model,
                           "revision": revision, "host": worker.host,

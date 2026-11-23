@@ -9,6 +9,7 @@ from unittest.mock import patch
 import httpx
 
 from src.model_router import create_app, _sse
+from src import model_router as router
 from src.serving_config import load_config
 from src.vllm_engine import HIGH_MODEL, LOW_MODEL
 
@@ -39,6 +40,23 @@ class FakeWorkerEngine:
     async def stop(self):
         self.stops += 1
         self.model, self.alive = None, False
+
+
+class SlowDelivery:
+    """An ASGI wrapper that makes marked response frames take real time to deliver."""
+
+    def __init__(self, app, delay, marker=b"x-slow-delivery"):
+        self.app, self.delay, self.marker = app, delay, marker
+
+    async def __call__(self, scope, receive, send):
+        slow_request = any(key == self.marker for key, _ in scope.get("headers", []))
+
+        async def slow(message):
+            if slow_request and message["type"] in {"http.response.start", "http.response.body"}:
+                await asyncio.sleep(self.delay)
+            await send(message)
+
+        await self.app(scope, receive, slow)
 
 
 class MultiWorkerGatewayTests(unittest.IsolatedAsyncioTestCase):
@@ -148,6 +166,28 @@ class MultiWorkerGatewayTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(worker.engine.starts, 1)
             self.assertEqual(worker.engine.stops, 0)
             self.assertIsNone(worker.last_error)
+
+    async def test_quarantine_between_admission_and_dispatch_returns_not_ready(self):
+        manager = self.app.state.manager
+        worker = manager.workers["small-0"]
+        connected = router._connected
+        calls = 0
+
+        async def quarantine_after_admission(request, future):
+            nonlocal calls
+            result = await connected(request, future)
+            if calls == 0:
+                calls = 1
+                worker.state = "unavailable"
+            return result
+
+        with patch.object(router, "_connected", quarantine_after_admission):
+            response = await self.post(LOW_MODEL)
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "not_ready")
+        self.assertEqual(self.forwarded, [])
+        self.assertEqual(worker.state, "unavailable")
+        self.assertEqual(worker.inflight, 0)
 
     async def test_gateway_auth_rejects_before_worker_dispatch(self):
         response = await self.post(LOW_MODEL, token="wrong-token")
