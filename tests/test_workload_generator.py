@@ -8,7 +8,7 @@ import httpx
 
 from benchmarks.workload_generator.arrivals import arrivals
 from benchmarks.workload_generator.config import load_scenario, validate_scenario
-from benchmarks.workload_generator.executor import _request
+from benchmarks.workload_generator.executor import _request, replay_trace
 from benchmarks.workload_generator.prompts import PromptProvider
 from benchmarks.workload_generator.recorder import summarize_results
 from benchmarks.workload_generator.trace import generate_trace, metadata, read_trace, write_trace
@@ -112,6 +112,44 @@ class ExecutorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["completion_tokens"], 1)
         self.assertIsNotNone(result["first_text_ms"])
 
+
+    async def test_drain_timeout_records_canceled_requests(self):
+        async def handler(request):
+            await asyncio.sleep(1)
+            return httpx.Response(200, json={"choices": []})
+
+        record = {"request_id": "request-3", "scenario_id": "test", "phase_id": "phase",
+                  "scheduled_offset_s": 0, "model": S, "messages": [], "max_tokens": 1,
+                  "temperature": 0, "top_p": 1, "stream": False, "request_timeout_s": 2}
+        results = await replay_trace(
+            records=[record], endpoint="http://gateway", drain_timeout_s=0.01,
+            transport=httpx.MockTransport(handler),
+        )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["status"], "canceled")
+
+    async def test_stream_requires_done_and_matching_model(self):
+        async def handler(request):
+            body = json.loads(request.content)
+            wrong = {"id": "x", "model": "other", "choices": [{"delta": {"content": "x"}}]}
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=(f"data: {json.dumps(wrong)}\n\n").encode())
+
+        record = {"request_id": "request-2", "scenario_id": "test", "phase_id": "phase",
+                  "scheduled_offset_s": 0, "model": S, "messages": [], "max_tokens": 1,
+                  "temperature": 0, "top_p": 1, "stream": True, "request_timeout_s": 2}
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler), trust_env=False) as client:
+            result = await _request(client, "http://gateway", record, 0)
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["error_code"], "model_mismatch")
+
+        async def incomplete(request):
+            chunk = {"id": "x", "model": S, "choices": [{"delta": {"content": "x"}}]}
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=(f"data: {json.dumps(chunk)}\n\n").encode())
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(incomplete), trust_env=False) as client:
+            result = await _request(client, "http://gateway", record, 0)
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["error_code"], "missing_terminal_marker")
 
 if __name__ == "__main__":
     unittest.main()
