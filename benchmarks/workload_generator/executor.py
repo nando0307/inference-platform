@@ -68,7 +68,7 @@ async def _request(client, endpoint, record, origin, *, cancel_after_s=None):
     return result
 
 
-async def replay_trace(records, endpoint, *, auth_token=None, max_inflight=64, max_connections=64, time_scale=1.0, drain_timeout_s=180.0):
+async def replay_trace(records, endpoint, *, auth_token=None, max_inflight=64, max_connections=64, time_scale=1.0, drain_timeout_s=180.0, transport=None):
     if time_scale <= 0 or max_inflight < 1 or max_connections < 1:
         raise ValueError("time_scale, max_inflight, and max_connections must be positive.")
     headers = {"authorization": f"Bearer {auth_token}"} if auth_token else {}
@@ -87,7 +87,7 @@ async def replay_trace(records, endpoint, *, auth_token=None, max_inflight=64, m
                 task.cancel()
         return await task
 
-    async with httpx.AsyncClient(headers=headers, timeout=None, limits=limits, trust_env=False) as client:
+    async with httpx.AsyncClient(headers=headers, timeout=None, limits=limits, trust_env=False, transport=transport) as client:
         for record in records:
             target = record["scheduled_offset_s"] / time_scale
             await asyncio.sleep(max(0.0, target - (perf_counter() - origin)))

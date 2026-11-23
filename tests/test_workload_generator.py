@@ -121,7 +121,10 @@ class ExecutorTests(unittest.IsolatedAsyncioTestCase):
         record = {"request_id": "request-3", "scenario_id": "test", "phase_id": "phase",
                   "scheduled_offset_s": 0, "model": S, "messages": [], "max_tokens": 1,
                   "temperature": 0, "top_p": 1, "stream": False, "request_timeout_s": 2}
-        results = await replay_trace(records=[record], endpoint="http://gateway", drain_timeout_s=0.01)
+        results = await replay_trace(
+            records=[record], endpoint="http://gateway", drain_timeout_s=0.01,
+            transport=httpx.MockTransport(handler),
+        )
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["status"], "canceled")
 
