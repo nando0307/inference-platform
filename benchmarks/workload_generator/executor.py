@@ -75,6 +75,7 @@ async def replay_trace(records, endpoint, *, auth_token=None, max_inflight=64, m
     limits = httpx.Limits(max_connections=max_connections, max_keepalive_connections=max_connections)
     origin = perf_counter()
     active = set()
+    tasks = []
     results = []
 
     async def run_one(client, record):
@@ -94,19 +95,15 @@ async def replay_trace(records, endpoint, *, auth_token=None, max_inflight=64, m
                 results.append({"result_schema_version": 1, "request_id": record["request_id"], "trace_id": record.get("trace_id"), "scenario_id": record["scenario_id"], "phase_id": record["phase_id"], "model": record["model"], "scheduled_offset_s": record["scheduled_offset_s"], "actual_submit_offset_s": None, "scheduling_delay_ms": None, "status": "not_submitted", "error_code": "client_inflight_limit"})
                 continue
             task = asyncio.create_task(run_one(client, record))
+            tasks.append(task)
             active.add(task)
             task.add_done_callback(active.discard)
-
-            def capture(done_task):
-                if not done_task.cancelled() and done_task.exception() is None:
-                    results.append(done_task.result())
-
-            task.add_done_callback(capture)
-        if active:
-            _, pending = await asyncio.wait(active, timeout=drain_timeout_s)
+        if tasks:
+            done, pending = await asyncio.wait(tasks, timeout=drain_timeout_s)
             for task in pending:
                 task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
+            results.extend(task.result() for task in done if not task.cancelled() and task.exception() is None)
     return results
 
 
