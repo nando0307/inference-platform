@@ -715,11 +715,12 @@ out of routing (`/metrics` reports `recycling`), and recycles that worker once
 for that request (drain, stop, then start and wait for fresh
 identity/readiness). The drain waits for the whole bounded lifetime of every
 still-active request on that worker, including bounded response delivery and
-upstream close. One recycle runs at a time per worker, and each later
-non-completion gets its own single recycle; there is no automatic retry after a
-failed one. A successful recycle returns the worker to `ready`; a failed
-recycle, or a child process that died before the intentional stop/start phase,
-reports `unavailable`: the worker leaves routing at once and is terminated.
+upstream close. One recycle runs at a time per worker: a non-completion during
+an in-progress recycle is covered by that recycle, and a later one gets its own
+single recycle; there is no automatic retry after a failed one. A successful
+recycle returns the worker to `ready`; a failed recycle, or a child process that
+died before the intentional stop/start phase, reports `unavailable`: the worker
+leaves routing at once and is terminated.
 Automatic recycling exists only for local child processes. A remote worker's
 stop and start are probe-only, so a remote request that does not complete
 quarantines that worker as `unavailable` instead of pretending to restart it;
