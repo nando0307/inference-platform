@@ -435,32 +435,6 @@ class WorkerManagerTests(unittest.IsolatedAsyncioTestCase):
             manager.submit(request(), "after-failure")
         self.assertEqual(caught.exception.code, "not_ready")
 
-    async def test_recycle_drain_covers_bounded_response_delivery(self):
-        config = self.config("D")
-        config = replace(config, workers=tuple(
-            replace(row, request_timeout_s=0.05) for row in config.workers))
-        manager = MultiWorkerManager(config, engine_factory=FakeEngine)
-        self.addAsyncCleanup(manager.shutdown)
-        await manager.start()
-        worker = next(w for w in manager.workers.values() if w.definition.model == LOW_MODEL)
-        first = manager.submit(request(), "first")
-        second = manager.submit(request(), "second")
-        await asyncio.gather(first.ready, second.ready)
-        with patch("src.worker_manager.DRAIN_TIMEOUT", 0.01), \
-                patch("src.worker_manager.CLOSE_TIMEOUT", 0.05), \
-                patch("src.model_router.SEND_TIMEOUT", 0.2), \
-                patch("src.model_router.CLOSE_TIMEOUT", 0.05):
-            first.dispatched = True
-            await manager.release(first, False)
-            self.assertEqual(worker.state, "recycling")
-            await asyncio.sleep(0.5)
-            self.assertEqual(worker.state, "recycling")
-            second.dispatched = True
-            await manager.release(second, True)
-            await asyncio.gather(*manager.tasks)
-        self.assertEqual(worker.state, "ready")
-        self.assertIsNone(worker.last_error)
-
     async def test_dispatch_requires_current_admission_on_ready_worker(self):
         manager = MultiWorkerManager(self.config("D"), engine_factory=FakeEngine)
         self.addAsyncCleanup(manager.shutdown)

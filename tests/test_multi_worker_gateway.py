@@ -42,6 +42,23 @@ class FakeWorkerEngine:
         self.model, self.alive = None, False
 
 
+class SlowDelivery:
+    """An ASGI wrapper that makes marked response frames take real time to deliver."""
+
+    def __init__(self, app, delay, marker=b"x-slow-delivery"):
+        self.app, self.delay, self.marker = app, delay, marker
+
+    async def __call__(self, scope, receive, send):
+        slow_request = any(key == self.marker for key, _ in scope.get("headers", []))
+
+        async def slow(message):
+            if slow_request and message["type"] in {"http.response.start", "http.response.body"}:
+                await asyncio.sleep(self.delay)
+            await send(message)
+
+        await self.app(scope, receive, slow)
+
+
 class MultiWorkerGatewayTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.config = load_config(ROOT / "configs/serving-b.json")
@@ -174,6 +191,75 @@ class MultiWorkerGatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.forwarded, [])
         self.assertEqual(worker.state, "suspect")
         self.assertEqual(worker.inflight, 0)
+
+    async def test_slow_sibling_delivery_keeps_a_recycled_worker_routable(self):
+        config = load_config(ROOT / "configs/serving-a.json")
+        config = replace(config, health_interval_s=60, workers=tuple(
+            replace(row, request_timeout_s=0.05) for row in config.workers))
+        dispatched = []
+
+        async def upstream(request):
+            body = json.loads(request.content)
+            dispatched.append(body["stream"])
+            if not body["stream"]:
+                return httpx.Response(500)
+            common = {"id": "chatcmpl-" + request.headers["x-request-id"],
+                      "object": "chat.completion.chunk", "created": 1, "model": body["model"],
+                      "prompt_token_ids": [10, 11, 12]}
+            frames = [
+                {**common, "choices": [{"index": 0, "delta": {"role": "assistant", "content": "hello"},
+                                        "finish_reason": None, "token_ids": [13]}]},
+                {**common, "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]},
+                {**common, "choices": [], "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}},
+            ]
+
+            async def stalled():
+                await asyncio.sleep(1.0)
+                for frame in frames:
+                    yield _sse(frame).encode()
+                yield b"data: [DONE]\n\n"
+
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=stalled())
+
+        body = {"model": LOW_MODEL, "messages": [{"role": "user", "content": "hello"}], "max_tokens": 1}
+        auth = {"authorization": "Bearer CLIENT-SECRET"}
+        app = create_app(config=config, worker_engine_factory=FakeWorkerEngine, mode="local")
+        async with app.router.lifespan_context(app):
+            await app.state.client.aclose()
+            app.state.client = httpx.AsyncClient(transport=httpx.MockTransport(upstream), trust_env=False)
+            client = httpx.AsyncClient(transport=httpx.ASGITransport(app=SlowDelivery(app, 0.15)),
+                                       base_url="http://gateway", timeout=30)
+            slow_auth = {**auth, "x-slow-delivery": "1"}
+            try:
+                with patch("src.model_router.SEND_TIMEOUT", 0.2), \
+                        patch("src.model_router.CLOSE_TIMEOUT", 0.1), \
+                        patch("src.worker_manager.CLOSE_TIMEOUT", 0.1), \
+                        patch("src.worker_manager.DRAIN_TIMEOUT", 0.01):
+                    streamed = asyncio.create_task(client.post(
+                        "/v1/chat/completions", json={**body, "stream": True}, headers=slow_auth))
+                    async with asyncio.timeout(5):
+                        while not dispatched:
+                            await asyncio.sleep(0.01)
+                    failed = await client.post("/v1/chat/completions", json=body, headers=auth)
+                    response = await streamed
+            finally:
+                await client.aclose()
+            await app.state.client.aclose()
+            manager = app.state.manager
+            worker = manager.workers["small-0"]
+            async with asyncio.timeout(10):
+                while worker.cleanup_task is not None or worker.state != "ready":
+                    await asyncio.sleep(0.01)
+            self.assertEqual(worker.state, "ready")
+            self.assertIsNone(worker.last_error)
+            self.assertEqual(worker.requests["timeout"], 1)
+            self.assertEqual(worker.requests["failed"], 1)
+            self.assertEqual(worker.engine.starts, 2)
+            self.assertEqual(worker.engine.stops, 1)
+        self.assertEqual(failed.status_code, 502)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('"code": "request_timeout"', response.text)
+        self.assertTrue(response.text.endswith("data: [DONE]\n\n"))
 
     async def test_gateway_auth_rejects_before_worker_dispatch(self):
         response = await self.post(LOW_MODEL, token="wrong-token")

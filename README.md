@@ -686,14 +686,20 @@ benchmark terminal. Use a fresh output path:
 ```
 
 The client never stops a worker or the gateway. Case 8 is interactive, and so is
-the closing lifecycle-evidence step. After the failure-isolation case the client
-asks you to stop the gateway with its normal stop signal and waits until
-`/health` stops answering. It records that observed stop plus the startup
-measurement taken from `/metrics` at run start (`uptime_seconds` and each
-worker's `ready_seconds_after_start`) under `lifecycle.startup` and
-`lifecycle.cleanup`. A run that cannot produce both measurements keeps
-`lifecycle.complete` and the `lifecycle_evidence` check false and never reports
-`status: completed`.
+the closing lifecycle-evidence step. After the failure-isolation case, stop the
+gateway with its normal stop signal. The client then asks you to confirm that
+the gateway process exited and to type its exit status, and it probes every
+configured worker endpoint until each one stops answering. It records the
+startup measurement taken from `/metrics` at run start (`uptime_seconds` and
+each worker's `ready_seconds_after_start`) under `lifecycle.startup`, and the
+gateway exit status plus per-worker stop confirmation under
+`lifecycle.cleanup`. A run keeps `lifecycle.complete` and the
+`lifecycle_evidence` check false, and never reports `status: completed`, unless
+startup is measured for every configured worker and cleanup is confirmed by a
+zero exit status together with every configured worker no longer answering. A
+health probe that stops answering is not accepted as cleanup on its own, so a
+crashed gateway or surviving worker process cannot be silently scored as a
+clean shutdown.
 
 `/health` probes are cheap liveness checks. Each worker also gets a full health
 probe every `health_interval_s`. A worker that fails its probe is removed from

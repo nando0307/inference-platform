@@ -45,20 +45,38 @@ class LifecycleEvidenceTests(unittest.TestCase):
     metrics = {"uptime_seconds": 42.5,
                "workers": {"small-0": {"ready_seconds_after_start": 12.5},
                            "large-1": {"ready_seconds_after_start": 20.0}}}
+    workers = ["small-0", "large-1"]
 
-    def test_startup_and_cleanup_evidence_completes_the_artifact(self):
-        lifecycle = _lifecycle(self.metrics, True)
+    def shutdown(self, exit_status=0, small=True, large=True):
+        return {"gateway_exit_status": exit_status,
+                "workers_stopped": {"small-0": small, "large-1": large}}
+
+    def test_orderly_shutdown_with_every_worker_stopped_completes_the_artifact(self):
+        lifecycle = _lifecycle(self.metrics, self.workers, self.shutdown())
         self.assertTrue(lifecycle["complete"])
         self.assertEqual(lifecycle["startup"]["gateway_uptime_seconds"], 42.5)
         self.assertEqual(lifecycle["startup"]["worker_ready_seconds_after_start"],
                          {"small-0": 12.5, "large-1": 20.0})
-        self.assertTrue(lifecycle["cleanup"]["gateway_stopped"])
+        self.assertEqual(lifecycle["cleanup"]["gateway_exit_status"], 0)
+        self.assertTrue(all(lifecycle["cleanup"]["workers_stopped"].values()))
 
-    def test_missing_startup_measurement_or_unobserved_stop_blocks_completion(self):
-        self.assertFalse(_lifecycle({"workers": {}}, True)["complete"])
+    def test_unconfirmed_worker_teardown_or_crashed_gateway_blocks_completion(self):
+        self.assertFalse(_lifecycle(self.metrics, self.workers,
+                                    self.shutdown(large=False))["complete"])
+        self.assertFalse(_lifecycle(self.metrics, self.workers,
+                                    self.shutdown(exit_status=1))["complete"])
+        self.assertFalse(_lifecycle(self.metrics, self.workers,
+                                    self.shutdown(exit_status=None))["complete"])
+
+    def test_empty_or_unknown_worker_set_never_completes(self):
+        self.assertFalse(_lifecycle(self.metrics, [],
+                                    {"gateway_exit_status": 0, "workers_stopped": {}})["complete"])
+        self.assertFalse(_lifecycle(self.metrics, self.workers,
+                                    {"gateway_exit_status": 0, "workers_stopped": {}})["complete"])
+        self.assertFalse(_lifecycle({"workers": {}}, self.workers, self.shutdown())["complete"])
         self.assertFalse(_lifecycle(
-            {"uptime_seconds": 1.0, "workers": {"small-0": {}}}, True)["complete"])
-        self.assertFalse(_lifecycle(self.metrics, False)["complete"])
+            {"uptime_seconds": 1.0, "workers": {"small-0": {}}},
+            self.workers, self.shutdown())["complete"])
 
 
 class FailurePartitionTests(unittest.TestCase):

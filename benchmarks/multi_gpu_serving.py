@@ -25,7 +25,7 @@ MIXED_PER_MODEL = 4
 LIFECYCLE_POLL_TIMEOUT = 30.0
 
 
-def _lifecycle(before_metrics, gateway_stopped):
+def _lifecycle(before_metrics, expected_workers, shutdown):
     startup = {
         "gateway_uptime_seconds": before_metrics.get("uptime_seconds"),
         "worker_ready_seconds_after_start": {
@@ -33,15 +33,45 @@ def _lifecycle(before_metrics, gateway_stopped):
             for name, row in before_metrics.get("workers", {}).items()},
     }
     worker_ready = startup["worker_ready_seconds_after_start"]
+    workers_stopped = shutdown["workers_stopped"]
     return {
         "startup": startup,
-        "cleanup": {"gateway_stopped": gateway_stopped},
+        "cleanup": {"gateway_exit_status": shutdown["gateway_exit_status"],
+                    "workers_stopped": workers_stopped},
         "complete": (
-            isinstance(startup["gateway_uptime_seconds"], (int, float))
+            bool(expected_workers)
+            and set(worker_ready) == set(expected_workers)
             and all(isinstance(value, (int, float)) for value in worker_ready.values())
-            and gateway_stopped
+            and isinstance(startup["gateway_uptime_seconds"], (int, float))
+            and shutdown["gateway_exit_status"] == 0
+            and set(workers_stopped) == set(expected_workers)
+            and all(workers_stopped.values())
         ),
     }
+
+
+async def _shutdown_evidence(config):
+    await asyncio.to_thread(input, "Press Enter once the gateway process has exited: ")
+    try:
+        exit_status = int((await asyncio.to_thread(
+            input, "Enter that gateway process exit status (0 means orderly shutdown): ")).strip())
+    except ValueError:
+        exit_status = None
+    stopped = {}
+    async with httpx.AsyncClient(timeout=5, trust_env=False) as probe:
+        for worker in config.workers:
+            token = os.environ.get(worker.service_token_env)
+            worker_headers = {"authorization": f"Bearer {token}"} if token else {}
+            deadline = perf_counter() + LIFECYCLE_POLL_TIMEOUT
+            stopped[worker.id] = False
+            while perf_counter() < deadline:
+                try:
+                    await probe.get(worker.endpoint.rstrip("/") + "/health", headers=worker_headers)
+                except httpx.HTTPError:
+                    stopped[worker.id] = True
+                    break
+                await asyncio.sleep(0.1)
+    return {"gateway_exit_status": exit_status, "workers_stopped": stopped}
 
 
 def _partition_by_model(rows, failed_model):
@@ -164,17 +194,9 @@ async def run_protocol(url, placement, config, small, large, failure_worker, out
         artifact["metrics_after"] = (await client.get(url.rstrip("/") + "/metrics")).json()
 
         print("Lifecycle: stop the gateway with its configured stop signal now.")
-        await asyncio.to_thread(input, "Press Enter once the gateway process has exited: ")
-        cleanup_started = perf_counter()
-        gateway_stopped = False
-        while perf_counter() - cleanup_started < LIFECYCLE_POLL_TIMEOUT:
-            try:
-                await client.get(url.rstrip("/") + "/health")
-            except httpx.HTTPError:
-                gateway_stopped = True
-                break
-            await asyncio.sleep(0.1)
-        artifact["lifecycle"] = _lifecycle(before_metrics, gateway_stopped)
+        artifact["lifecycle"] = _lifecycle(
+            before_metrics, [worker.id for worker in config.workers],
+            await _shutdown_evidence(config))
         artifact["checks"]["lifecycle_evidence"] = artifact["lifecycle"]["complete"]
 
     artifact["status"] = "completed" if all(artifact["checks"].values()) else "failed"
