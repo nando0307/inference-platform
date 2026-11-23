@@ -11,8 +11,8 @@ from time import perf_counter
 
 import httpx
 
-from benchmarks.client import _load_workload, run_request
-from benchmarks.common import distribution, environment, write_json
+from benchmarks.client import _load_workload, _summary, run_request
+from benchmarks.common import environment, write_json
 from src.serving_config import load_config
 from src.vllm_engine import HIGH_MODEL, LOW_MODEL
 
@@ -22,20 +22,26 @@ REPEATS = 5
 WARMUPS = 2
 BURST = 8
 MIXED_PER_MODEL = 4
+LIFECYCLE_POLL_TIMEOUT = 30.0
 
 
-def _summary(rows, elapsed):
-    measured = [row for row in rows if row["phase"] == "measured"]
-    successful = [row for row in measured if row["status"] == "success"]
-    tokens = sum(row["completion_tokens"] or 0 for row in successful)
-    return {"requests": len(measured), "successes": len(successful),
-            "http_429": sum(row["http_status"] == 429 for row in measured),
-            "errors": sum(row["status"] == "error" for row in measured),
-            "canceled": sum(row["status"] == "canceled" for row in measured),
-            "e2e_ms": distribution([row["e2e_ms"] for row in successful]),
-            "first_text_ms": distribution([row["first_text_ms"] for row in successful]),
-            "successful_completion_tokens": tokens,
-            "output_tokens_per_second": tokens / elapsed if elapsed else None}
+def _lifecycle(before_metrics, gateway_stopped):
+    startup = {
+        "gateway_uptime_seconds": before_metrics.get("uptime_seconds"),
+        "worker_ready_seconds_after_start": {
+            name: row.get("ready_seconds_after_start")
+            for name, row in before_metrics.get("workers", {}).items()},
+    }
+    worker_ready = startup["worker_ready_seconds_after_start"]
+    return {
+        "startup": startup,
+        "cleanup": {"gateway_stopped": gateway_stopped},
+        "complete": (
+            isinstance(startup["gateway_uptime_seconds"], (int, float))
+            and all(isinstance(value, (int, float)) for value in worker_ready.values())
+            and gateway_stopped
+        ),
+    }
 
 
 def _partition_by_model(rows, failed_model):
@@ -124,7 +130,7 @@ async def run_protocol(url, placement, config, small, large, failure_worker, out
             workload, case = singles[(model, "short")]
             targets = [(model, case)] * BURST
             entry = await execute(f"{label}: simultaneous same-model burst", targets, concurrent=True)
-            artifact["checks"][f"burst_{label}_bounded"] = (entry["summary"]["successes"] + entry["summary"]["http_429"] == BURST)
+            artifact["checks"][f"burst_{label}_bounded"] = (entry["summary"]["successes"] + entry["summary"]["rejections"] == BURST)
 
         mixed = [*([(LOW_MODEL, singles[(LOW_MODEL, "short")][1])] * MIXED_PER_MODEL),
                  *([(HIGH_MODEL, singles[(HIGH_MODEL, "short")][1])] * MIXED_PER_MODEL)]
@@ -156,6 +162,20 @@ async def run_protocol(url, placement, config, small, large, failure_worker, out
         )
         artifact["checks"]["case_8_other_model_unaffected"] = bool(unaffected) and all(row["status"] == "success" for row in unaffected)
         artifact["metrics_after"] = (await client.get(url.rstrip("/") + "/metrics")).json()
+
+        print("Lifecycle: stop the gateway with its configured stop signal now.")
+        await asyncio.to_thread(input, "Press Enter once the gateway process has exited: ")
+        cleanup_started = perf_counter()
+        gateway_stopped = False
+        while perf_counter() - cleanup_started < LIFECYCLE_POLL_TIMEOUT:
+            try:
+                await client.get(url.rstrip("/") + "/health")
+            except httpx.HTTPError:
+                gateway_stopped = True
+                break
+            await asyncio.sleep(0.1)
+        artifact["lifecycle"] = _lifecycle(before_metrics, gateway_stopped)
+        artifact["checks"]["lifecycle_evidence"] = artifact["lifecycle"]["complete"]
 
     artifact["status"] = "completed" if all(artifact["checks"].values()) else "failed"
     write_json(output, artifact)

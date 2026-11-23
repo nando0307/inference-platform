@@ -9,6 +9,7 @@ from unittest.mock import patch
 import httpx
 
 from src.model_router import create_app, _sse
+from src import model_router as router
 from src.serving_config import load_config
 from src.vllm_engine import HIGH_MODEL, LOW_MODEL
 
@@ -151,6 +152,28 @@ class MultiWorkerGatewayTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(worker.engine.starts, 2)
             self.assertEqual(worker.engine.stops, 1)
             self.assertIsNone(worker.last_error)
+
+    async def test_quarantine_between_admission_and_dispatch_returns_not_ready(self):
+        manager = self.app.state.manager
+        worker = manager.workers["small-0"]
+        connected = router._connected
+        calls = 0
+
+        async def quarantine_after_admission(request, future):
+            nonlocal calls
+            result = await connected(request, future)
+            if calls == 0:
+                calls = 1
+                worker.state = "suspect"
+            return result
+
+        with patch.object(router, "_connected", quarantine_after_admission):
+            response = await self.post(LOW_MODEL)
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "not_ready")
+        self.assertEqual(self.forwarded, [])
+        self.assertEqual(worker.state, "suspect")
+        self.assertEqual(worker.inflight, 0)
 
     async def test_gateway_auth_rejects_before_worker_dispatch(self):
         response = await self.post(LOW_MODEL, token="wrong-token")

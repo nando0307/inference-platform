@@ -10,7 +10,9 @@ from time import perf_counter
 import httpx
 
 from .inference import ContextLimitError
-from .model_router import CLOSE_TIMEOUT, DRAIN_TIMEOUT, Lease, RouterError, STOP_TIMEOUT, _observe
+from .model_router import (
+    CLOSE_TIMEOUT, DRAIN_TIMEOUT, Lease, RouterError, STOP_TIMEOUT, _observe, request_lifetime,
+)
 from .serving_config import ServingConfig
 from .vllm_engine import VLLMEngine
 
@@ -29,9 +31,11 @@ class Worker:
     queue: deque = field(default_factory=deque)
     available: asyncio.Event = field(default_factory=asyncio.Event)
     consecutive_successes: int = 0
-    requests: dict = field(default_factory=lambda: {"completed": 0, "failed": 0, "canceled": 0, "rejected": 0})
+    requests: dict = field(default_factory=lambda: {
+        "completed": 0, "failed": 0, "canceled": 0, "timeout": 0, "rejected": 0})
     last_error: str | None = None
     cleanup_task: asyncio.Task | None = None
+    ready_at: float | None = None
 
     @property
     def inflight(self):
@@ -86,6 +90,7 @@ class MultiWorkerManager:
             raise ValueError("Local worker management requires host ID 'local'.")
         self.config = config
         self.mode = mode
+        self.started = perf_counter()
         if engine_factory is None:
             engine_factory = (lambda definition: VLLMEngine(worker=definition)) if mode == "local" else RemoteWorkerEngine
         self.workers = {row.id: Worker(row, engine_factory(row)) for row in config.workers}
@@ -139,6 +144,7 @@ class MultiWorkerManager:
                         raise RuntimeError("Worker did not serve the configured model.")
                     worker.state = "ready"
                     worker.last_error = None
+                    worker.ready_at = perf_counter()
                     self.emit("ready", worker, generation=generation)
             except Exception as error:
                 if generation == worker.generation:
@@ -273,7 +279,7 @@ class MultiWorkerManager:
             worker.requests["failed"] += 1
             worker.available.set()
 
-    def cancel_waiting(self, lease):
+    def cancel_waiting(self, lease, outcome="canceled"):
         worker = getattr(lease, "worker", None)
         if worker is None or lease.dispatched:
             return
@@ -291,7 +297,7 @@ class MultiWorkerManager:
                 task.cancel()
             if not lease.ready.done():
                 lease.ready.cancel()
-            worker.requests["canceled"] += 1
+            worker.requests[outcome] += 1
             self.emit("canceled", worker, request_id=lease.request_id)
             worker.available.set()
 
@@ -306,6 +312,7 @@ class MultiWorkerManager:
         while worker.queue:
             lease = worker.queue.popleft()
             failed = True
+            worker.requests["failed"] += 1
             if not lease.ready.done():
                 lease.ready.set_exception(RouterError(503, code, "The selected worker became unavailable."))
             task = lease.prepare_task
@@ -314,9 +321,10 @@ class MultiWorkerManager:
         if failed:
             worker.available.set()
 
-    async def release(self, lease, completed):
+    async def release(self, lease, completed, outcome=None):
         worker = lease.worker
-        self.cancel_waiting(lease)
+        outcome = outcome or ("completed" if completed else "failed")
+        self.cancel_waiting(lease, outcome)
         if lease not in worker.active:
             return
         if lease.upstream is not None:
@@ -324,20 +332,19 @@ class MultiWorkerManager:
                 async with asyncio.timeout(CLOSE_TIMEOUT):
                     await lease.upstream.aclose()
             except Exception:
-                completed = False
+                completed, outcome = False, "failed"
                 if not self._quarantined(worker):
                     worker.state = "suspect"
                     worker.last_error = "upstream_close_failed"
         worker.active.remove(lease)
-        outcome = "completed" if completed else "canceled" if lease.task and lease.task.cancelled() else "failed"
         worker.requests[outcome] += 1
         self.emit("released", worker, request_id=lease.request_id, outcome=outcome)
         if not completed and lease.dispatched and not self.closing:
             self._fail_queued(worker, "not_ready")
             if not self._quarantined(worker):
-                if self.mode == "local" and not worker.engine.is_alive():
+                if self.mode != "local" or not worker.engine.is_alive():
                     worker.state = "unavailable"
-                    worker.last_error = "process_exited"
+                    worker.last_error = "process_exited" if self.mode == "local" else outcome
                     worker.consecutive_successes = 0
                     self.emit("unready", worker, generation=worker.generation)
                 else:
@@ -363,10 +370,15 @@ class MultiWorkerManager:
     async def _recycle(self, worker):
         worker.generation += 1
         try:
-            drain = max(DRAIN_TIMEOUT, 2 * worker.definition.request_timeout_s + CLOSE_TIMEOUT)
-            async with asyncio.timeout(drain):
+            async with asyncio.timeout(max(DRAIN_TIMEOUT, request_lifetime(worker))):
                 while worker.active:
                     await asyncio.sleep(0.01)
+            if not worker.engine.is_alive():
+                worker.state = "unavailable"
+                worker.last_error = "process_exited"
+                worker.consecutive_successes = 0
+                self.emit("unready", worker, generation=worker.generation)
+                return
             async with asyncio.timeout(STOP_TIMEOUT):
                 await worker.engine.stop()
             async with asyncio.timeout(worker.definition.startup_timeout_s):
@@ -385,6 +397,7 @@ class MultiWorkerManager:
         else:
             worker.last_error = None
             worker.consecutive_successes = 0
+            worker.ready_at = perf_counter()
             worker.state = "ready"
             self.emit("recycled", worker, generation=worker.generation)
         finally:
@@ -392,25 +405,29 @@ class MultiWorkerManager:
 
     def metrics(self):
         workers = self.snapshot()["workers"]
+        for worker_id, row in workers.items():
+            ready_at = self.workers[worker_id].ready_at
+            row["ready_seconds_after_start"] = (
+                round(ready_at - self.started, 3) if ready_at is not None else None)
         worker_counts = {w.definition.id: dict(w.requests) for w in self.workers.values()}
         models = {}
         for model in self.config.models.values():
             members = [w for w in self.workers.values() if w.definition.model == model.id]
             models[model.id] = {"ready": sum(w.state == "ready" for w in members),
                 "requests": {key: sum(w.requests[key] for w in members)
-                             for key in ("completed", "failed", "canceled", "rejected")}}
+                             for key in ("completed", "failed", "canceled", "timeout", "rejected")}}
         devices = {}
-        for worker in self.workers.values():
-            key = (worker.definition.host, worker.definition.gpu_uuid)
-            if key in devices:
-                continue
-            sample = self._nvml_sample(key[1]) if self.mode == "local" and key[0] == "local" else None
-            devices[key] = {"host": key[0], "physical_gpu_uuid": key[1],
-                "utilization_percent": None, "memory_used_bytes": None,
-                "memory_total_bytes": None, "telemetry": "unavailable"}
-            if sample is not None:
-                devices[key].update(sample)
-        return {"workers": workers, "worker_requests": worker_counts,
+        for host_id, host in self.config.hosts.items():
+            for gpu_uuid in host.gpu_uuids:
+                key = (host_id, gpu_uuid)
+                sample = self._nvml_sample(gpu_uuid) if self.mode == "local" and host_id == "local" else None
+                devices[key] = {"host": key[0], "physical_gpu_uuid": key[1],
+                    "utilization_percent": None, "memory_used_bytes": None,
+                    "memory_total_bytes": None, "telemetry": "unavailable"}
+                if sample is not None:
+                    devices[key].update(sample)
+        return {"uptime_seconds": round(perf_counter() - self.started, 3),
+                "workers": workers, "worker_requests": worker_counts,
                 "models": models, "physical_gpus": list(devices.values())}
 
     def _nvml_sample(self, gpu_uuid):

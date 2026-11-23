@@ -109,7 +109,7 @@ def validate_config(raw: dict) -> ServingConfig:
     workers_raw = raw.get("workers")
     if not isinstance(workers_raw, list) or not workers_raw:
         raise ValueError("At least one worker is required.")
-    workers, ids, endpoints, slots, token_envs = [], set(), set(), set(), set()
+    workers, ids, origins, slots, token_envs = [], set(), set(), set(), set()
     for row in workers_raw:
         if not isinstance(row, dict) or set(row) != set(Worker.__dataclass_fields__):
             raise ValueError("Each worker must use the complete supported worker schema.")
@@ -138,9 +138,11 @@ def validate_config(raw: dict) -> ServingConfig:
                 or parsed.username or parsed.password or parsed.path not in {"", "/"}
                 or parsed.query or parsed.fragment):
             raise ValueError("Worker endpoint must be an explicit credential-free HTTP origin with a port.")
-        if worker.endpoint in endpoints:
+        origin = (parsed.scheme, "127.0.0.1" if parsed.hostname == "localhost" else parsed.hostname,
+                  parsed.port)
+        if origin in origins:
             raise ValueError("Worker endpoints must be unique.")
-        endpoints.add(worker.endpoint)
+        origins.add(origin)
         if (not isinstance(worker.service_token_env, str) or not worker.service_token_env.isidentifier()
                 or worker.service_token_env in token_envs):
             raise ValueError("Each worker requires a distinct service-token environment variable name.")

@@ -624,7 +624,12 @@ status stays independent of that flag: `ready` when every replica of the model i
 ready, `degraded` when only some replicas are available, and `unavailable` when
 that model alone has no ready replica. Worker state, physical UUIDs, device
 ordinals, revisions, queue depths, and failure detail stay on `/metrics`, which
-reports request state per worker, model, and physical UUID. NVML telemetry is
+reports request state per worker, model, and physical UUID. Every configured
+physical GPU is reported, including one left deliberately idle by placement D.
+Worker request counters distinguish `completed`, `failed`, `canceled`,
+`timeout`, and `rejected` outcomes. `/metrics` also reports `uptime_seconds`
+and, per worker, `ready_seconds_after_start`: the startup measurement the
+approved comparison records. NVML telemetry is
 optional and missing values remain unknown, not zero. No prompts, outputs,
 request headers, or service credentials are included in these metrics. Each
 worker admits at most two active sequences and queues at most two more; when
@@ -680,6 +685,16 @@ benchmark terminal. Use a fresh output path:
   --output benchmark-results/multi-gpu/approved-run.json
 ```
 
+The client never stops a worker or the gateway. Case 8 is interactive, and so is
+the closing lifecycle-evidence step. After the failure-isolation case the client
+asks you to stop the gateway with its normal stop signal and waits until
+`/health` stops answering. It records that observed stop plus the startup
+measurement taken from `/metrics` at run start (`uptime_seconds` and each
+worker's `ready_seconds_after_start`) under `lifecycle.startup` and
+`lifecycle.cleanup`. A run that cannot produce both measurements keeps
+`lifecycle.complete` and the `lifecycle_evidence` check false and never reports
+`status: completed`.
+
 `/health` probes are cheap liveness checks. Each worker also gets a full health
 probe every `health_interval_s`. A worker that fails its probe is removed from
 routing immediately and its queued requests fail with 503 `not_ready`; healthy
@@ -688,14 +703,21 @@ same-model replicas keep serving. A worker that had become ready is marked
 its restarted remote process answers again. A local child process that exited,
 or a worker that never completed startup, is marked `unavailable` and is not
 probed again. A dispatched request that does not complete, such as a client
-cancellation or a request deadline, does not permanently take a healthy replica
-offline: the gateway closes that upstream generation, keeps the worker out of
-routing (`/metrics` reports `recycling`), and recycles that worker once for that
-request (drain, stop, then start and wait for fresh identity/readiness). One
-recycle runs at a time per worker, and each later non-completion gets its own
-single recycle; there is no automatic retry after a failed one. A successful
-recycle returns the worker to `ready`; a failed recycle reports `unavailable`:
-the worker leaves routing at once and is terminated. When no replica of the requested
+cancellation or a request deadline, does not permanently take a healthy local
+replica offline: the gateway closes that upstream generation, keeps the worker
+out of routing (`/metrics` reports `recycling`), and recycles that worker once
+for that request (drain, stop, then start and wait for fresh
+identity/readiness). The drain waits for the whole bounded lifetime of every
+still-active request on that worker, including bounded response delivery and
+upstream close. One recycle runs at a time per worker, and each later
+non-completion gets its own single recycle; there is no automatic retry after a
+failed one. A successful recycle returns the worker to `ready`; a failed
+recycle, or a child process that died before the intentional stop/start phase,
+reports `unavailable`: the worker leaves routing at once and is terminated.
+Automatic recycling exists only for local child processes. A remote worker's
+stop and start are probe-only, so a remote request that does not complete
+quarantines that worker as `unavailable` instead of pretending to restart it;
+recovery for it is operator-controlled. When no replica of the requested
 model is ready, the gateway returns 503 `not_ready`. Failure state is recorded
 in the worker metrics and gateway logs. An unexpectedly dead process is never
 restarted automatically; recovery is operator-controlled with no restart loop,
@@ -703,9 +725,10 @@ backoff, or retry budget: restart a remote worker process (a `suspect` worker
 rejoins through health probes), or restart the gateway to recover an
 `unavailable` worker.
 
-The client never stops a worker. After the protocol, restart the failed remote
-worker, or the gateway for a local worker whose process actually died, and verify
-the affected model becomes `ready` again. Treat returned measurements as one observed run,
+The client never stops a worker. The run finishes by observing the gateway stop,
+so recover the failed worker afterwards: restart the remote worker process, or
+the gateway for a local worker whose process actually died, and verify the
+affected model becomes `ready` again. Treat returned measurements as one observed run,
 not a general SLO or a proof of safe co-residency. No GPU run is performed by
 the CPU-only checks described here.
 

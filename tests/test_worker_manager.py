@@ -2,11 +2,12 @@ import asyncio
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
 
-from src.model_router import RouterError, RoutingRequest
+from src.model_router import RouterError, RoutingRequest, _complete
 from src.serving_config import load_config
 from src.worker_manager import MultiWorkerManager
 from src.vllm_engine import HIGH_MODEL, LOW_MODEL
@@ -433,6 +434,159 @@ class WorkerManagerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RouterError) as caught:
             manager.submit(request(), "after-failure")
         self.assertEqual(caught.exception.code, "not_ready")
+
+    async def test_recycle_drain_covers_bounded_response_delivery(self):
+        config = self.config("D")
+        config = replace(config, workers=tuple(
+            replace(row, request_timeout_s=0.05) for row in config.workers))
+        manager = MultiWorkerManager(config, engine_factory=FakeEngine)
+        self.addAsyncCleanup(manager.shutdown)
+        await manager.start()
+        worker = next(w for w in manager.workers.values() if w.definition.model == LOW_MODEL)
+        first = manager.submit(request(), "first")
+        second = manager.submit(request(), "second")
+        await asyncio.gather(first.ready, second.ready)
+        with patch("src.worker_manager.DRAIN_TIMEOUT", 0.01), \
+                patch("src.worker_manager.CLOSE_TIMEOUT", 0.05), \
+                patch("src.model_router.SEND_TIMEOUT", 0.2), \
+                patch("src.model_router.CLOSE_TIMEOUT", 0.05):
+            first.dispatched = True
+            await manager.release(first, False)
+            self.assertEqual(worker.state, "recycling")
+            await asyncio.sleep(0.5)
+            self.assertEqual(worker.state, "recycling")
+            second.dispatched = True
+            await manager.release(second, True)
+            await asyncio.gather(*manager.tasks)
+        self.assertEqual(worker.state, "ready")
+        self.assertIsNone(worker.last_error)
+
+    async def test_dispatch_requires_current_admission_on_ready_worker(self):
+        manager = MultiWorkerManager(self.config("D"), engine_factory=FakeEngine)
+        self.addAsyncCleanup(manager.shutdown)
+        await manager.start()
+        worker = next(w for w in manager.workers.values() if w.definition.model == LOW_MODEL)
+        fake_request = SimpleNamespace(state=SimpleNamespace(), app=SimpleNamespace(
+            state=SimpleNamespace(client=None, manager=manager)))
+
+        async def admitted(name):
+            lease = manager.submit(request(), name)
+            await lease.ready
+            self.assertIs(lease.worker, worker)
+            return lease
+
+        stale_state = await admitted("stale-state")
+        worker.state = "suspect"
+        with self.assertRaises(RouterError) as caught:
+            await _complete(fake_request, stale_state)
+        self.assertEqual(caught.exception.status, 503)
+        self.assertEqual(caught.exception.code, "not_ready")
+        self.assertFalse(stale_state.dispatched)
+        worker.state = "ready"
+        manager.cancel_waiting(stale_state)
+
+        stale_generation = await admitted("stale-generation")
+        worker.generation += 1
+        with self.assertRaises(RouterError):
+            await _complete(fake_request, stale_generation)
+        self.assertFalse(stale_generation.dispatched)
+        worker.generation -= 1
+        manager.cancel_waiting(stale_generation)
+
+        stale_membership = await admitted("stale-membership")
+        worker.active.discard(stale_membership)
+        with self.assertRaises(RouterError):
+            await _complete(fake_request, stale_membership)
+        self.assertFalse(stale_membership.dispatched)
+        await manager.release(stale_membership, False)
+
+    async def test_remote_dispatch_failure_quarantines_without_recycle(self):
+        manager = MultiWorkerManager(self.config("D"), engine_factory=FakeEngine, mode="remote")
+        self.addAsyncCleanup(manager.shutdown)
+        await manager.start()
+        worker = next(w for w in manager.workers.values() if w.definition.model == LOW_MODEL)
+        lease = manager.submit(request(), "remote-cancel")
+        await lease.ready
+        lease.dispatched = True
+        await manager.release(lease, False)
+        self.assertEqual(worker.state, "unavailable")
+        self.assertIsNone(worker.cleanup_task)
+        self.assertEqual(worker.engine.starts, 1)
+        self.assertEqual(worker.engine.stops, 0)
+        with self.assertRaises(RouterError) as caught:
+            manager.submit(request(), "after-remote-cancel")
+        self.assertEqual(caught.exception.status, 503)
+
+    async def test_death_during_recycle_drain_is_never_restarted(self):
+        manager = MultiWorkerManager(self.config("D"), engine_factory=FakeEngine)
+        self.addAsyncCleanup(manager.shutdown)
+        await manager.start()
+        worker = next(w for w in manager.workers.values() if w.definition.model == LOW_MODEL)
+        first = manager.submit(request(), "first")
+        second = manager.submit(request(), "second")
+        await asyncio.gather(first.ready, second.ready)
+        with patch("src.worker_manager.DRAIN_TIMEOUT", 0.05):
+            first.dispatched = True
+            await manager.release(first, False)
+            self.assertEqual(worker.state, "recycling")
+            worker.engine.alive = False
+            second.dispatched = True
+            await manager.release(second, False)
+            await asyncio.gather(*manager.tasks)
+        self.assertEqual(worker.state, "unavailable")
+        self.assertEqual(worker.last_error, "process_exited")
+        self.assertEqual(worker.engine.starts, 1)
+        self.assertEqual(worker.engine.stops, 0)
+        self.assertIsNone(worker.cleanup_task)
+
+    async def test_terminal_outcomes_are_counted_as_observed(self):
+        manager = MultiWorkerManager(self.config("D"), engine_factory=FakeEngine)
+        self.addAsyncCleanup(manager.shutdown)
+        await manager.start()
+        worker = next(w for w in manager.workers.values() if w.definition.model == LOW_MODEL)
+        for outcome in ("completed", "failed", "canceled", "timeout"):
+            lease = manager.submit(request(), outcome)
+            await lease.ready
+            lease.dispatched = True
+            await manager.release(lease, outcome == "completed", outcome)
+            await asyncio.gather(*manager.tasks)
+            self.assertEqual(worker.state, "ready")
+        self.assertEqual({key: worker.requests[key]
+                          for key in ("completed", "failed", "canceled", "timeout")},
+                         {"completed": 1, "failed": 1, "canceled": 1, "timeout": 1})
+        model_requests = manager.metrics()["models"][LOW_MODEL]["requests"]
+        self.assertEqual(model_requests["timeout"], 1)
+        self.assertEqual(model_requests["canceled"], 1)
+
+    async def test_health_failure_counts_each_queued_request_once(self):
+        gate = asyncio.Event()
+        manager = MultiWorkerManager(
+            self.config("D"), engine_factory=lambda row: FakeEngine(row, gate=gate))
+        self.addAsyncCleanup(manager.shutdown)
+        await manager.start()
+        worker = next(w for w in manager.workers.values() if w.definition.model == LOW_MODEL)
+        for n in range(3):
+            manager.submit(request(), f"queued-{n}")
+        await asyncio.sleep(0)
+        self.assertEqual(len(worker.queue), 1)
+        worker.engine.alive = False
+        await manager._probe(worker, worker.generation)
+        self.assertEqual(worker.state, "unavailable")
+        self.assertEqual(worker.requests["failed"], 1)
+
+    async def test_metrics_report_configured_idle_gpu_and_lifecycle_evidence(self):
+        manager = MultiWorkerManager(self.config("D"), engine_factory=FakeEngine)
+        self.addAsyncCleanup(manager.shutdown)
+        await manager.start()
+        metrics = manager.metrics()
+        self.assertEqual(
+            [row["physical_gpu_uuid"] for row in metrics["physical_gpus"]],
+            ["GPU-00000000-0000-0000-0000-000000000001",
+             "GPU-00000000-0000-0000-0000-000000000002"])
+        self.assertTrue(all(row["telemetry"] == "unavailable" for row in metrics["physical_gpus"]))
+        self.assertIsInstance(metrics["uptime_seconds"], float)
+        self.assertTrue(all(isinstance(row["ready_seconds_after_start"], float)
+                            for row in metrics["workers"].values()))
 
     async def test_metrics_deduplicate_physical_device_and_leave_unavailable_unknown(self):
         manager = MultiWorkerManager(self.config("B"), engine_factory=FakeEngine)
