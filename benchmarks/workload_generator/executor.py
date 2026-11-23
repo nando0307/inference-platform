@@ -99,11 +99,11 @@ async def replay_trace(records, endpoint, *, auth_token=None, max_inflight=64, m
             active.add(task)
             task.add_done_callback(active.discard)
         if tasks:
-            done, pending = await asyncio.wait(tasks, timeout=drain_timeout_s)
+            _, pending = await asyncio.wait(tasks, timeout=drain_timeout_s)
             for task in pending:
                 task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-            results.extend(task.result() for task in done if not task.cancelled() and task.exception() is None)
+            completed = await asyncio.gather(*tasks, return_exceptions=True)
+            results.extend(result for result in completed if isinstance(result, dict))
     return results
 
 
