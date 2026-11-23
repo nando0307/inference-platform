@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "id": "microburst",
+  "duration_s": 180,
+  "seed": 42,
+  "arrival_process": "poisson",
+  "phases": [
+    {
+      "id": "base1",
+      "start_s": 0,
+      "end_s": 60,
+      "rate_rps": 0.5,
+      "model_probabilities": {
+        "Qwen/Qwen2.5-0.5B-Instruct": 0.5,
+        "Qwen/Qwen3-1.7B": 0.5
+      },
+      "arrival_process": "poisson",
+      "input_profile": "mixed",
+      "output_profile": "mixed",
+      "stream_probability": 0.8,
+      "cancellation_probability": 0
+    },
+    {
+      "id": "burst1",
+      "start_s": 60,
+      "end_s": 65,
+      "rate_rps": 8,
+      "model_probabilities": {
+        "Qwen/Qwen2.5-0.5B-Instruct": 0.5,
+        "Qwen/Qwen3-1.7B": 0.5
+      },
+      "arrival_process": "poisson",
+      "input_profile": "mixed",
+      "output_profile": "mixed",
+      "stream_probability": 0.8,
+      "cancellation_probability": 0
+    },
+    {
+      "id": "base2",
+      "start_s": 65,
+      "end_s": 120,
+      "rate_rps": 0.5,
+      "model_probabilities": {
+        "Qwen/Qwen2.5-0.5B-Instruct": 0.5,
+        "Qwen/Qwen3-1.7B": 0.5
+      },
+      "arrival_process": "poisson",
+      "input_profile": "mixed",
+      "output_profile": "mixed",
+      "stream_probability": 0.8,
+      "cancellation_probability": 0
+    },
+    {
+      "id": "burst2",
+      "start_s": 120,
+      "end_s": 125,
+      "rate_rps": 8,
+      "model_probabilities": {
+        "Qwen/Qwen2.5-0.5B-Instruct": 0.5,
+        "Qwen/Qwen3-1.7B": 0.5
+      },
+      "arrival_process": "poisson",
+      "input_profile": "mixed",
+      "output_profile": "mixed",
+      "stream_probability": 0.8,
+      "cancellation_probability": 0
+    },
+    {
+      "id": "base3",
+      "start_s": 125,
+      "end_s": 180,
+      "rate_rps": 0.5,
+      "model_probabilities": {
+        "Qwen/Qwen2.5-0.5B-Instruct": 0.5,
+        "Qwen/Qwen3-1.7B": 0.5
+      },
+      "arrival_process": "poisson",
+      "input_profile": "mixed",
+      "output_profile": "mixed",
+      "stream_probability": 0.8,
+      "cancellation_probability": 0
+    }
+  ],
+  "prompt_corpus_id": "synthetic-v1",
+  "request_timeout_s": 180,
+  "max_inflight": 64,
+  "max_connections": 64
+}
