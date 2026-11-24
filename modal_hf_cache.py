@@ -64,5 +64,5 @@ def verify_manifest(root=HF_HOME):
                 raise ValueError(f"manifest revision mismatch for {repo}")
             verify_snapshot(snapshot_path(root, repo, revision), root, entries[repo]["paths"])
     except (OSError, KeyError, ValueError) as e:
-        raise RuntimeError(f"cache invalid; re-run provision: {e}") from e
+        raise RuntimeError(f"cache invalid; re-run a T4 lab command: {e}") from e
     return True

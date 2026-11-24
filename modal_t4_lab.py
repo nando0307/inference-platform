@@ -1,4 +1,4 @@
-"""Approval-gated, offline diagnostics and vLLM checks on exactly one Modal T4.
+"""Approval-gated cache population and vLLM checks on exactly one Modal T4.
 
 Run with ``modal run modal_t4_lab.py --mode diagnostic`` only after operator approval.
 """
@@ -53,6 +53,35 @@ def _cache(model_path, revision):
     except (OSError, KeyError, ValueError, json.JSONDecodeError):
         return {"model": model_path, "available": False}
     return {"model": model_path, "available": True}
+
+
+def _populate_cache():
+    from modal_hf_cache import HF_HOME, MANIFEST, MODELS as PINNED_MODELS
+    from modal_hf_cache import snapshot_path, verify_manifest, verify_snapshot
+
+    try:
+        verify_manifest(HF_HOME)
+        return
+    except RuntimeError:
+        pass
+
+    os.environ.pop("HF_HUB_OFFLINE", None)
+    os.environ.pop("TRANSFORMERS_OFFLINE", None)
+    from huggingface_hub import HfApi, snapshot_download
+
+    api = HfApi()
+    manifest = {}
+    for repo, revision in PINNED_MODELS.items():
+        expected = sorted(api.list_repo_files(repo, revision=revision))
+        snapshot_download(repo, revision=revision, cache_dir=str(HF_HOME / "hub"))
+        paths = verify_snapshot(snapshot_path(HF_HOME, repo, revision), HF_HOME, expected)
+        manifest[repo] = {"revision": revision, "paths": paths}
+    MANIFEST.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    cache_volume.commit()
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    verify_manifest(HF_HOME)
+
 
 
 def _diagnostics():
@@ -221,10 +250,11 @@ def _serve(mode):
               min_containers=0, scaledown_window=2, timeout=958, retries=0,
               volumes={"/opt/huggingface": cache_volume})
 def lab(mode: str):
+    if mode not in ("diagnostic", "single-small", "single-large", "shared"):
+        raise ValueError("mode must be diagnostic, single-small, single-large, or shared")
+    _populate_cache()
     if mode == "diagnostic":
         return _diagnostics()
-    if mode not in ("single-small", "single-large", "shared"):
-        raise ValueError("mode must be diagnostic, single-small, single-large, or shared")
     return _serve(mode)
 
 
