@@ -19,7 +19,7 @@ def provision():
     manifest = {}
     for repo, revision in MODELS.items():
         expected = sorted(api.list_repo_files(repo, revision=revision))
-        snapshot_download(repo, revision=revision, cache_dir=str(HF_HOME))
+        snapshot_download(repo, revision=revision, cache_dir=str(HF_HOME / "hub"))
         snapshot = snapshot_path(HF_HOME, repo, revision)
         paths = verify_snapshot(snapshot, HF_HOME, expected)
         manifest[repo] = {"revision": revision, "paths": paths}

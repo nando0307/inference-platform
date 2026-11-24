@@ -60,9 +60,9 @@ class SnapshotInventoryTests(unittest.TestCase):
             root = Path(temporary)
             manifest = {}
             for repo, _rev in MODELS.items():
-                manifest[repo] = {"revision": "wrong-revision", "paths": []}
+                manifest[repo] = {"revision": "wrong-revision", "paths": ["config.json"]}
             (root / "verified-snapshots.json").write_text(json.dumps(manifest))
-            with self.assertRaises(ValueError):
+            with self.assertRaisesRegex(ValueError, "manifest revision mismatch"):
                 verify_manifest(root)
 
 
