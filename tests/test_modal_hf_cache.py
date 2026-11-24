@@ -36,14 +36,14 @@ class SnapshotInventoryTests(unittest.TestCase):
 
     def test_verify_manifest_missing_file(self):
         with tempfile.TemporaryDirectory() as temporary:
-            with self.assertRaises(OSError):
+            with self.assertRaisesRegex(RuntimeError, "cache invalid; re-run provision"):
                 verify_manifest(Path(temporary))
 
     def test_verify_manifest_corrupt_json(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "verified-snapshots.json").write_text("not json")
-            with self.assertRaises(json.JSONDecodeError):
+            with self.assertRaisesRegex(RuntimeError, "cache invalid; re-run provision"):
                 verify_manifest(root)
 
     def test_verify_manifest_missing_entry(self):
@@ -52,7 +52,7 @@ class SnapshotInventoryTests(unittest.TestCase):
             (root / "verified-snapshots.json").write_text(
                 json.dumps({"some-other-repo": {"revision": "abc", "paths": []}})
             )
-            with self.assertRaises(KeyError):
+            with self.assertRaisesRegex(RuntimeError, "cache invalid; re-run provision"):
                 verify_manifest(root)
 
     def test_verify_manifest_revision_mismatch(self):
@@ -62,7 +62,7 @@ class SnapshotInventoryTests(unittest.TestCase):
             for repo, _rev in MODELS.items():
                 manifest[repo] = {"revision": "wrong-revision", "paths": ["config.json"]}
             (root / "verified-snapshots.json").write_text(json.dumps(manifest))
-            with self.assertRaisesRegex(ValueError, "manifest revision mismatch"):
+            with self.assertRaisesRegex(RuntimeError, "manifest revision mismatch"):
                 verify_manifest(root)
 
 

@@ -57,9 +57,12 @@ def verify_snapshot(snapshot, volume_root, expected):
 
 def verify_manifest(root=HF_HOME):
     root = Path(root)
-    entries = json.loads((root / MANIFEST.name).read_text())
-    for repo, revision in MODELS.items():
-        if entries[repo]["revision"] != revision:
-            raise ValueError(f"manifest revision mismatch for {repo}")
-        verify_snapshot(snapshot_path(root, repo, revision), root, entries[repo]["paths"])
+    try:
+        entries = json.loads((root / MANIFEST.name).read_text())
+        for repo, revision in MODELS.items():
+            if entries[repo]["revision"] != revision:
+                raise ValueError(f"manifest revision mismatch for {repo}")
+            verify_snapshot(snapshot_path(root, repo, revision), root, entries[repo]["paths"])
+    except (OSError, KeyError, ValueError) as e:
+        raise RuntimeError(f"cache invalid; re-run provision: {e}") from e
     return True
