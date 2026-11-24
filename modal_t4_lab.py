@@ -14,12 +14,18 @@ from pathlib import Path
 
 import modal
 
+from modal_hf_cache import MODELS as PINNED_MODELS
+
 IMAGE = "vllm/vllm-openai@sha256:91ee972ab751fb7180bc71c175865e36b091686600dca783d52b2511399810b3"
 ENGINE_VERSION = "0.33.0"
-MODELS = {
-    "small": ("Qwen/Qwen2.5-0.5B-Instruct", "7ae557604adf67be50417f59c2c2f167def9a775"),
-    "large": ("Qwen/Qwen3-1.7B", "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e"),
+MODEL_REPOS = {
+    "small": "Qwen/Qwen2.5-0.5B-Instruct",
+    "large": "Qwen/Qwen3-1.7B",
 }
+MODELS = {name: (repo, PINNED_MODELS[repo]) for name, repo in MODEL_REPOS.items()}
+cache_volume = modal.Volume.from_name("inference-huggingface-cache", version=2)
+
+
 app = modal.App("inference-one-t4-lab")
 image = (
     modal.Image.from_registry(IMAGE)
@@ -31,15 +37,22 @@ image = (
         "TOKENIZERS_PARALLELISM": "false",
         "VLLM_NO_USAGE_STATS": "1",
     })
+    .add_local_file(Path(__file__).parent / "modal_hf_cache.py", "/root/modal_hf_cache.py")
 )
 
 
 def _cache(model_path, revision):
-    hub = Path(os.environ.get("HF_HOME", str(Path.home() / ".cache/huggingface"))) / "hub"
-    org, model = model_path.split("/", 1)
-    snapshot_dir = hub / f"models--{org}--{model}" / "snapshots" / revision
-    available = snapshot_dir.is_dir() and any(snapshot_dir.iterdir())
-    return {"model": model_path, "available": available}
+    from modal_hf_cache import HF_HOME, MANIFEST, snapshot_path, verify_snapshot
+
+    try:
+        manifest = json.loads(MANIFEST.read_text())
+        entry = manifest[model_path]
+        if entry["revision"] != revision:
+            raise ValueError("revision mismatch")
+        verify_snapshot(snapshot_path(HF_HOME, model_path, revision), HF_HOME, entry["paths"])
+    except (OSError, KeyError, ValueError, json.JSONDecodeError):
+        return {"model": model_path, "available": False}
+    return {"model": model_path, "available": True}
 
 
 def _diagnostics():
@@ -205,7 +218,8 @@ def _serve(mode):
     return report
 
 @app.function(image=image, gpu="T4", cpu=4, memory=8192, max_containers=1,
-              min_containers=0, scaledown_window=2, timeout=958, retries=0)
+              min_containers=0, scaledown_window=2, timeout=958, retries=0,
+              volumes={"/opt/huggingface": cache_volume})
 def lab(mode: str):
     if mode == "diagnostic":
         return _diagnostics()
