@@ -109,9 +109,6 @@ def _stop_process_group(process):
 
 
 def _serve(mode):
-    from modal_hf_cache import verify_manifest
-
-    verify_manifest()
     diag = _diagnostics()
     chosen = ["small", "large"] if mode == "shared" else [mode.removeprefix("single-")]
     missing = [row["model"] for row in diag["model_cache"] if row["model"] in

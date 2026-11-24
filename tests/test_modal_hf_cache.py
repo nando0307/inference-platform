@@ -1,8 +1,9 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
-from modal_hf_cache import inventory, verify_snapshot
+from modal_hf_cache import MODELS, inventory, verify_manifest, verify_snapshot
 
 
 class SnapshotInventoryTests(unittest.TestCase):
@@ -32,6 +33,37 @@ class SnapshotInventoryTests(unittest.TestCase):
             (snapshot / "escape").symlink_to(outside)
             with self.assertRaisesRegex(ValueError, "escapes Volume"):
                 inventory(snapshot, root / "volume")
+
+    def test_verify_manifest_missing_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaises(OSError):
+                verify_manifest(Path(temporary))
+
+    def test_verify_manifest_corrupt_json(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "verified-snapshots.json").write_text("not json")
+            with self.assertRaises(json.JSONDecodeError):
+                verify_manifest(root)
+
+    def test_verify_manifest_missing_entry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "verified-snapshots.json").write_text(
+                json.dumps({"some-other-repo": {"revision": "abc", "paths": []}})
+            )
+            with self.assertRaises(KeyError):
+                verify_manifest(root)
+
+    def test_verify_manifest_revision_mismatch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = {}
+            for repo, _rev in MODELS.items():
+                manifest[repo] = {"revision": "wrong-revision", "paths": []}
+            (root / "verified-snapshots.json").write_text(json.dumps(manifest))
+            with self.assertRaises(ValueError):
+                verify_manifest(root)
 
 
 if __name__ == "__main__":
