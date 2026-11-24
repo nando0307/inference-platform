@@ -10,7 +10,6 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
-from pathlib import Path
 
 import modal
 
@@ -20,6 +19,9 @@ MODELS = {
     "small": ("Qwen/Qwen2.5-0.5B-Instruct", "7ae557604adf67be50417f59c2c2f167def9a775"),
     "large": ("Qwen/Qwen3-1.7B", "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e"),
 }
+cache_volume = modal.Volume.from_name("inference-huggingface-cache")
+
+
 app = modal.App("inference-one-t4-lab")
 image = (
     modal.Image.from_registry(IMAGE)
@@ -35,11 +37,17 @@ image = (
 
 
 def _cache(model_path, revision):
-    hub = Path(os.environ.get("HF_HOME", str(Path.home() / ".cache/huggingface"))) / "hub"
-    org, model = model_path.split("/", 1)
-    snapshot_dir = hub / f"models--{org}--{model}" / "snapshots" / revision
-    available = snapshot_dir.is_dir() and any(snapshot_dir.iterdir())
-    return {"model": model_path, "available": available}
+    from modal_hf_cache import HF_HOME, MANIFEST, snapshot_path, verify_snapshot
+
+    try:
+        manifest = json.loads(MANIFEST.read_text())
+        entry = manifest[model_path]
+        if entry["revision"] != revision:
+            raise ValueError("revision mismatch")
+        verify_snapshot(snapshot_path(HF_HOME, model_path, revision), HF_HOME, entry["paths"])
+    except (OSError, KeyError, ValueError, json.JSONDecodeError):
+        return {"model": model_path, "available": False}
+    return {"model": model_path, "available": True}
 
 
 def _diagnostics():
@@ -101,6 +109,9 @@ def _stop_process_group(process):
 
 
 def _serve(mode):
+    from modal_hf_cache import verify_manifest
+
+    verify_manifest()
     diag = _diagnostics()
     chosen = ["small", "large"] if mode == "shared" else [mode.removeprefix("single-")]
     missing = [row["model"] for row in diag["model_cache"] if row["model"] in
@@ -205,7 +216,8 @@ def _serve(mode):
     return report
 
 @app.function(image=image, gpu="T4", cpu=4, memory=8192, max_containers=1,
-              min_containers=0, scaledown_window=2, timeout=958, retries=0)
+              min_containers=0, scaledown_window=2, timeout=958, retries=0,
+              volumes={"/opt/huggingface": cache_volume})
 def lab(mode: str):
     if mode == "diagnostic":
         return _diagnostics()
