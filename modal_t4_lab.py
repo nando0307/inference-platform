@@ -10,6 +10,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 import modal
 
@@ -36,6 +37,7 @@ image = (
         "TOKENIZERS_PARALLELISM": "false",
         "VLLM_NO_USAGE_STATS": "1",
     })
+    .add_local_file(Path(__file__).parent / "modal_hf_cache.py", "/root/modal_hf_cache.py")
 )
 
 

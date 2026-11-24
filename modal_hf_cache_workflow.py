@@ -3,12 +3,14 @@
 import json
 
 import modal
+from pathlib import Path
 
 from modal_hf_cache import HF_HOME, MANIFEST, MODELS, snapshot_path, verify_snapshot
 
 app = modal.App("inference-hf-cache")
 volume = modal.Volume.from_name("inference-huggingface-cache", create_if_missing=True, version=2)
 image = modal.Image.debian_slim(python_version="3.12").pip_install("huggingface_hub==0.36.0")
+image = image.add_local_file(Path(__file__).parent / "modal_hf_cache.py", "/root/modal_hf_cache.py")
 
 
 @app.function(image=image, volumes={str(HF_HOME): volume}, cpu=4, timeout=3600, retries=0)
