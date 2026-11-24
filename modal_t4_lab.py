@@ -13,13 +13,16 @@ import urllib.request
 
 import modal
 
+from modal_hf_cache import MODELS as PINNED_MODELS
+
 IMAGE = "vllm/vllm-openai@sha256:91ee972ab751fb7180bc71c175865e36b091686600dca783d52b2511399810b3"
 ENGINE_VERSION = "0.33.0"
-MODELS = {
-    "small": ("Qwen/Qwen2.5-0.5B-Instruct", "7ae557604adf67be50417f59c2c2f167def9a775"),
-    "large": ("Qwen/Qwen3-1.7B", "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e"),
+MODEL_REPOS = {
+    "small": "Qwen/Qwen2.5-0.5B-Instruct",
+    "large": "Qwen/Qwen3-1.7B",
 }
-cache_volume = modal.Volume.from_name("inference-huggingface-cache")
+MODELS = {name: (repo, PINNED_MODELS[repo]) for name, repo in MODEL_REPOS.items()}
+cache_volume = modal.Volume.from_name("inference-huggingface-cache", version=2)
 
 
 app = modal.App("inference-one-t4-lab")

@@ -7,7 +7,7 @@ import modal
 from modal_hf_cache import HF_HOME, MANIFEST, MODELS, snapshot_path, verify_snapshot
 
 app = modal.App("inference-hf-cache")
-volume = modal.Volume.from_name("inference-huggingface-cache", create_if_missing=True)
+volume = modal.Volume.from_name("inference-huggingface-cache", create_if_missing=True, version=2)
 image = modal.Image.debian_slim(python_version="3.12").pip_install("huggingface_hub==0.36.0")
 
 
