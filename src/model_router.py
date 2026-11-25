@@ -2,10 +2,11 @@
 
 import asyncio
 import json
+import logging
 import os
 from collections import deque
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from time import perf_counter, time
 from uuid import uuid4
 
@@ -16,6 +17,7 @@ from starlette.requests import ClientDisconnect
 from starlette.responses import JSONResponse, StreamingResponse
 
 from .api import AUTH_TOKEN_ENV, ChatCompletionRequest, ChatMessage, _AuthMiddleware, _DisconnectedResponse
+from .measurements import DurationWindow
 from .telemetry import close_tracer, create_tracer, start_request
 from .inference import ContextLimitError
 from .vllm_engine import MODEL_SPECS, VLLMEngine
@@ -29,6 +31,11 @@ LEGACY_COMPLETION_TIMEOUT = 180
 DRAIN_TIMEOUT = 5.0
 CLOSE_TIMEOUT = 3.0
 STOP_TIMEOUT = 20.0
+logger = logging.getLogger("inference.router.lifecycle")
+logger.setLevel(logging.INFO)
+logger.propagate = False
+if not logger.handlers:
+    logger.addHandler(logging.StreamHandler())
 
 
 class RoutingRequest(ChatCompletionRequest):
@@ -80,6 +87,8 @@ class Lease:
     upstream: httpx.Response | None = None
     usage: dict | None = None
     dispatched: bool = False
+    queued_at: float = field(default_factory=perf_counter)
+    ready_at: float | None = None
 
 
 class ModelManager:
@@ -245,6 +254,7 @@ class ModelManager:
         if len(self.active) < 2:
             self.queue.popleft()
             self.active.add(lease)
+            lease.ready_at = perf_counter()
             lease.ready.set_result(lease)
             self.emit("admitted", lease)
             self.wake.set()
@@ -310,17 +320,20 @@ class _LeaseMiddleware:
             return
         state = scope.setdefault("state", {})
         state["request_id"] = uuid4().hex
+        started = perf_counter()
         trace = None
         if scope["method"] == "POST" and scope["path"] == "/v1/chat/completions":
             trace = start_request(
                 getattr(scope["app"].state, "tracer", None), state["request_id"],
                 backend="model-router",
             )
+        observed = scope["method"] == "POST" and scope["path"] == "/v1/chat/completions"
         state["request_trace"] = trace
         status = None
         disconnected = False
         delivered = False
         success = False
+        first_content_ms = None
 
         async def traced_receive():
             nonlocal disconnected
@@ -330,7 +343,7 @@ class _LeaseMiddleware:
             return message
 
         async def bounded_send(message):
-            nonlocal status, delivered, disconnected
+            nonlocal status, delivered, disconnected, first_content_ms
             if message["type"] == "http.response.start":
                 status = message["status"]
                 message["headers"] = [*message.get("headers", []),
@@ -338,18 +351,24 @@ class _LeaseMiddleware:
             try:
                 async with asyncio.timeout(SEND_TIMEOUT):
                     await send(message)
+                if (message["type"] == "http.response.body" and state.get("content_pending")
+                        and first_content_ms is None):
+                    first_content_ms = (perf_counter() - started) * 1000
+                    state["content_pending"] = False
                 if message["type"] == "http.response.body" and not message.get("more_body", False):
                     delivered = True
             except TimeoutError:
                 state["trace_error_code"] = "slow_consumer"
+                state["content_pending"] = False
                 raise
             except OSError:
                 disconnected = True
                 state["trace_error_code"] = "client_disconnected"
+                state["content_pending"] = False
                 raise
 
         try:
-            await self.app(scope, traced_receive if trace is not None else receive, bounded_send)
+            await self.app(scope, traced_receive if observed else receive, bounded_send)
             success = True
         except asyncio.CancelledError:
             if not disconnected:
@@ -359,7 +378,7 @@ class _LeaseMiddleware:
             disconnected = True
             raise
         finally:
-            if trace is not None:
+            if observed:
                 code = state.get("trace_error_code")
                 if code in ("client_disconnected", "request_canceled"):
                     outcome = "disconnected"
@@ -374,8 +393,30 @@ class _LeaseMiddleware:
                     outcome = "completed"
                 else:
                     outcome, code = "failed", "internal_error"
-                # End at HTTP delivery, before potentially slow lease cleanup.
-                trace.finish(outcome=outcome, http_status=status, error_code=code)
+                # HTTP delivery is measured before potentially slow lease cleanup.
+                if trace is not None:
+                    trace.finish(outcome=outcome, http_status=status, error_code=code)
+                manager = scope["app"].state.manager
+                if hasattr(manager, "record_http"):
+                    lease = state.get("lease")
+                    worker = getattr(lease, "worker", None)
+                    queue_ms = ((lease.ready_at - lease.queued_at) * 1000
+                                if lease is not None and lease.ready_at is not None else None)
+                    duration_ms = (perf_counter() - started) * 1000
+                    usage = lease.usage if lease is not None else None
+                    model = state.get("model")
+                    manager.record_http(model, worker, outcome, code, duration_ms,
+                                        queue_ms, first_content_ms, usage)
+                    logger.info(json.dumps({
+                        "event": "request_finished", "request_id": state["request_id"],
+                        "model": model, "worker_id": worker.definition.id if worker else None,
+                        "stream": state.get("stream"), "outcome": outcome,
+                        "http_status": status, "error_code": code,
+                        "duration_ms": duration_ms, "queue_wait_ms": queue_ms,
+                        "first_content_ms": first_content_ms,
+                        "prompt_tokens": usage["prompt_tokens"] if usage else None,
+                        "completion_tokens": usage["completion_tokens"] if usage else None,
+                    }))
             lease = state.get("lease")
             if lease is not None:
                 code = state.get("trace_error_code")
@@ -527,6 +568,8 @@ async def _stream(request, lease):
                     if trace is not None:
                         trace.update(prompt_tokens=usage["prompt_tokens"],
                                      completion_tokens=usage["completion_tokens"])
+                if payload["choices"] and payload["choices"][0]["delta"].get("content"):
+                    request.state.content_pending = True
                 yield _sse({key: value for key, value in payload.items() if key in (
                     "id", "object", "created", "model", "choices", "usage", "prompt_token_ids",
                 )})
@@ -704,24 +747,26 @@ def create_app(engine=None, config=None, worker_engine_factory=None, mode=None):
                 body = RoutingRequest.model_validate_json(raw)
             except (ValidationError, ValueError):
                 raise RouterError(422, "invalid_request", "Request does not match the supported schema.") from None
+            request.state.model, request.state.stream = body.model, body.stream
             if trace is not None:
                 trace.update(model=body.model, stream=body.stream)
-            submitted = perf_counter() if trace is not None else None
             lease = app.state.manager.submit(body, request.state.request_id)
             request.state.lease = lease
             lease.task = asyncio.current_task()
             worker = getattr(lease, "worker", None)
+            if trace is not None and worker is not None:
+                trace.update(worker_id=worker.definition.id)
             if worker is None:
                 await _connected(request, lease.ready)
                 if trace is not None:
-                    trace.update(queue_wait_ms=(perf_counter() - submitted) * 1000)
+                    trace.update(queue_wait_ms=(lease.ready_at - lease.queued_at) * 1000)
                 work = asyncio.create_task(_complete(request, lease))
                 async with asyncio.timeout(LEGACY_COMPLETION_TIMEOUT):
                     return await _connected(request, work)
             async with asyncio.timeout(worker.definition.request_timeout_s):
                 await _connected(request, lease.ready)
                 if trace is not None:
-                    trace.update(queue_wait_ms=(perf_counter() - submitted) * 1000)
+                    trace.update(queue_wait_ms=(lease.ready_at - lease.queued_at) * 1000)
                 work = asyncio.create_task(_complete(request, lease))
                 return await _connected(request, work)
         except ClientDisconnect:

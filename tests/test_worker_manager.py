@@ -362,5 +362,56 @@ class WorkerManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("request_id", str(metrics))
 
 
+    async def test_bounded_vllm_poll_keeps_unknown_and_stale_values_null(self):
+        from src.measurements import parse_vllm_metrics
+
+        self.assertEqual(parse_vllm_metrics(
+            f'vllm:num_requests_running{{model_name="{LOW_MODEL}"}} 2\n'
+            f'vllm:num_requests_running{{model_name="{LOW_MODEL}",engine_index="1"}} 3\n',
+            LOW_MODEL), {})
+        manager = MultiWorkerManager(self.config("D"), engine_factory=FakeEngine, mode="remote")
+        self.addAsyncCleanup(manager.shutdown)
+        await manager.start()
+        calls = []
+
+        def upstream(req):
+            calls.append(req)
+            worker = next(row for row in manager.config.workers if row.endpoint == str(req.url).removesuffix("/metrics"))
+            self.assertEqual(req.headers["authorization"], "Bearer " + (
+                "internal-small" if worker.model == LOW_MODEL else "internal-large"))
+            model = worker.model
+            return httpx.Response(200, text=(
+                f'vllm:num_requests_running{{model_name="{model}"}} 2\n'
+                f'vllm:num_requests_waiting{{model_name="{model}"}} 1\n'
+                f'vllm:kv_cache_usage_perc{{model_name="{model}"}} 0.375\n'
+                f'vllm:num_preemptions_total{{model_name="{model}"}} 4\n'))
+
+        tokens = {row.service_token_env: (
+            "internal-small" if row.model == LOW_MODEL else "internal-large")
+            for row in manager.config.workers}
+        with patch.dict("os.environ", tokens):
+            async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+                await manager._poll_metrics(client)
+        self.assertEqual(len(calls), 2)
+        snapshot = manager.metrics()
+        small = snapshot["workers"]["small-0"]["vllm"]
+        self.assertEqual(small["num_requests_running"], 2)
+        self.assertEqual(small["kv_cache_usage_fraction"], 0.375)
+        self.assertEqual(small["num_preemptions"], 4)
+        self.assertTrue(manager.readiness()["ready"])
+        self.assertTrue(all(device["telemetry"] == "unavailable" for device in snapshot["physical_gpus"]))
+
+        with patch.dict("os.environ", tokens):
+            async with httpx.AsyncClient(transport=httpx.MockTransport(
+                    lambda req: httpx.Response(200, content=b"x" * 262145))) as client:
+                await manager._poll_metrics(client)
+        self.assertEqual(manager.metrics()["workers"]["small-0"]["vllm"]["status"], "stale")
+        self.assertIsNone(manager.metrics()["workers"]["small-0"]["vllm"]["num_requests_running"])
+        self.assertTrue(manager.readiness()["ready"])
+        manager.workers["small-0"].vllm_ok = True
+        manager.workers["small-0"].vllm_sample_at -= 3 * manager.metrics_interval
+        self.assertIsNone(manager.metrics()["workers"]["small-0"]["vllm"]["kv_cache_usage_fraction"])
+
+
 if __name__ == "__main__":
     unittest.main()

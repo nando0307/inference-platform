@@ -655,5 +655,71 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, 2)
 
 
+    async def test_first_content_is_measured_after_send_and_survives_later_failure(self):
+        waiting, allow = asyncio.Event(), asyncio.Event()
+        release_worker = Event()
+
+        class DelayedContent(Connection):
+            async def send(self, message):
+                if message.get("body", b"").startswith(b"data: {"):
+                    event = json.loads(message["body"][6:])
+                    if event.get("choices", [{}])[0].get("delta", {}).get("content"):
+                        waiting.set()
+                        await allow.wait()
+                await super().send(message)
+
+        def fail_after_text(*args, streamer, on_prepared, **kwargs):
+            on_prepared()
+            streamer.on_finalized_text("partial text", stream_end=True)
+            if not release_worker.wait(5):
+                raise TimeoutError("Producer was not released")
+            raise RuntimeError("PRIVATE")
+
+        with (patch("src.api.generate", side_effect=fail_after_text),
+              self.assertLogs("inference.lifecycle") as captured):
+            connection = DelayedContent()
+            try:
+                await asyncio.wait_for(waiting.wait(), 2)
+                self.assertEqual((await self.client.get("/metrics")).json()["first_content_ms"]["count"], 0)
+            finally:
+                allow.set()
+                release_worker.set()
+                await asyncio.wait_for(connection.task, 3)
+        rows = [json.loads(line[line.index("{"):]) for line in captured.output
+                if '"event": "request_finished"' in line]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["outcome"], "failed")
+        self.assertEqual(rows[0]["http_status"], 200)
+        self.assertGreater(rows[0]["first_content_ms"], 0)
+        self.assertGreater(rows[0]["duration_ms"], rows[0]["first_content_ms"])
+        self.assertEqual((await self.client.get("/metrics")).json()["first_content_ms"]["count"], 1)
+
+    async def test_failed_first_content_send_never_claims_delivery(self):
+        class FailedContent(Connection):
+            async def send(self, message):
+                if message.get("body", b"").startswith(b"data: {"):
+                    event = json.loads(message["body"][6:])
+                    if event.get("choices", [{}])[0].get("delta", {}).get("content"):
+                        raise OSError("client disconnected")
+                await super().send(message)
+
+        def generate(*args, streamer, on_prepared, **kwargs):
+            on_prepared()
+            streamer.on_finalized_text("partial text", stream_end=True)
+            return self.result
+
+        with (patch("src.api.generate", side_effect=generate),
+              self.assertLogs("inference.lifecycle") as captured):
+            connection = FailedContent()
+            await asyncio.wait_for(connection.task, 3)
+        rows = [json.loads(line[line.index("{"):]) for line in captured.output
+                if '"event": "request_finished"' in line]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["outcome"], "disconnected")
+        self.assertNotIn("first_content_ms", rows[0])
+        self.assertEqual(rows[0]["terminal_reason"], "client_disconnected")
+        self.assertEqual((await self.client.get("/metrics")).json()["first_content_ms"]["count"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
