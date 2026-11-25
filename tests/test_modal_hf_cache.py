@@ -39,7 +39,12 @@ class SnapshotInventoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             manifest = {}
-            for repo, revision in MODELS.items():
+            approved = {
+                "Qwen/Qwen2.5-0.5B-Instruct": "7ae557604adf67be50417f59c2c2f167def9a775",
+                "Qwen/Qwen3-1.7B": "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e",
+            }
+            self.assertEqual(MODELS, approved)
+            for repo, revision in approved.items():
                 snapshot = root / "hub" / f"models--{repo.replace('/', '--')}" / "snapshots" / revision
                 snapshot.mkdir(parents=True)
                 paths = ["config.json", "tokenizer.json", "tokenizer_config.json", "model.safetensors"]
