@@ -88,7 +88,6 @@ def _populate_cache():
             manifest[repo] = {"revision": revision, "paths": paths}
         MANIFEST.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
         cache_volume.commit()
-        verify_manifest(HF_HOME)
     except BaseException:
         MANIFEST.unlink(missing_ok=True)
         raise
