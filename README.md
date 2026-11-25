@@ -914,13 +914,16 @@ The root duration covers the **HTTP request lifetime**, including validation,
 queueing, any model load, and response delivery, not pure model/GPU execution.
 Both apps use outcomes `completed`, `rejected`, `failed`, and `disconnected`.
 A stream can have HTTP 200 but outcome `failed`; cancellation/disconnect is
-`disconnected`, not success. CPU `queue_wait_ms` ends at worker entry; router `queue_wait_ms` runs
-from submission through lease readiness and includes preparation, draining,
-model unload/load, and admission wait. Router producer duration is unavailable,
-not estimated. CPU producer duration is recorded only when known before HTTP
-completion. A disconnected CPU producer can finish later: its existing logs
-may contain authoritative usage that the already-ended trace omits. Missing
-usage is never replaced with zero, the requested cap, or a text-based estimate.
+`disconnected`, not success. CPU `queue_wait_ms` ends at worker entry; router
+`queue_wait_ms` runs from submission through lease readiness and includes
+preparation, draining, model unload/load, and admission wait. Router producer
+duration is unavailable, not estimated. CPU producer duration is recorded only
+when known before HTTP completion. A disconnected CPU producer can finish later:
+its existing logs may contain authoritative usage that the already-ended trace
+omits. Missing usage is never replaced with zero, the requested cap, or a
+text-based estimate. In static multi-worker mode, see
+[Gateway measurement contract](#gateway-measurement-contract-static-multi-worker-mode)
+for the `/metrics` and lifecycle JSONL schema and their counter-reset semantics.
 
 To correlate a request, use `curl -i` with either chat example below and locate
 its `x-request-id` in Langfuse after background export. A completed HTTP request
