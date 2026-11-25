@@ -1,42 +1,83 @@
+import importlib.util
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
-from modal_python_runtime import PYTHON_ALIAS_SETUP
-
 
 class PythonAliasTests(unittest.TestCase):
-    def test_setup_alias_runs_the_existing_python3_interpreter(self):
+    def test_modal_entrypoint_imports_without_unbundled_runtime_module(self):
+        modal = types.ModuleType("modal")
+        modal.App = lambda name: types.SimpleNamespace(
+            function=lambda **kwargs: lambda function: function,
+            local_entrypoint=lambda: lambda function: function,
+        )
+
+        class Image:
+            @classmethod
+            def from_registry(cls, *args, **kwargs):
+                return cls()
+
+            def entrypoint(self, *args, **kwargs):
+                return self
+
+            def env(self, *args, **kwargs):
+                return self
+
+            def add_local_file(self, *args, **kwargs):
+                return self
+
+        modal.Image = Image
+        modal.Volume = types.SimpleNamespace(from_name=lambda *args, **kwargs: object())
+        cache = types.ModuleType("modal_hf_cache")
+        cache.MODELS = {
+            "Qwen/Qwen2.5-0.5B-Instruct": "small-revision",
+            "Qwen/Qwen3-1.7B": "large-revision",
+        }
+        saved = {name: sys.modules.get(name) for name in ("modal", "modal_hf_cache")}
+        old_path = sys.path[:]
+        try:
+            sys.modules.update(modal=modal, modal_hf_cache=cache)
+            sys.path[:] = [entry for entry in old_path if Path(entry or ".").resolve() != Path(__file__).parents[1]]
+            spec = importlib.util.spec_from_file_location(
+                "modal_t4_lab_isolated", Path(__file__).parents[1] / "modal_t4_lab.py"
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        finally:
+            sys.path[:] = old_path
+            for name, value in saved.items():
+                if value is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = value
+
         python3 = shutil.which("python3")
         self.assertIsNotNone(python3)
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary)
             (path / "python3").symlink_to(python3)
             search_path = os.pathsep.join((temporary, os.environ["PATH"]))
-            env = {**os.environ, "PATH": search_path}
-
             subprocess.run(
-                ["/bin/sh", "-c", PYTHON_ALIAS_SETUP.removeprefix("RUN ")],
+                ["/bin/sh", "-c", module.PYTHON_ALIAS_SETUP.removeprefix("RUN ")],
                 check=True,
-                env=env,
+                env={**os.environ, "PATH": search_path},
                 capture_output=True,
                 text=True,
             )
-
             python = shutil.which("python", path=search_path)
-            python3 = shutil.which("python3", path=search_path)
-            self.assertTrue(python)
-            self.assertTrue(python3)
             self.assertEqual(Path(python).resolve(), Path(python3).resolve())
-            code = "import sys; print(sys.version_info[:2])"
             self.assertEqual(
-                subprocess.check_output([python, "-c", code], text=True),
-                subprocess.check_output([python3, "-c", code], text=True),
+                subprocess.check_output([python, "-c", "import sys; print(sys.version_info[:2])"], text=True),
+                subprocess.check_output([python3, "-c", "import sys; print(sys.version_info[:2])"], text=True),
             )
 
 
 if __name__ == "__main__":
     unittest.main()
+
+

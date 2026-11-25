@@ -15,7 +15,9 @@ from pathlib import Path
 import modal
 
 from modal_hf_cache import MODELS as PINNED_MODELS
-from modal_python_runtime import PYTHON_ALIAS_SETUP
+
+# Modal needs an unversioned `python`; alias vLLM's existing interpreter.
+PYTHON_ALIAS_SETUP = 'RUN ln -s "$(command -v python3)" "$(dirname "$(command -v python3)")/python"'
 
 IMAGE = "vllm/vllm-openai@sha256:91ee972ab751fb7180bc71c175865e36b091686600dca783d52b2511399810b3"
 ENGINE_VERSION = "0.33.0"
