@@ -15,6 +15,7 @@ from pathlib import Path
 import modal
 
 from modal_hf_cache import MODELS as PINNED_MODELS
+from modal_python_runtime import PYTHON_ALIAS_SETUP
 
 IMAGE = "vllm/vllm-openai@sha256:91ee972ab751fb7180bc71c175865e36b091686600dca783d52b2511399810b3"
 ENGINE_VERSION = "0.33.0"
@@ -28,7 +29,10 @@ cache_volume = modal.Volume.from_name("inference-huggingface-cache", version=2)
 
 app = modal.App("inference-one-t4-lab")
 image = (
-    modal.Image.from_registry(IMAGE)
+    modal.Image.from_registry(
+        IMAGE,
+        setup_dockerfile_commands=[PYTHON_ALIAS_SETUP],
+    )
     .entrypoint([])
     .env({
         "HF_HOME": "/opt/huggingface",
@@ -38,6 +42,7 @@ image = (
         "VLLM_NO_USAGE_STATS": "1",
     })
     .add_local_file(Path(__file__).parent / "modal_hf_cache.py", "/root/modal_hf_cache.py")
+    .add_local_file(Path(__file__).parent / "modal_python_runtime.py", "/root/modal_python_runtime.py")
 )
 
 
