@@ -109,7 +109,7 @@ Commit the graph, config, metadata, fingerprints, and ignore rules in `.ua/` to
 share the analysis; scratch output is ignored by Git. Review generated summaries
 before sharing them outside the project.
 
-For a separately bounded, offline one-T4 vLLM lab that preserves the pinned serving image and model revisions, see [the Modal T4 lab operator guide](docs/modal-t4-lab.md). It is environment preparation and validation tooling, not a public deployment.
+For a separately bounded one-T4 vLLM lab that populates a pinned Hugging Face cache and enables offline inference, see [the Modal T4 lab operator guide](docs/modal-t4-lab.md). It is environment preparation and validation tooling, not a public deployment.
 
 ## Bounded warm Qwen measurements on Modal
 
