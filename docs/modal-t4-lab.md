@@ -1,6 +1,8 @@
 # One-T4 Modal lab
 
-The lab uses the digest-pinned `vllm/vllm-openai@sha256:91ee972ab751fb7180bc71c175865e36b091686600dca783d52b2511399810b3` image (vLLM 0.33.0) and one stable Modal Volume v2 named `inference-huggingface-cache`, mounted at `/opt/huggingface`. Each T4 execution downloads and verifies the complete pinned Hugging Face snapshots before diagnostics or inference, then commits the manifest and switches back to offline mode. Imports and image builds do not download models or run remote work.
+The lab uses the digest-pinned `vllm/vllm-openai@sha256:91ee972ab751fb7180bc71c175865e36b091686600dca783d52b2511399810b3` image (vLLM 0.33.0) and one stable Modal Volume v2 named `inference-huggingface-cache`, mounted at `/opt/huggingface`. On an empty or invalid cache, the approved T4 execution downloads and verifies both pinned Hugging Face snapshots, commits the manifest, then switches back to offline mode before diagnostics or inference. Later executions reuse a verified cache without downloading or committing. Imports and image builds do not download models or run remote work.
+
+Modal 1.6.3 could not detect Python in the pinned image before the Function ran. The image recipe uses `setup_dockerfile_commands` to expose the existing `python3` as `python` without replacing the image's Python packages; the next approved T4 diagnostic will confirm the interpreter, pip, and torch/vLLM imports. `add_python="3.12"` could provide Modal a detectable interpreter, but adds another Python environment whose packages may differ from the pinned vLLM/PyTorch/CUDA stack. The alias avoids that compatibility risk; its effectiveness in Modal still requires a real T4 run.
 
 ## Populate and verify the cache on T4
 
@@ -10,7 +12,7 @@ From the repository root, with the intended Modal workspace selected and authent
 modal run modal_t4_lab.py --mode diagnostic
 ```
 
-The T4 execution obtains each complete revision file list from the Hub, downloads both exact revisions into the Hub cache under `/opt/huggingface`, and requires exact snapshot path equality, required config/tokenizer metadata and model weight files, and symlink targets inside the mounted Volume. It writes the verified path lists to `/opt/huggingface/verified-snapshots.json`, commits the Volume, and verifies the manifest before any diagnostic or inference. The same preparation runs before each later T4 invocation; cached Hub objects are reused. Any download or verification error stops before inference. The existing T4 function timeout is unchanged; whether both snapshots fit within that limit is unverified, and no timeout or resource limit is increased to accommodate downloads.
+The T4 first validates the mounted Volume v2 manifest and snapshot files locally. If missing or invalid, it obtains each complete revision file list from the Hub, downloads both exact revisions into the Hub cache under `/opt/huggingface`, and requires exact snapshot path equality, required config/tokenizer metadata and model weight files, and symlink targets inside the mounted Volume. It writes the verified path lists to `/opt/huggingface/verified-snapshots.json`, commits the Volume, and verifies the manifest before any diagnostic or inference. A valid cache skips network downloads and commits and stays offline. Any download or verification error stops before inference. The existing T4 function timeout is unchanged; whether both snapshots fit within that limit is unverified, and no timeout or resource limit is increased to accommodate downloads.
 
 Pinned snapshots:
 
@@ -29,7 +31,7 @@ modal profile current
 modal token info >/dev/null 2>&1 && echo 'Modal authentication accepted (details suppressed).'
 ```
 
-Review credits, billing configuration, workspace usage budget and out-of-pocket spend limit in Modal [Usage & Billing](https://modal.com/settings/usage) and the official [budget guide](https://modal.com/docs/guide/budgets). Authentication does not establish the budget or spend-limit configuration. Run the diagnostic above only after explicit spending approval; it populates the cache on T4.
+Review credits, billing configuration, workspace usage budget and out-of-pocket spend limit in Modal [Usage & Billing](https://modal.com/settings/usage) and the official [budget guide](https://modal.com/docs/guide/budgets). Authentication does not establish the budget or spend-limit configuration. Run the diagnostic above only after explicit spending approval; it populates the cache on T4 only when missing or invalid.
 
 After the diagnostic succeeds, run each single-model test one at a time and confirm cleanup between runs:
 

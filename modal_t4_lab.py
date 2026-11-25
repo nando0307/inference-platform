@@ -27,7 +27,7 @@ MODEL_REPOS = {
     "large": "Qwen/Qwen3-1.7B",
 }
 MODELS = {name: (repo, PINNED_MODELS[repo]) for name, repo in MODEL_REPOS.items()}
-cache_volume = modal.Volume.from_name("inference-huggingface-cache", version=2)
+cache_volume = modal.Volume.from_name("inference-huggingface-cache", version=2, create_if_missing=True)
 
 
 app = modal.App("inference-one-t4-lab")
@@ -57,7 +57,7 @@ def _cache(model_path, revision):
         if entry["revision"] != revision:
             raise ValueError("revision mismatch")
         verify_snapshot(snapshot_path(HF_HOME, model_path, revision), HF_HOME, entry["paths"])
-    except (OSError, KeyError, ValueError, json.JSONDecodeError):
+    except (OSError, KeyError, ValueError, TypeError, json.JSONDecodeError):
         return {"model": model_path, "available": False}
     return {"model": model_path, "available": True}
 

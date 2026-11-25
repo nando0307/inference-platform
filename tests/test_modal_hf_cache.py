@@ -53,6 +53,13 @@ class SnapshotInventoryTests(unittest.TestCase):
                 manifest[repo] = {"revision": revision, "paths": paths}
             (root / "verified-snapshots.json").write_text(json.dumps(manifest))
             self.assertTrue(verify_manifest(root))
+            for repo, revision in approved.items():
+                for invalid in (None, {"revision": revision, "paths": None},
+                                {"revision": revision, "paths": dict.fromkeys(paths)}):
+                    with self.subTest(repo=repo, entry=invalid):
+                        (root / "verified-snapshots.json").write_text(json.dumps({**manifest, repo: invalid}))
+                        with self.assertRaisesRegex(RuntimeError, "cache invalid"):
+                            verify_manifest(root)
     def test_verify_manifest_missing_file(self):
         with tempfile.TemporaryDirectory() as temporary:
             with self.assertRaisesRegex(RuntimeError, "cache invalid; re-run a T4 lab command"):

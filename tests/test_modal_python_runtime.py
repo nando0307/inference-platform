@@ -35,7 +35,10 @@ class PythonAliasTests(unittest.TestCase):
                 return self
 
         modal.Image = Image
-        modal.Volume = types.SimpleNamespace(from_name=lambda *args, **kwargs: object())
+        volume_calls = []
+        modal.Volume = types.SimpleNamespace(
+            from_name=lambda *args, **kwargs: volume_calls.append((args, kwargs)) or object()
+        )
         cache = types.ModuleType("modal_hf_cache")
         cache.MODELS = {
             "Qwen/Qwen2.5-0.5B-Instruct": "small-revision",
@@ -60,6 +63,8 @@ class PythonAliasTests(unittest.TestCase):
                     sys.modules[name] = value
 
         self.assertEqual(image_recipe["setup_dockerfile_commands"], [module.PYTHON_ALIAS_SETUP])
+        self.assertEqual(volume_calls, [(("inference-huggingface-cache",),
+                                         {"version": 2, "create_if_missing": True})])
 
         python3 = shutil.which("python3")
         self.assertIsNotNone(python3)
