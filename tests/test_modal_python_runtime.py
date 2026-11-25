@@ -96,7 +96,7 @@ class PythonAliasTests(unittest.TestCase):
         image.env.return_value = image
         image.add_local_file.return_value = image
         volume = MagicMock()
-        volume.commit.side_effect = [RuntimeError("commit failed"), None]
+        volume.commit.side_effect = [RuntimeError("commit failed"), None, None]
         app = types.SimpleNamespace(
             function=lambda **kwargs: lambda fn: fn,
             local_entrypoint=lambda: lambda fn: fn,
@@ -116,8 +116,15 @@ class PythonAliasTests(unittest.TestCase):
             for name in files:
                 (snapshot / name).write_text(name)
 
+        fail_repo = []
+
+        def list_files(repo, revision):
+            if repo in fail_repo:
+                raise RuntimeError("repo unavailable")
+            return files
+
         hub = types.SimpleNamespace(
-            HfApi=lambda: types.SimpleNamespace(list_repo_files=lambda repo, revision: files),
+            HfApi=lambda: types.SimpleNamespace(list_repo_files=list_files),
             snapshot_download=download,
         )
         with tempfile.TemporaryDirectory() as temporary:
@@ -135,10 +142,28 @@ class PythonAliasTests(unittest.TestCase):
                     self.assertFalse(cache.MANIFEST.exists())
                     self.assertEqual(lab["lab"]("diagnostic"), "ready")
                     self.assertTrue(cache.verify_manifest(root))
+                    os.environ.pop("HF_HUB_OFFLINE")
+                    os.environ.pop("TRANSFORMERS_OFFLINE")
                     self.assertEqual(lab["lab"]("diagnostic"), "ready")
-                self.assertEqual(diagnostic.call_count, 2)
-                self.assertEqual(downloads, ["Qwen/Qwen2.5-0.5B-Instruct", "Qwen/Qwen3-1.7B"] * 2)
-                self.assertEqual(volume.commit.call_count, 2)
+                    self.assertEqual(os.environ["HF_HUB_OFFLINE"], "1")
+                    self.assertEqual(os.environ["TRANSFORMERS_OFFLINE"], "1")
+
+                    small = "Qwen/Qwen2.5-0.5B-Instruct"
+                    large = "Qwen/Qwen3-1.7B"
+                    repaired = cache.snapshot_path(root, small, cache.MODELS[small]) / "config.json"
+                    repaired.unlink()
+                    fail_repo.append(large)
+                    with self.assertRaisesRegex(RuntimeError, "repo unavailable"):
+                        lab["lab"]("diagnostic")
+                    self.assertTrue(repaired.exists())
+                    self.assertFalse(cache.MANIFEST.exists())
+                    self.assertEqual(diagnostic.call_count, 2)
+                    fail_repo.clear()
+                    self.assertEqual(lab["lab"]("diagnostic"), "ready")
+                    self.assertTrue(cache.verify_manifest(root))
+                self.assertEqual(diagnostic.call_count, 3)
+                self.assertEqual(downloads, [small, large] * 2 + [small] + [small, large])
+                self.assertEqual(volume.commit.call_count, 3)
                 self.assertEqual(os.environ["HF_HUB_OFFLINE"], "1")
                 self.assertEqual(os.environ["TRANSFORMERS_OFFLINE"], "1")
 

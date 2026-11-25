@@ -68,30 +68,32 @@ def _populate_cache():
 
     try:
         verify_manifest(HF_HOME)
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
         return
     except RuntimeError:
-        pass
+        MANIFEST.unlink(missing_ok=True)
 
     os.environ.pop("HF_HUB_OFFLINE", None)
     os.environ.pop("TRANSFORMERS_OFFLINE", None)
     from huggingface_hub import HfApi, snapshot_download
 
-    api = HfApi()
-    manifest = {}
-    for repo, revision in PINNED_MODELS.items():
-        expected = sorted(api.list_repo_files(repo, revision=revision))
-        snapshot_download(repo, revision=revision, cache_dir=str(HF_HOME / "hub"))
-        paths = verify_snapshot(snapshot_path(HF_HOME, repo, revision), HF_HOME, expected)
-        manifest[repo] = {"revision": revision, "paths": paths}
-    MANIFEST.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     try:
+        api = HfApi()
+        manifest = {}
+        for repo, revision in PINNED_MODELS.items():
+            expected = sorted(api.list_repo_files(repo, revision=revision))
+            snapshot_download(repo, revision=revision, cache_dir=str(HF_HOME / "hub"))
+            paths = verify_snapshot(snapshot_path(HF_HOME, repo, revision), HF_HOME, expected)
+            manifest[repo] = {"revision": revision, "paths": paths}
+        MANIFEST.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
         cache_volume.commit()
+        verify_manifest(HF_HOME)
     except BaseException:
         MANIFEST.unlink(missing_ok=True)
         raise
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    verify_manifest(HF_HOME)
 
 
 
