@@ -42,7 +42,6 @@ image = (
         "VLLM_NO_USAGE_STATS": "1",
     })
     .add_local_file(Path(__file__).parent / "modal_hf_cache.py", "/root/modal_hf_cache.py")
-    .add_local_file(Path(__file__).parent / "modal_python_runtime.py", "/root/modal_python_runtime.py")
 )
 
 
