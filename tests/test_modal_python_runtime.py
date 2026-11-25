@@ -1,5 +1,6 @@
 import importlib.util
 import os
+import runpy
 import shutil
 import subprocess
 import sys
@@ -7,6 +8,9 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import modal_hf_cache as cache
 
 
 class PythonAliasTests(unittest.TestCase):
@@ -85,6 +89,58 @@ class PythonAliasTests(unittest.TestCase):
                 subprocess.check_output([python, "-c", "import sys; print(sys.version_info[:2])"], text=True),
                 subprocess.check_output([python3, "-c", "import sys; print(sys.version_info[:2])"], text=True),
             )
+
+    def test_failed_commit_cannot_reuse_local_manifest(self):
+        image = MagicMock()
+        image.entrypoint.return_value = image
+        image.env.return_value = image
+        image.add_local_file.return_value = image
+        volume = MagicMock()
+        volume.commit.side_effect = [RuntimeError("commit failed"), None]
+        app = types.SimpleNamespace(
+            function=lambda **kwargs: lambda fn: fn,
+            local_entrypoint=lambda: lambda fn: fn,
+        )
+        modal = types.SimpleNamespace(
+            Volume=types.SimpleNamespace(from_name=lambda *args, **kwargs: volume),
+            Image=types.SimpleNamespace(from_registry=lambda *args, **kwargs: image),
+            App=lambda name: app,
+        )
+        files = ["config.json", "tokenizer.json", "tokenizer_config.json", "model.safetensors"]
+        downloads = []
+
+        def download(repo, revision, cache_dir):
+            downloads.append(repo)
+            snapshot = cache.snapshot_path(root, repo, revision)
+            snapshot.mkdir(parents=True, exist_ok=True)
+            for name in files:
+                (snapshot / name).write_text(name)
+
+        hub = types.SimpleNamespace(
+            HfApi=lambda: types.SimpleNamespace(list_repo_files=lambda repo, revision: files),
+            snapshot_download=download,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch.dict(sys.modules, {"modal": modal, "huggingface_hub": hub}), \
+                 patch.object(cache, "HF_HOME", root), \
+                 patch.object(cache, "MANIFEST", root / "verified-snapshots.json"), \
+                 patch.dict(os.environ, {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"}):
+                lab = runpy.run_path(str(Path(__file__).parents[1] / "modal_t4_lab.py"))
+                diagnostic = MagicMock(return_value="ready")
+                with patch.dict(lab["lab"].__globals__, {"_diagnostics": diagnostic}):
+                    with self.assertRaisesRegex(RuntimeError, "commit failed"):
+                        lab["lab"]("diagnostic")
+                    diagnostic.assert_not_called()
+                    self.assertFalse(cache.MANIFEST.exists())
+                    self.assertEqual(lab["lab"]("diagnostic"), "ready")
+                    self.assertTrue(cache.verify_manifest(root))
+                    self.assertEqual(lab["lab"]("diagnostic"), "ready")
+                self.assertEqual(diagnostic.call_count, 2)
+                self.assertEqual(downloads, ["Qwen/Qwen2.5-0.5B-Instruct", "Qwen/Qwen3-1.7B"] * 2)
+                self.assertEqual(volume.commit.call_count, 2)
+                self.assertEqual(os.environ["HF_HUB_OFFLINE"], "1")
+                self.assertEqual(os.environ["TRANSFORMERS_OFFLINE"], "1")
 
 
 if __name__ == "__main__":

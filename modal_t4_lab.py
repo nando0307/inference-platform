@@ -84,7 +84,11 @@ def _populate_cache():
         paths = verify_snapshot(snapshot_path(HF_HOME, repo, revision), HF_HOME, expected)
         manifest[repo] = {"revision": revision, "paths": paths}
     MANIFEST.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-    cache_volume.commit()
+    try:
+        cache_volume.commit()
+    except BaseException:
+        MANIFEST.unlink(missing_ok=True)
+        raise
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     verify_manifest(HF_HOME)
