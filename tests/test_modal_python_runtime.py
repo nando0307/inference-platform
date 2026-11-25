@@ -17,9 +17,12 @@ class PythonAliasTests(unittest.TestCase):
             local_entrypoint=lambda: lambda function: function,
         )
 
+        image_recipe = {}
+
         class Image:
             @classmethod
             def from_registry(cls, *args, **kwargs):
+                image_recipe.update(kwargs)
                 return cls()
 
             def entrypoint(self, *args, **kwargs):
@@ -55,6 +58,8 @@ class PythonAliasTests(unittest.TestCase):
                     sys.modules.pop(name, None)
                 else:
                     sys.modules[name] = value
+
+        self.assertEqual(image_recipe["setup_dockerfile_commands"], [module.PYTHON_ALIAS_SETUP])
 
         python3 = shutil.which("python3")
         self.assertIsNotNone(python3)

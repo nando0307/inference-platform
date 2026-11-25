@@ -6,6 +6,7 @@ Run with ``modal run modal_t4_lab.py --mode diagnostic`` only after operator app
 import json
 import os
 import signal
+import shutil
 import subprocess
 import time
 import urllib.error
@@ -96,6 +97,11 @@ def _diagnostics():
     from importlib.metadata import version
 
     result = {
+        "python_executable": os.path.realpath(os.sys.executable),
+        "python_version": os.sys.version,
+        "path": os.environ.get("PATH", ""),
+        "pip_executable": shutil.which("pip"),
+        "package_paths": {"torch": torch.__file__, "vllm": vllm.__file__},
         "gpu_listing": subprocess.run(["nvidia-smi", "-L"], check=True, text=True,
                                       capture_output=True).stdout.strip(),
         "vllm_version": version("vllm"),
