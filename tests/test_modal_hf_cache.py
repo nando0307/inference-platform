@@ -34,16 +34,42 @@ class SnapshotInventoryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "escapes Volume"):
                 inventory(snapshot, root / "volume")
 
+
+    def test_verify_manifest_accepts_complete_pinned_snapshots(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = {}
+            approved = {
+                "Qwen/Qwen2.5-0.5B-Instruct": "7ae557604adf67be50417f59c2c2f167def9a775",
+                "Qwen/Qwen3-1.7B": "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e",
+            }
+            self.assertEqual(MODELS, approved)
+            for repo, revision in approved.items():
+                snapshot = root / "hub" / f"models--{repo.replace('/', '--')}" / "snapshots" / revision
+                snapshot.mkdir(parents=True)
+                paths = ["config.json", "tokenizer.json", "tokenizer_config.json", "model.safetensors"]
+                for name in paths:
+                    (snapshot / name).write_text(name)
+                manifest[repo] = {"revision": revision, "paths": paths}
+            (root / "verified-snapshots.json").write_text(json.dumps(manifest))
+            self.assertTrue(verify_manifest(root))
+            for repo, revision in approved.items():
+                for invalid in (None, {"revision": revision, "paths": None},
+                                {"revision": revision, "paths": dict.fromkeys(paths)}):
+                    with self.subTest(repo=repo, entry=invalid):
+                        (root / "verified-snapshots.json").write_text(json.dumps({**manifest, repo: invalid}))
+                        with self.assertRaisesRegex(RuntimeError, "cache invalid"):
+                            verify_manifest(root)
     def test_verify_manifest_missing_file(self):
         with tempfile.TemporaryDirectory() as temporary:
-            with self.assertRaisesRegex(RuntimeError, "cache invalid; re-run provision"):
+            with self.assertRaisesRegex(RuntimeError, "cache invalid; re-run a T4 lab command"):
                 verify_manifest(Path(temporary))
 
     def test_verify_manifest_corrupt_json(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "verified-snapshots.json").write_text("not json")
-            with self.assertRaisesRegex(RuntimeError, "cache invalid; re-run provision"):
+            with self.assertRaisesRegex(RuntimeError, "cache invalid; re-run a T4 lab command"):
                 verify_manifest(root)
 
     def test_verify_manifest_missing_entry(self):
@@ -52,9 +78,8 @@ class SnapshotInventoryTests(unittest.TestCase):
             (root / "verified-snapshots.json").write_text(
                 json.dumps({"some-other-repo": {"revision": "abc", "paths": []}})
             )
-            with self.assertRaisesRegex(RuntimeError, "cache invalid; re-run provision"):
+            with self.assertRaisesRegex(RuntimeError, "cache invalid; re-run a T4 lab command"):
                 verify_manifest(root)
-
     def test_verify_manifest_revision_mismatch(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

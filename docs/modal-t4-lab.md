@@ -1,24 +1,25 @@
 # One-T4 Modal lab
 
-The lab uses the digest-pinned `vllm/vllm-openai@sha256:91ee972ab751fb7180bc71c175865e36b091686600dca783d52b2511399810b3` image (vLLM 0.33.0) and one stable Modal Volume v2 named `inference-huggingface-cache`, mounted at `/opt/huggingface`. The volume holds complete, revision-pinned Hugging Face Hub snapshots and a verified path manifest. Provisioning is an explicit CPU-only command; imports and image builds do not download models or run remote work. Inference remains offline and fails unless both snapshots match their complete saved manifests.
+The lab uses the digest-pinned `vllm/vllm-openai@sha256:91ee972ab751fb7180bc71c175865e36b091686600dca783d52b2511399810b3` image (vLLM 0.33.0) and one stable Modal Volume v2 named `inference-huggingface-cache`, mounted at `/opt/huggingface`. On an empty or invalid cache, the approved T4 execution downloads and verifies both pinned Hugging Face snapshots, commits the manifest, then switches back to offline mode before diagnostics or inference. Later executions reuse a verified cache without downloading or committing. Imports and image builds do not download models or run remote work.
 
-## Prepare and verify the cache
+Modal 1.6.3 could not detect Python in the pinned image before the Function ran. The image recipe uses `setup_dockerfile_commands` to expose the existing `python3` as `python` without replacing the image's Python packages; the next T4 diagnostic will confirm the interpreter, pip, and torch/vLLM imports. One T4 validation is authorized but deferred until after PR merge; no hardware result exists yet, so both the root cause and the alias's effectiveness remain unverified. `add_python="3.12"` could provide Modal a detectable interpreter, but adds another Python environment whose packages may differ from the pinned vLLM/PyTorch/CUDA stack. The alias avoids that compatibility risk, pending the T4 result.
 
-From the repository root, with the intended Modal workspace selected and authenticated:
+## Populate and verify the cache on T4
+
+From the repository root, with the intended Modal workspace selected and authenticated, run a diagnostic only after explicit spending approval:
 
 ```bash
-modal run modal_hf_cache_workflow.py --command provision
-modal run modal_hf_cache_workflow.py --command verify
+modal run modal_t4_lab.py --mode diagnostic
 ```
 
-`provision` creates the Volume if needed, downloads both exact revisions using the Hub cache layout under `/opt/huggingface`, obtains each complete revision file list from the Hub, and requires exact snapshot path equality, required config/tokenizer metadata and model weight files, and symlink targets inside the mounted Volume. It stores the verified path lists in `/opt/huggingface/verified-snapshots.json` and commits the Volume. Re-running is safe: existing Hub cache objects are reused rather than downloading already-cached blobs again. `verify` reads only that manifest and the local mounted tree; it makes no network calls.
+The T4 first validates the mounted Volume v2 manifest and snapshot files locally. If missing or invalid, it obtains each complete revision file list from the Hub, downloads both exact revisions into the Hub cache under `/opt/huggingface`, and requires exact snapshot path equality, required config/tokenizer metadata and model weight files, and symlink targets inside the mounted Volume. After fully verifying both snapshots, it writes their verified path lists to `/opt/huggingface/verified-snapshots.json` and commits the Volume before any diagnostic or inference. A valid cache skips network downloads and commits and stays offline. Any download or verification error stops before inference. The existing T4 function timeout is unchanged; whether both snapshots fit within that limit is unverified, and no timeout or resource limit is increased to accommodate downloads.
 
 Pinned snapshots:
 
 - `Qwen/Qwen2.5-0.5B-Instruct` at `7ae557604adf67be50417f59c2c2f167def9a775`: `/opt/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/7ae557604adf67be50417f59c2c2f167def9a775`
 - `Qwen/Qwen3-1.7B` at `70d244cc86ccca08cf5af4e1e306ecf908b1ad5e`: `/opt/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e`
 
-Provisioning requires network access to Hugging Face and incurs CPU time, cache storage, and potentially network transfer charges. Verification needs no network. Do not run provisioning or any paid inference until the workspace, budget and spending limits have been reviewed.
+Provisioning and verification run on the T4 and require network access to Hugging Face; downloads incur GPU/CPU time, cache storage, and potentially network transfer charges. Do not run any paid T4 command until the workspace, budget, spending limits, and explicit per-command approval are confirmed.
 
 ## Preflight and first paid tests
 
@@ -28,19 +29,11 @@ Install Modal CLI 1.6.3 or compatible, select the intended profile, and authenti
 scripts/modal-t4-lab.sh preflight
 modal profile current
 modal token info >/dev/null 2>&1 && echo 'Modal authentication accepted (details suppressed).'
-modal run modal_hf_cache_workflow.py --command verify
 ```
 
-The final command verifies the fully provisioned snapshots offline. Review credits, billing configuration, workspace usage budget and out-of-pocket spend limit in Modal [Usage & Billing](https://modal.com/settings/usage) and the official [budget guide](https://modal.com/docs/guide/budgets). Authentication does not establish the budget or spend-limit configuration.
+Review credits, billing configuration, workspace usage budget and out-of-pocket spend limit in Modal [Usage & Billing](https://modal.com/settings/usage) and the official [budget guide](https://modal.com/docs/guide/budgets). Authentication does not establish the budget or spend-limit configuration. Run the diagnostic above only after explicit spending approval; it populates the cache on T4 only when missing or invalid.
 
-Only after cache verification and explicit spending approval, run the paid one-T4 diagnostic, then verify no lab container remains:
-
-```bash
-modal run modal_t4_lab.py --mode diagnostic
-modal container list
-```
-
-After it passes, run each single-model test one at a time and confirm cleanup between runs:
+After the diagnostic succeeds, run each single-model test one at a time and confirm cleanup between runs:
 
 ```bash
 modal run modal_t4_lab.py --mode single-small

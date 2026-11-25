@@ -42,6 +42,8 @@ def inventory(snapshot, volume_root):
 
 
 def verify_snapshot(snapshot, volume_root, expected):
+    if not isinstance(expected, (list, tuple, set)) or not all(isinstance(path, str) for path in expected):
+        raise ValueError("invalid snapshot path list")
     snapshot = Path(snapshot)
     actual = inventory(snapshot, volume_root)
     missing = set(expected) - actual
@@ -63,6 +65,6 @@ def verify_manifest(root=HF_HOME):
             if entries[repo]["revision"] != revision:
                 raise ValueError(f"manifest revision mismatch for {repo}")
             verify_snapshot(snapshot_path(root, repo, revision), root, entries[repo]["paths"])
-    except (OSError, KeyError, ValueError) as e:
-        raise RuntimeError(f"cache invalid; re-run provision: {e}") from e
+    except (OSError, KeyError, ValueError, TypeError) as e:
+        raise RuntimeError(f"cache invalid; re-run a T4 lab command: {e}") from e
     return True

@@ -1,4 +1,4 @@
-"""Approval-gated, offline diagnostics and vLLM checks on exactly one Modal T4.
+"""Approval-gated cache population and vLLM checks on exactly one Modal T4.
 
 Run with ``modal run modal_t4_lab.py --mode diagnostic`` only after operator approval.
 """
@@ -6,6 +6,7 @@ Run with ``modal run modal_t4_lab.py --mode diagnostic`` only after operator app
 import json
 import os
 import signal
+import shutil
 import subprocess
 import time
 import urllib.error
@@ -16,6 +17,9 @@ import modal
 
 from modal_hf_cache import MODELS as PINNED_MODELS
 
+# Modal needs an unversioned `python`; alias vLLM's existing interpreter.
+PYTHON_ALIAS_SETUP = 'RUN ln -s "$(command -v python3)" "$(dirname "$(command -v python3)")/python"'
+
 IMAGE = "vllm/vllm-openai@sha256:91ee972ab751fb7180bc71c175865e36b091686600dca783d52b2511399810b3"
 ENGINE_VERSION = "0.33.0"
 MODEL_REPOS = {
@@ -23,12 +27,15 @@ MODEL_REPOS = {
     "large": "Qwen/Qwen3-1.7B",
 }
 MODELS = {name: (repo, PINNED_MODELS[repo]) for name, repo in MODEL_REPOS.items()}
-cache_volume = modal.Volume.from_name("inference-huggingface-cache", version=2)
+cache_volume = modal.Volume.from_name("inference-huggingface-cache", version=2, create_if_missing=True)
 
 
 app = modal.App("inference-one-t4-lab")
 image = (
-    modal.Image.from_registry(IMAGE)
+    modal.Image.from_registry(
+        IMAGE,
+        setup_dockerfile_commands=[PYTHON_ALIAS_SETUP],
+    )
     .entrypoint([])
     .env({
         "HF_HOME": "/opt/huggingface",
@@ -50,9 +57,43 @@ def _cache(model_path, revision):
         if entry["revision"] != revision:
             raise ValueError("revision mismatch")
         verify_snapshot(snapshot_path(HF_HOME, model_path, revision), HF_HOME, entry["paths"])
-    except (OSError, KeyError, ValueError, json.JSONDecodeError):
+    except (OSError, KeyError, ValueError, TypeError, json.JSONDecodeError):
         return {"model": model_path, "available": False}
     return {"model": model_path, "available": True}
+
+
+def _populate_cache():
+    from modal_hf_cache import HF_HOME, MANIFEST, MODELS as PINNED_MODELS
+    from modal_hf_cache import snapshot_path, verify_manifest, verify_snapshot
+
+    try:
+        verify_manifest(HF_HOME)
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        return
+    except RuntimeError:
+        MANIFEST.unlink(missing_ok=True)
+
+    os.environ.pop("HF_HUB_OFFLINE", None)
+    os.environ.pop("TRANSFORMERS_OFFLINE", None)
+    from huggingface_hub import HfApi, snapshot_download
+
+    try:
+        api = HfApi()
+        manifest = {}
+        for repo, revision in PINNED_MODELS.items():
+            expected = sorted(api.list_repo_files(repo, revision=revision))
+            snapshot_download(repo, revision=revision, cache_dir=str(HF_HOME / "hub"))
+            paths = verify_snapshot(snapshot_path(HF_HOME, repo, revision), HF_HOME, expected)
+            manifest[repo] = {"revision": revision, "paths": paths}
+        MANIFEST.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        cache_volume.commit()
+    except BaseException:
+        MANIFEST.unlink(missing_ok=True)
+        raise
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
 
 
 def _diagnostics():
@@ -61,6 +102,11 @@ def _diagnostics():
     from importlib.metadata import version
 
     result = {
+        "python_executable": os.path.realpath(os.sys.executable),
+        "python_version": os.sys.version,
+        "path": os.environ.get("PATH", ""),
+        "pip_executable": shutil.which("pip"),
+        "package_paths": {"torch": torch.__file__, "vllm": vllm.__file__},
         "gpu_listing": subprocess.run(["nvidia-smi", "-L"], check=True, text=True,
                                       capture_output=True).stdout.strip(),
         "vllm_version": version("vllm"),
@@ -221,10 +267,11 @@ def _serve(mode):
               min_containers=0, scaledown_window=2, timeout=958, retries=0,
               volumes={"/opt/huggingface": cache_volume})
 def lab(mode: str):
+    if mode not in ("diagnostic", "single-small", "single-large", "shared"):
+        raise ValueError("mode must be diagnostic, single-small, single-large, or shared")
+    _populate_cache()
     if mode == "diagnostic":
         return _diagnostics()
-    if mode not in ("single-small", "single-large", "shared"):
-        raise ValueError("mode must be diagnostic, single-small, single-large, or shared")
     return _serve(mode)
 
 
