@@ -4061,3 +4061,21 @@ This verifies local SDK export, not Langfuse authentication, ingestion, or UI
 rendering. No project keys/base URL were configured for a live Langfuse instance.
 Live dashboard acceptance requires operator-provided credentials and a compatible
 server; no hosted infrastructure was deployed and no performance claim is made.
+
+
+## Single-T4 hardware smoke validation - 2026-11-25
+
+The smoke runs used tested commit `c4f0fafc709e98452633eadbd69ee84d6f360ce9`:
+
+- Diagnostic: https://modal.com/apps/lenando0307/main/ap-aOutfhz9obmlO7y1bPRQoi
+- Single-small: https://modal.com/apps/lenando0307/main/ap-HcEiA1nHFC2sx5gnt1SIZN
+- Single-large: https://modal.com/apps/lenando0307/main/ap-IoxQShyf7iY5FeWGR8i7rR
+- Shared: https://modal.com/apps/lenando0307/main/ap-ACF1iedTd8zg7bbgoFSJEz
+
+Pinned models were `Qwen/Qwen2.5-0.5B-Instruct` revision `7ae557604adf67be50417f59c2c2f167def9a775` and `Qwen/Qwen3-1.7B` revision `70d244cc86ccca08cf5af4e1e306ecf908b1ad5e`.
+
+The diagnostic reported Python 3.12.3, CUDA 13.0, vLLM 0.33.0, one Tesla T4 with compute capability 7.5 and 15,651,369,856 bytes, CUDA available, and both model cache entries available. Each single-model run and the shared two-model run reported ready workers and HTTP 200 for both streaming and non-streaming inference. Post-request GPU memory was 7,612 MiB for single-small, 7,607 MiB for single-large, and 10,846 MiB of 15,360 MiB for shared.
+
+All four Modal apps stopped, and the final active-container listing was empty. The initial diagnostic output showed Hugging Face fetching 10 files and 12 files. Later runs showed both cache entries available but did not explicitly establish that weights were not downloaded again; persistent cache reuse without weight downloads remains unverified.
+
+This completes the single-T4 smoke validation only. It does not establish sustained throughput, production capacity, latency SLO compliance, or two-GPU behavior.

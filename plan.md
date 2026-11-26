@@ -1942,3 +1942,14 @@ model, CPU float32, greedy decoding, EOS rules, and output limit fixed.
 It has not been implemented or measured. Discuss the prediction first and
 obtain explicit confirmation before modifying files.
 
+
+
+# Request routing and adaptive placement roadmap
+
+Continue the existing request-router and adaptive-placement development direction.
+The next independent hardware milestone is two-T4 hardware validation.
+Then proceed in order: static placement validation, short concurrent traffic tests,
+capacity calibration, and reproducible 15-minute benchmark experiments.
+Reuse the existing workload generator, observability, benchmark suite, and worker
+lifecycle infrastructure.
+Do not allocate additional paid GPU resources without explicit approval.
