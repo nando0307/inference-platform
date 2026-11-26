@@ -67,6 +67,24 @@ class ServingConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "queue_capacity_per_worker"):
             validate_config(raw)
 
+    def test_policy_defaults_weights_and_invalid_values(self):
+        raw = self.read("b")
+        raw["routing"].pop("policy")
+        self.assertEqual(validate_config(raw).policy, "least-inflight")
+        self.assertTrue(all(w.capacity_weight == 1 for w in validate_config(raw).workers))
+        raw["workers"][0]["capacity_weight"] = 3
+        for policy in ("least-inflight", "least-queue-depth", "round-robin", "weighted-capacity"):
+            raw["routing"]["policy"] = policy
+            self.assertEqual(validate_config(raw).workers[0].capacity_weight, 3)
+        for value in (0, -1, 1.5, True, "3", None):
+            raw["workers"][0]["capacity_weight"] = value
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "capacity_weight"):
+                validate_config(raw)
+        raw["workers"][0]["capacity_weight"] = 1
+        raw["routing"]["policy"] = "random"
+        with self.assertRaisesRegex(ValueError, "policy"):
+            validate_config(raw)
+
     def test_loader_reads_typed_config(self):
         config = load_config(ROOT / "configs/serving-d.json")
         self.assertEqual(config.placement, "D")

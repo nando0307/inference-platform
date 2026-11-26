@@ -557,6 +557,8 @@ as `errors.unauthorized`; static multi-GPU mode publishes no per-error counters.
 
 ### Static multi-GPU vLLM serving
 
+[Request-routing policies, configuration, and CPU simulation](docs/request-routing.md) document the opt-in dispatch choices and their limits.
+
 The opt-in `src.model_router:create_app` can manage one vLLM process per
 configured worker and route each supported model to its own process. Validate
 the four reviewed placements before launch:
@@ -807,6 +809,7 @@ snapshot percentiles, for offline benchmark percentiles.
 
 The authenticated gateway `/metrics` retains its existing worker/model/physical
 GPU fields and adds `http` observations globally, per model, and per worker.
+Its `routing` policy, admission outcomes, and decision timing are described in [request routing](docs/request-routing.md).
 Each `http` group has cumulative `requests` by delivery outcome (`completed`,
 `rejected`, `failed`, `disconnected`), sanitized `errors`,
 `completed_tokens` (`prompt`, `completion`), and uptime-averaged

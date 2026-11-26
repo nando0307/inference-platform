@@ -9,7 +9,7 @@ from unittest.mock import patch
 import httpx
 from starlette.requests import ClientDisconnect
 
-from src.model_router import create_app, _sse
+from src.model_router import RoutingRequest, create_app, _sse
 from src import model_router as router
 from src.serving_config import load_config
 from src.vllm_engine import HIGH_MODEL, LOW_MODEL
@@ -104,6 +104,97 @@ class MultiWorkerGatewayTests(unittest.IsolatedAsyncioTestCase):
             "model": model, "messages": [{"role": "user", "content": "hello"}],
             "max_tokens": 1, "stream": stream,
         }, headers={"authorization": f"Bearer {token}"})
+
+    def request(self, model=LOW_MODEL):
+        return RoutingRequest(model=model, messages=[{"role": "user", "content": "hello"}], max_tokens=1)
+
+    async def test_policy_selection_and_admission_are_atomic(self):
+        manager = self.app.state.manager
+        small = [manager.workers[key] for key in ("small-0", "small-1")]
+        for policy, expected in (
+            ("least-inflight", ["small-0", "small-1"] * 4),
+            ("round-robin", ["small-0", "small-1"] * 4),
+            ("weighted-capacity", ["small-0", "small-0", "small-1", "small-0"] * 2),
+        ):
+            manager.config = replace(manager.config, policy=policy)
+            manager.workers["small-0"].definition = replace(small[0].definition, capacity_weight=3)
+            manager.routing_cursor.clear()
+            manager.routing_credits.clear()
+            selected = []
+            for index in range(8):
+                lease = manager.submit(self.request(), f"{policy}-{index}")
+                selected.append(lease.worker.definition.id)
+                self.assertLessEqual(len(lease.worker.active), lease.worker.definition.max_sequences)
+                self.assertLessEqual(len(lease.worker.queue), manager.config.queue_capacity_per_worker)
+            if policy != "weighted-capacity":
+                self.assertEqual(selected, expected)
+            else:
+                self.assertEqual(selected[:4], expected[:4])
+                self.assertEqual(sorted(selected).count("small-0"), 4)
+            with self.assertRaises(router.RouterError) as failure:
+                manager.submit(self.request(), "overflow")
+            self.assertEqual((failure.exception.status, failure.exception.code), (429, "server_busy"))
+            for worker in small:
+                for lease in list(worker.active) + list(worker.queue):
+                    manager.cancel_waiting(lease)
+                self.assertEqual(worker.inflight, 0)
+            await asyncio.sleep(0)
+        self.assertEqual(manager.metrics()["routing"]["policy"], "weighted-capacity")
+
+    async def test_eligibility_queue_depth_and_lifecycle(self):
+        manager = self.app.state.manager
+        manager.config = replace(manager.config, policy="least-queue-depth")
+        leases = [manager.submit(self.request(), str(i)) for i in range(5)]
+        self.assertEqual([lease.worker.definition.id for lease in leases],
+                         ["small-0", "small-0", "small-0", "small-1", "small-1"])
+        manager.workers["small-1"].state = "draining"
+        self.assertEqual(manager.submit(self.request(), "next").worker.definition.id, "small-0")
+        manager.workers["large-0"].state = "unavailable"
+        with self.assertRaises(router.RouterError) as unavailable:
+            manager.submit(self.request(HIGH_MODEL), "large")
+        self.assertEqual((unavailable.exception.status, unavailable.exception.code), (503, "not_ready"))
+        for worker in manager.workers.values():
+            for lease in list(worker.active) + list(worker.queue):
+                manager.cancel_waiting(lease)
+        await asyncio.sleep(0)
+        self.assertTrue(all(w.inflight == 0 for w in manager.workers.values()))
+
+    async def test_concurrent_admissions_and_prepare_failure_release(self):
+        manager = self.app.state.manager
+        manager.config = replace(manager.config, policy="round-robin")
+
+        async def submit(index):
+            try:
+                return manager.submit(self.request(), str(index))
+            except router.RouterError as error:
+                return error
+
+        results = await asyncio.gather(*(submit(i) for i in range(20)))
+        leases = [result for result in results if not isinstance(result, router.RouterError)]
+        self.assertEqual(len(leases), 8)
+        self.assertEqual([result.code for result in results if isinstance(result, router.RouterError)],
+                         ["server_busy"] * 12)
+        self.assertTrue(all(lease.worker.definition.model == LOW_MODEL for lease in leases))
+        self.assertEqual(manager.routing_cursor[LOW_MODEL], leases[-1].worker.definition.id)
+        for lease in leases:
+            manager.cancel_waiting(lease)
+        await asyncio.sleep(0)
+        self.assertTrue(all(worker.inflight == 0 for worker in manager.workers.values()))
+
+        worker = manager.workers["small-0"]
+        async def failed_prepare(*args):
+            raise RuntimeError("simulated preparation failure")
+        worker.engine.prepare = failed_prepare
+        lease = manager.submit(self.request(), "prepare-failure")
+        with self.assertRaises(router.RouterError) as failure:
+            await lease.ready
+        self.assertEqual(failure.exception.code, "engine_failed")
+        self.assertEqual(worker.state, "unavailable")
+        self.assertEqual(worker.inflight, 0)
+        self.assertEqual(manager.submit(self.request(), "survivor").worker.definition.id, "small-1")
+        for lease in list(manager.workers["small-1"].active):
+            manager.cancel_waiting(lease)
+        await asyncio.sleep(0)
 
     async def test_model_dispatch_credentials_and_openai_response(self):
         for model in (LOW_MODEL, HIGH_MODEL):
