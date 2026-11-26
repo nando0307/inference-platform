@@ -153,12 +153,14 @@ def run(scenario, configs, initial="A", profile=SHORT_EXPERIMENT, *, adaptive=Tr
             "recommendations": recommendations}
 
 
-def compare(scenario, configs=None, profile=SHORT_EXPERIMENT, **kwargs):
+def compare(scenario, configs=None, profile=SHORT_EXPERIMENT, *, missing_windows=(), stale_windows=()):
     configs = configs or configurations()
     trace = generate_trace(scenario)
     return {"schema_version": SCHEMA_VERSION, "kind": "simulation-comparison",
-            "scenario": scenario.id, "runs": [run(scenario, configs, name, profile, adaptive=False, records=trace) for name in "ABCD"]
-            + [run(scenario, configs, "A", profile, records=trace, **kwargs)]}
+            "scenario": scenario.id, "telemetry_condition": "missing/stale" if missing_windows or stale_windows else "available",
+            "runs": [run(scenario, configs, name, profile, adaptive=False, records=trace) for name in "ABCD"]
+            + [run(scenario, configs, "A", profile, records=trace,
+                   missing_windows=missing_windows, stale_windows=stale_windows)]}
 
 
 def sensitivity(configs=None, scenarios=("small_peak", "large_peak", "alternating_peaks", "mixed_15min")):
@@ -182,13 +184,16 @@ def main():
     parser.add_argument("--scenario", choices=SCENARIOS + ("all",), default="all")
     parser.add_argument("--profile", choices=("short-experiment", "conservative"), default="short-experiment")
     parser.add_argument("--sensitivity", action="store_true")
+    parser.add_argument("--telemetry-gap", choices=("none", "missing", "stale"), default="none")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     profile = CONSERVATIVE if args.profile == "conservative" else SHORT_EXPERIMENT
     configs = configurations()
     names = SCENARIOS if args.scenario == "all" else (args.scenario,)
     result = {"schema_version": SCHEMA_VERSION, "kind": "simulation-suite", "profile": asdict(profile),
-              "comparisons": [compare(load_scenario(ROOT / "configs" / "workloads" / f"{name}.json"), configs, profile)
+              "comparisons": [compare(load_scenario(ROOT / "configs" / "workloads" / f"{name}.json"), configs, profile,
+                                       missing_windows=range(1, 4) if args.telemetry_gap == "missing" else (),
+                                       stale_windows=range(1, 4) if args.telemetry_gap == "stale" else ())
                               for name in names]}
     if args.sensitivity:
         result["sensitivity"] = sensitivity(configs)

@@ -75,16 +75,11 @@ class PlacementPlannerTests(unittest.TestCase):
         self.assertEqual(decision.schema_version, 1)
         self.assertEqual(json.loads(json.dumps(decision.to_dict()))['profile']['name'], 'short-experiment')
         self.assertEqual(decision.provenance['capacity'], 'assumed')
-        def model_capacity(ids, model):
-            return sum(self.snapshot().capacity_rps[id] *
-                       (.7 if sum(self.workers[peer].gpu_uuid == self.workers[id].gpu_uuid for peer in ids) > 1 else 1)
-                       for id in ids if self.workers[id].model == model)
-        target = {w.id for w in self.configs['B'].workers}
-        expected_loss = sum(step.impact_s * sum(max(0, min(decision.demand_rps[m], model_capacity(target, m))
-                                               - min(decision.demand_rps[m], model_capacity(step.available_after, m)))
-                                                for m in self.models) for step in decision.transition)
-        self.assertAlmostEqual(decision.transition_lost_requests, expected_loss)
-        self.assertGreater(expected_loss, 0)  # requests = seconds x requests/second
+        # Independent A→B oracle: target small capacity is 1.19 RPS; the three
+        # pre-step capacities are .70, .49 and .98, giving 4.9 + 7 + 2.1 = 14 requests.
+        self.assertAlmostEqual(decision.transition_lost_requests, 14.0)
+        self.assertEqual([(step.action, step.worker) for step in decision.transition],
+                         [('add', 'large-0'), ('add', 'small-1'), ('remove', 'large-1')])
         for step in decision.transition:
             self.assertEqual({self.workers[id].model for id in step.available_after}, set(self.models))
         # No switch until both 60s cooldown AND 90s residence elapse.
@@ -142,9 +137,17 @@ class PlacementPlannerTests(unittest.TestCase):
         self.assertEqual(run(micro, self.configs)['transitions'], 0)
         stale = run(scenario, self.configs, stale_windows=range(1, 1000))
         missing = run(scenario, self.configs, missing_windows=range(1, 1000))
+        missing_comparison = compare(scenario, self.configs, missing_windows=range(1, 4))
+        stale_comparison = compare(scenario, self.configs, stale_windows=range(1, 4))
         self.assertEqual(missing['transitions'], 0)
         self.assertEqual(stale['transitions'], 0)
         self.assertEqual(stale['final'], 'A')
+        for result in (missing_comparison, stale_comparison):
+            self.assertEqual({run['offered'] for run in result['runs']}, {first['offered']})
+            adaptive_run = result['runs'][-1]
+            self.assertEqual(adaptive_run['final'], 'A')
+            self.assertEqual(adaptive_run['transitions'], 0)
+            self.assertIn('missing or stale observation', {r['reason'] for r in adaptive_run['recommendations']})
         self.assertEqual(len(sensitivity(self.configs, ('small_peak', 'large_peak'))['results']), 10)
 
 

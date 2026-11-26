@@ -96,6 +96,7 @@ class Step:
     action: str
     worker: str
     impact_s: float
+    available_before: tuple[str, ...]
     available_after: tuple[str, ...]
 
 
@@ -159,9 +160,11 @@ def _transition(current, target, snapshot, profile, demand):
         choice = next(((action, id, members) for action, id, members in options if valid(members)), None)
         if choice is None:
             return (), None, "no availability-preserving, resource-feasible transition"
-        action, id, active = choice
+        action, id, members = choice
+        before = tuple(sorted(active))
+        active = members
         (pending if action == "add" else removals).remove(id)
-        steps.append(Step(action, id, profile.transition_step_s, tuple(sorted(active))))
+        steps.append(Step(action, id, profile.transition_step_s, before, tuple(sorted(active))))
     if sum(step.impact_s for step in steps) > profile.horizon_s:
         return (), None, "transition exceeds planning horizon"
     # Charge foregone candidate requests over each step against the same horizon
@@ -169,7 +172,7 @@ def _transition(current, target, snapshot, profile, demand):
     target_capacity = _capacity(target, set(new), snapshot)
     loss = sum(sum(max(0, min(demand[m], target_capacity[m]) - min(demand[m], capacity[m])) * step.impact_s
                    for m in demand)
-               for step, capacity in ((step, _capacity_map(old | new, step.available_after, snapshot, models)) for step in steps))
+               for step, capacity in ((step, _capacity_map(old | new, step.available_before, snapshot, models)) for step in steps))
     return tuple(steps), loss, None
 
 
