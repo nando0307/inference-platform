@@ -68,7 +68,8 @@ class LifecycleLoggingTests(unittest.IsolatedAsyncioTestCase):
             "event", "request_id", "model", "stream", "http_status", "outcome",
             "duration_ms", "producer_duration_ms", "prompt_tokens", "completion_tokens",
             "error_code", "exception_type",
-            "state", "queue_wait_ms", "cancellation_delay_ms", "cancellation_reason",
+            "state", "queue_wait_ms", "first_content_ms", "terminal_reason",
+            "cancellation_delay_ms", "cancellation_reason",
         }
         for record in self.records():
             self.assertLessEqual(record.keys(), allowed)

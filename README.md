@@ -783,7 +783,12 @@ on restart; nothing is aggregated across instances or processes.
 | `uptime_seconds` | seconds since this process initialized |
 
 If startup has not completed, `/metrics` returns 503 `not_ready`. The endpoint
-never includes prompts, outputs, headers, or exception messages.
+never includes prompts, outputs, headers, or exception messages. CPU snapshots
+also include bounded `queue_wait_ms`, `first_content_ms`, and
+`terminal_reasons` (cancellation, disconnect, slow consumer, timeout). Each
+window has a `count` (samples currently retained), `window` (capacity),
+`last`, `p50`, `p95`, and `max`; use terminal log events, **not** rolling
+snapshot percentiles, for offline benchmark percentiles.
 
 ```json
 {
@@ -795,6 +800,63 @@ never includes prompts, outputs, headers, or exception messages.
   "memory": {"process_peak_rss_bytes": 2127249408}
 }
 ```
+
+### Gateway measurement contract (static multi-worker mode)
+
+The authenticated gateway `/metrics` retains its existing worker/model/physical
+GPU fields and adds `http` observations globally, per model, and per worker.
+Each `http` group has cumulative `requests` by delivery outcome (`completed`,
+`rejected`, `failed`, `disconnected`), sanitized `errors`,
+`completed_tokens` (`prompt`, `completion`), and uptime-averaged
+`completed_requests_per_second` and `completed_output_tokens_per_second`.
+The latter is **token throughput**, not request throughput or SLO goodput.
+`queue_wait_ms`, `first_content_ms`, and `http_e2e_ms` are bounded 256-sample
+windows with `count`, `window`, `last`, `p50`, `p95`, and `max`. Missing
+measurements are null/absent, not zero. Cumulative counters and uptime reset
+on process restart; windows evict oldest samples. Counters are per process,
+not across replicas. The existing worker `tokens` totals reflect authoritative
+upstream usage captured during worker release, including usage from a request
+whose HTTP delivery subsequently failed. `http.completed_tokens` includes only
+completed delivery with authoritative usage; partial/produced tokens without
+upstream usage are **unknown**, never inferred from text or token limits.
+
+`inference.router.lifecycle` emits one metadata-only JSON `request_finished`
+line for each authorized chat request, including rejected/failed/disconnected
+requests. It includes server-generated `request_id`, validated `model`, selected
+`worker_id` if any, `stream`, `outcome`, HTTP status, sanitized `error_code`,
+`duration_ms`, `queue_wait_ms`, `first_content_ms`, and authoritative
+`prompt_tokens`/`completion_tokens` if available. Null values mean not observed.
+Use these per-request durations for offline percentile computation and the
+request ID for joining client measurements; no prompts, responses, headers,
+credentials, or raw exception messages are logged. Queue wait runs from
+submission through lease readiness (including preparation and admission);
+end-to-end runs from gateway ASGI entry through final ASGI send or observed
+failure. First-content runs from ASGI entry through successful server-side send
+of the first nonempty streamed content frame; it survives a later failed frame.
+An ASGI send completing **does not prove client receipt**. Client-observed first
+content and engine TTFT are separate measurements, not available here. A stream
+may return HTTP 200 with terminal outcome `failed` or `disconnected`.
+
+Gateway worker `vllm` exposes a fresh/stale/unavailable status, sample age,
+request running/waiting gauges, KV-cache usage fraction, and preemption count
+when the worker exposes matching Prometheus `vllm:` series. Scrapes are
+asynchronous and limited to two concurrent ready workers, with a 2-second
+per-worker timeout and a 256 KiB response cap. Set `VLLM_METRICS_INTERVAL_S`
+to 1–60 seconds (default 5); samples older than two intervals or after poll
+failure have null values, never stale readings disguised as current. Only
+unambiguous finite nonnegative metric series are used (when a `model_name`
+label exists, it must match the worker model); unsupported names or missing
+metrics remain null. Polling failures
+never affect routing or readiness. Lifespan shutdown cancels polling.
+`physical_gpus` preserves existing best-effort local NVML readings; remote or
+unavailable GPU readings remain null. CPU-only simulated-worker tests verify
+timing, counter semantics, and polling failure isolation, but actual vLLM
+metric availability, NVML fidelity, GPU hardware timing, and production
+measurement overhead remain **unverified**. Memory for duration windows is
+bounded; percentile sorting happens on `/metrics` snapshots, not on inference.
+Poll traffic is bounded per interval to at most 256 KiB per sampled worker
+plus protocol overhead; benchmark under real GPU load before interpreting
+production latency or overhead.
 
 ### Optional Langfuse tracing
 
@@ -852,13 +914,16 @@ The root duration covers the **HTTP request lifetime**, including validation,
 queueing, any model load, and response delivery, not pure model/GPU execution.
 Both apps use outcomes `completed`, `rejected`, `failed`, and `disconnected`.
 A stream can have HTTP 200 but outcome `failed`; cancellation/disconnect is
-`disconnected`, not success. CPU `queue_wait_ms` ends at worker entry; router `queue_wait_ms` runs
-from submission through lease readiness and includes preparation, draining,
-model unload/load, and admission wait. Router producer duration is unavailable,
-not estimated. CPU producer duration is recorded only when known before HTTP
-completion. A disconnected CPU producer can finish later: its existing logs
-may contain authoritative usage that the already-ended trace omits. Missing
-usage is never replaced with zero, the requested cap, or a text-based estimate.
+`disconnected`, not success. CPU `queue_wait_ms` ends at worker entry; router
+`queue_wait_ms` runs from submission through lease readiness and includes
+preparation, draining, model unload/load, and admission wait. Router producer
+duration is unavailable, not estimated. CPU producer duration is recorded only
+when known before HTTP completion. A disconnected CPU producer can finish later:
+its existing logs may contain authoritative usage that the already-ended trace
+omits. Missing usage is never replaced with zero, the requested cap, or a
+text-based estimate. In static multi-worker mode, see
+[Gateway measurement contract](#gateway-measurement-contract-static-multi-worker-mode)
+for the `/metrics` and lifecycle JSONL schema and their counter-reset semantics.
 
 To correlate a request, use `curl -i` with either chat example below and locate
 its `x-request-id` in Langfuse after background export. A completed HTTP request
@@ -1077,7 +1142,10 @@ Timing fields use a monotonic clock:
   extraction. It excludes request-body reading and executor handoff.
 - `request_started.queue_wait_ms` measures validated admission to actual worker
   entry, separately from model TTFT. Terminal records use null for jobs canceled before
-  starting.
+  starting. `request_finished.first_content_ms`, when present, measures request
+  entry through successful server-side ASGI send of the first nonempty streamed
+  text frame; it is not client receipt or engine TTFT and remains recorded if
+  a later frame fails.
 - `scheduling_finished.cancellation_delay_ms` measures the first cancellation
   signal to actual worker exit. It is null for never-started jobs and jobs without
   an in-flight cancellation signal. Signals after worker exit are delivery-only.

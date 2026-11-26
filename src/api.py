@@ -36,6 +36,7 @@ from .inference import (
 )
 from .streaming import BoundedTextIteratorStreamer
 from .telemetry import RequestTrace, close_tracer, create_tracer, start_request
+from .measurements import DurationWindow
 
 
 QUEUE_CAPACITY = 2
@@ -67,6 +68,9 @@ class _Metrics:
         self.outcomes = {"completed": 0, "rejected": 0, "failed": 0, "disconnected": 0}
         self.errors: dict[str, int] = {}
         self.durations: deque = deque(maxlen=LATENCY_WINDOW)
+        self.queue_wait = DurationWindow(LATENCY_WINDOW)
+        self.first_content = DurationWindow(LATENCY_WINDOW)
+        self.terminal_reasons: dict[str, int] = {}
         self.prompt_tokens = 0
         self.completion_tokens = 0
         self.producer_ms = 0.0
@@ -79,11 +83,19 @@ class _Metrics:
         prompt_tokens: int | None,
         completion_tokens: int | None,
         producer_ms: float | None,
+        queue_wait_ms: float | None,
+        first_content_ms: float | None,
+        terminal_reason: str | None,
     ) -> None:
         self.outcomes[outcome] = self.outcomes.get(outcome, 0) + 1
         if error_code is not None:
             self.errors[error_code] = self.errors.get(error_code, 0) + 1
         self.durations.append(duration_ms)
+        self.queue_wait.record(queue_wait_ms)
+        self.first_content.record(first_content_ms)
+        reason = terminal_reason or error_code
+        if reason in {"request_canceled", "client_disconnected", "slow_consumer", "request_timeout"}:
+            self.terminal_reasons[reason] = self.terminal_reasons.get(reason, 0) + 1
         if prompt_tokens is not None:
             self.prompt_tokens += prompt_tokens
             self.completion_tokens += completion_tokens or 0
@@ -106,12 +118,15 @@ class _RequestLog:
     http_status: int | None = None
     outcome: str = "completed"
     error_code: str | None = None
+    terminal_reason: str | None = None
     exception_type: str | None = None
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     queue_wait_ms: float | None = None
     cancellation_delay_ms: float | None = None
     producer_duration_ms: float | None = None
+    first_content_ms: float | None = None
+    content_pending: bool = False
     finished: bool = False
     trace: RequestTrace | None = None
 
@@ -144,6 +159,8 @@ class _RequestLog:
         }
         if self.error_code is not None:
             fields["error_code"] = self.error_code
+        if self.terminal_reason is not None:
+            fields["terminal_reason"] = self.terminal_reason
         if self.exception_type is not None:
             fields["exception_type"] = self.exception_type
         if self.prompt_tokens is not None:
@@ -153,11 +170,14 @@ class _RequestLog:
             fields["queue_wait_ms"] = self.queue_wait_ms
         if self.cancellation_delay_ms is not None:
             fields["cancellation_delay_ms"] = self.cancellation_delay_ms
+        if self.first_content_ms is not None:
+            fields["first_content_ms"] = self.first_content_ms
         self.emit("request_finished", **fields)
         if self.metrics is not None:
             self.metrics.record(
                 resolved, self.error_code, fields["duration_ms"],
                 self.prompt_tokens, self.completion_tokens, self.producer_duration_ms,
+                self.queue_wait_ms, self.first_content_ms, self.terminal_reason,
             )
         if self.trace is not None:
             self.trace.update(
@@ -248,6 +268,7 @@ class _RequestLoggingMiddleware:
             message = await receive()
             if message["type"] == "http.disconnect":
                 scope_state["disconnected"] = True
+                request_log.terminal_reason = "client_disconnected"
                 cancel_job("client_disconnected")
                 request_log.finish("disconnected")
             return message
@@ -272,8 +293,13 @@ class _RequestLoggingMiddleware:
                 raise OSError("Chat transport send deadline exceeded.") from None
             except OSError:
                 cancel_job("client_disconnected")
+                request_log.terminal_reason = "client_disconnected"
                 request_log.finish("disconnected")
                 raise ClientDisconnect() from None
+            if (message["type"] == "http.response.body" and request_log.content_pending
+                    and request_log.first_content_ms is None):
+                request_log.first_content_ms = (perf_counter() - request_log.started) * 1000
+                request_log.content_pending = False
             if message["type"] == "http.response.body" and not message.get("more_body", False):
                 request_log.finish()
 
@@ -281,8 +307,10 @@ class _RequestLoggingMiddleware:
             await self.app(scope, receive_logged, send_logged)
         except (ClientDisconnect, OSError):
             cancel_job("client_disconnected")
+            request_log.terminal_reason = "client_disconnected"
             request_log.finish("disconnected")
         except asyncio.CancelledError:
+            request_log.terminal_reason = "request_canceled"
             cancel_job("request_canceled")
             request_log.finish("disconnected")
             raise
@@ -852,6 +880,9 @@ async def _stream_completion(
                 return
             if outcome == "text":
                 if text:
+                    request.state.request_log.content_pending = (
+                        request.state.request_log.first_content_ms is None
+                    )
                     yield chunk({"content": text})
             elif outcome == "end":
                 result = await _await_connected(request, job, future)
@@ -994,6 +1025,12 @@ async def metrics(request: Request):
         },
         "requests": dict(counters.outcomes),
         "errors": dict(counters.errors),
+        "terminal_reasons": dict(counters.terminal_reasons),
+        "queue_wait_ms": {"scope": "admission to executor entry", **counters.queue_wait.snapshot()},
+        "first_content_ms": {
+            "scope": "request entry to first successful ASGI send of nonempty streamed text; not client receipt",
+            **counters.first_content.snapshot(),
+        },
         "latency_ms": {
             "scope": "HTTP request duration at the ASGI boundary, including queueing",
             "window": counters.durations.maxlen,

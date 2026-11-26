@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import math
 import os
 from collections import deque
 from dataclasses import dataclass, field
@@ -11,12 +12,45 @@ import httpx
 
 from .inference import ContextLimitError
 from .model_router import CLOSE_TIMEOUT, DRAIN_TIMEOUT, Lease, RouterError, STOP_TIMEOUT, _observe
+from .measurements import DurationWindow, parse_vllm_metrics
 from .serving_config import ServingConfig
 from .vllm_engine import VLLMEngine
 
 _nvml_initialized = False
 
 logger = logging.getLogger("inference.workers")
+
+
+@dataclass
+class Observations:
+    requests: dict = field(default_factory=lambda: {
+        "completed": 0, "rejected": 0, "failed": 0, "disconnected": 0})
+    errors: dict = field(default_factory=dict)
+    completed_tokens: dict = field(default_factory=lambda: {"prompt": 0, "completion": 0})
+    queue_wait: DurationWindow = field(default_factory=DurationWindow)
+    first_content: DurationWindow = field(default_factory=DurationWindow)
+    e2e: DurationWindow = field(default_factory=DurationWindow)
+
+    def record(self, outcome, code, duration_ms, queue_ms, first_ms, usage):
+        self.requests[outcome] += 1
+        if code:
+            self.errors[code] = self.errors.get(code, 0) + 1
+        self.e2e.record(duration_ms)
+        self.queue_wait.record(queue_ms)
+        self.first_content.record(first_ms)
+        if outcome == "completed" and usage is not None:
+            self.completed_tokens["prompt"] += usage["prompt_tokens"]
+            self.completed_tokens["completion"] += usage["completion_tokens"]
+
+    def snapshot(self, uptime):
+        return {"requests": dict(self.requests), "errors": dict(self.errors),
+                "completed_tokens": dict(self.completed_tokens),
+                "completed_requests_per_second": self.requests["completed"] / uptime if uptime else None,
+                "completed_output_tokens_per_second": (
+                    self.completed_tokens["completion"] / uptime if uptime else None),
+                "queue_wait_ms": self.queue_wait.snapshot(),
+                "first_content_ms": self.first_content.snapshot(),
+                "http_e2e_ms": self.e2e.snapshot()}
 
 
 @dataclass(eq=False)
@@ -33,6 +67,10 @@ class Worker:
     tokens: dict = field(default_factory=lambda: {"prompt": 0, "completion": 0})
     ready_at: float | None = None
     last_error: str | None = None
+    http: Observations = field(default_factory=Observations)
+    vllm_sample: dict = field(default_factory=dict)
+    vllm_sample_at: float | None = None
+    vllm_ok: bool = False
 
     @property
     def inflight(self):
@@ -97,6 +135,13 @@ class MultiWorkerManager:
         self.health_task = None
         self.cleanup_error = None
         self.events = deque(maxlen=2048)
+        interval = float(os.environ.get("VLLM_METRICS_INTERVAL_S", "5"))
+        if not math.isfinite(interval) or not 1 <= interval <= 60:
+            raise ValueError("VLLM_METRICS_INTERVAL_S must be between 1 and 60 seconds.")
+        self.metrics_interval = interval
+        self.metrics_task = None
+        self.http = Observations()
+        self.model_http = {model.id: Observations() for model in config.models.values()}
 
     def emit(self, event, worker=None, **fields):
         self.events.append({"timestamp": perf_counter(), "event": event,
@@ -153,6 +198,7 @@ class MultiWorkerManager:
 
         await asyncio.gather(*(start_worker(w) for w in self.workers.values()))
         self.health_task = asyncio.create_task(self._health_loop(), name="multi-gpu-worker-health")
+        self.metrics_task = asyncio.create_task(self._metrics_loop(), name="vllm-metrics-poll")
         return any(w.state == "ready" for w in self.workers.values())
 
     @staticmethod
@@ -191,6 +237,55 @@ class MultiWorkerManager:
                 await asyncio.gather(*(self._probe(w, w.generation) for w in self.workers.values()))
         except asyncio.CancelledError:
             pass
+
+    async def _poll_metrics(self, client):
+        slots = asyncio.Semaphore(2)
+
+        async def sample(worker):
+            if worker.state != "ready":
+                worker.vllm_ok = False
+                return
+            async with slots:
+                token = os.environ.get(worker.definition.service_token_env)
+                if not token:
+                    worker.vllm_ok = False
+                    return
+                try:
+                    async with asyncio.timeout(2):
+                        async with client.stream("GET", worker.engine.base_url + "/metrics",
+                                                 headers={"authorization": f"Bearer {token}"}) as response:
+                            response.raise_for_status()
+                            data = bytearray()
+                            async for chunk in response.aiter_bytes():
+                                if len(data) + len(chunk) > 262144:
+                                    raise ValueError("Oversized vLLM metrics response.")
+                                data.extend(chunk)
+                    samples = parse_vllm_metrics(data.decode("utf-8"), worker.definition.model)
+                    worker.vllm_sample = samples
+                    worker.vllm_sample_at = perf_counter()
+                    worker.vllm_ok = bool(samples)
+                except (Exception, asyncio.CancelledError) as error:
+                    if isinstance(error, asyncio.CancelledError):
+                        raise
+                    worker.vllm_ok = False
+
+        await asyncio.gather(*(sample(worker) for worker in self.workers.values()))
+
+    async def _metrics_loop(self):
+        try:
+            async with httpx.AsyncClient(timeout=2, trust_env=False) as client:
+                while not self.closing:
+                    await asyncio.sleep(self.metrics_interval)
+                    await self._poll_metrics(client)
+        except asyncio.CancelledError:
+            pass
+
+    def record_http(self, model, worker, outcome, code, duration_ms, queue_ms, first_ms, usage):
+        self.http.record(outcome, code, duration_ms, queue_ms, first_ms, usage)
+        if model in self.model_http:
+            self.model_http[model].record(outcome, code, duration_ms, queue_ms, first_ms, usage)
+        if worker is not None:
+            worker.http.record(outcome, code, duration_ms, queue_ms, first_ms, usage)
 
     def submit(self, body, request_id):
         if not self.accepting:
@@ -239,6 +334,7 @@ class MultiWorkerManager:
                 raise RouterError(503, "not_ready", "The selected worker became unavailable.")
             if lease not in worker.active:
                 raise RouterError(503, "not_ready", "The selected worker lost its admission slot.")
+            lease.ready_at = perf_counter()
             lease.ready.set_result(lease)
             self.emit("admitted", worker, request_id=lease.request_id)
         except asyncio.CancelledError:
@@ -350,11 +446,28 @@ class MultiWorkerManager:
         self._fail_queued(worker, "not_ready")
 
     def metrics(self):
+        uptime = perf_counter() - self.started
         workers = self.snapshot()["workers"]
         for worker_id, row in workers.items():
             ready_at = self.workers[worker_id].ready_at
             row["ready_seconds_after_start"] = (
                 round(ready_at - self.started, 3) if ready_at is not None else None)
+            worker = self.workers[worker_id]
+            age = perf_counter() - worker.vllm_sample_at if worker.vllm_sample_at is not None else None
+            fresh = worker.vllm_ok and age is not None and age <= 2 * self.metrics_interval
+            row["vllm"] = {
+                "status": "available" if fresh else "stale" if age is not None else "unavailable",
+                "sample_age_seconds": round(age, 3) if age is not None else None,
+                "num_requests_running": worker.vllm_sample.get("num_requests_running") if fresh else None,
+                "num_requests_waiting": worker.vllm_sample.get("num_requests_waiting") if fresh else None,
+                "kv_cache_usage_fraction": (
+                    worker.vllm_sample.get("kv_cache_usage_perc", worker.vllm_sample.get("gpu_cache_usage_perc"))
+                    if fresh else None),
+                "num_preemptions": (
+                    worker.vllm_sample.get("num_preemptions_total", worker.vllm_sample.get("num_preemptions"))
+                    if fresh else None),
+            }
+            row["http"] = worker.http.snapshot(uptime)
         worker_counts = {w.definition.id: {
             **w.requests, "prompt_tokens": w.tokens["prompt"], "completion_tokens": w.tokens["completion"],
         } for w in self.workers.values()}
@@ -365,7 +478,8 @@ class MultiWorkerManager:
                 "requests": {key: sum(w.requests[key] for w in members)
                              for key in ("completed", "failed", "canceled", "timeout", "rejected")},
                 "tokens": {"prompt": sum(w.tokens["prompt"] for w in members),
-                           "completion": sum(w.tokens["completion"] for w in members)}}
+                           "completion": sum(w.tokens["completion"] for w in members)},
+                "http": self.model_http[model.id].snapshot(uptime)}
         devices = {}
         for host_id, host in self.config.hosts.items():
             for gpu_uuid in host.gpu_uuids:
@@ -376,9 +490,10 @@ class MultiWorkerManager:
                     "memory_total_bytes": None, "telemetry": "unavailable"}
                 if sample is not None:
                     devices[key].update(sample)
-        return {"uptime_seconds": round(perf_counter() - self.started, 3),
+        return {"uptime_seconds": round(uptime, 3),
                 "workers": workers, "worker_requests": worker_counts,
-                "models": models, "physical_gpus": list(devices.values())}
+                "models": models, "physical_gpus": list(devices.values()),
+                "http": self.http.snapshot(uptime), "vllm_metrics_interval_seconds": self.metrics_interval}
 
     def _nvml_sample(self, gpu_uuid):
         global _nvml_initialized
@@ -405,6 +520,9 @@ class MultiWorkerManager:
         if self.health_task:
             self.health_task.cancel()
             await asyncio.gather(self.health_task, return_exceptions=True)
+        if self.metrics_task:
+            self.metrics_task.cancel()
+            await asyncio.gather(self.metrics_task, return_exceptions=True)
         for task in list(self.tasks):
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)

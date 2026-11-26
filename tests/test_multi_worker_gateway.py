@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import httpx
+from starlette.requests import ClientDisconnect
 
 from src.model_router import create_app, _sse
 from src import model_router as router
@@ -248,6 +249,69 @@ class MultiWorkerGatewayTests(unittest.IsolatedAsyncioTestCase):
         offline = await self.client.get("/ready")
         self.assertEqual(offline.status_code, 503)
         self.assertEqual(offline.json(), {"status": "not_ready"})
+
+
+    async def test_asgi_send_timing_worker_correlation_and_partial_failure(self):
+        async def exchange(*, fail_terminal=False):
+            incoming = asyncio.Queue()
+            incoming.put_nowait({"type": "http.request", "body": json.dumps({
+                "model": LOW_MODEL, "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 1, "stream": True,
+            }).encode(), "more_body": False})
+            waiting, release = asyncio.Event(), asyncio.Event()
+            sent = []
+            scope = {
+                "type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"},
+                "http_version": "1.1", "method": "POST", "scheme": "http",
+                "path": "/v1/chat/completions", "raw_path": b"/v1/chat/completions",
+                "query_string": b"", "headers": [(b"content-type", b"application/json"),
+                                                (b"authorization", b"Bearer CLIENT-SECRET")],
+                "client": ("127.0.0.1", 1234), "server": ("gateway", 80),
+                "app": self.app,
+            }
+
+            async def send(message):
+                body = message.get("body", b"")
+                if b'"content": "hello"' in body:
+                    waiting.set()
+                    await release.wait()
+                if fail_terminal and body == b"data: [DONE]\n\n":
+                    raise OSError("client disappeared")
+                sent.append(message)
+
+            with self.assertLogs("inference.router.lifecycle") as captured:
+                task = asyncio.create_task(self.app(scope, incoming.get, send))
+                try:
+                    await asyncio.wait_for(waiting.wait(), 2)
+                    metrics = self.app.state.manager.metrics()
+                    self.assertEqual(metrics["http"]["first_content_ms"]["count"],
+                                     1 if fail_terminal else 0)
+                finally:
+                    release.set()
+                    if fail_terminal:
+                        with self.assertRaises(ClientDisconnect):
+                            await asyncio.wait_for(task, 3)
+                    else:
+                        await asyncio.wait_for(task, 3)
+            rows = [json.loads(line[line.index("{"):]) for line in captured.output]
+            self.assertEqual(len(rows), 1)
+            request_id = dict(sent[0]["headers"])[b"x-request-id"].decode()
+            self.assertEqual(rows[0]["request_id"], request_id)
+            self.assertEqual(rows[0]["worker_id"], "small-0")
+            self.assertGreater(rows[0]["first_content_ms"], 0)
+            return rows[0]
+
+        delivered = await exchange()
+        self.assertEqual(delivered["outcome"], "completed")
+        self.assertEqual(delivered["completion_tokens"], 1)
+        partial = await exchange(fail_terminal=True)
+        self.assertEqual(partial["outcome"], "disconnected")
+        metrics = self.app.state.manager.metrics()
+        self.assertEqual(metrics["models"][LOW_MODEL]["http"]["completed_tokens"]["completion"], 1)
+        self.assertEqual(metrics["workers"]["small-0"]["http"]["requests"]["disconnected"], 1)
+        self.assertEqual(metrics["http"]["first_content_ms"]["count"], 2)
+        self.assertEqual(metrics["http"]["http_e2e_ms"]["count"], 2)
+        self.assertNotIn("internal-small-0", json.dumps(metrics))
 
 
 if __name__ == "__main__":

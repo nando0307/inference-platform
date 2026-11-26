@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import math
+import re
 import os
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -135,7 +136,7 @@ class RequestTrace:
 
     def update(
         self, *, model=None, stream=None, prompt_tokens=None, completion_tokens=None,
-        queue_wait_ms=None, producer_duration_ms=None,
+        queue_wait_ms=None, producer_duration_ms=None, worker_id=None,
     ):
         if self._observation is None:
             return
@@ -145,6 +146,8 @@ class RequestTrace:
             fields["model"] = model
         if type(stream) is bool:
             metadata["stream"] = stream
+        if type(worker_id) is str and re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", worker_id):
+            metadata["worker_id"] = worker_id
         for key, value in (
             ("queue_wait_ms", queue_wait_ms),
             ("producer_duration_ms", producer_duration_ms),
