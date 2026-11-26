@@ -16,7 +16,9 @@ The implementation now includes Phase 4 controlled concurrency: one inference
 worker, two FIFO waiting slots, cooperative cancellation, and bounded streaming.
 The suite has 241 passing CPU tests, with real-Qwen lifecycle and HTTP smoke evidence.
 The multi-GPU feature adds static two-GPU worker pools, exact-model dispatch, and
-operator-controlled failure handling; real two-T4 validation remains pending.
+operator-controlled failure handling. A single-T4 hardware smoke is recorded in
+[the experiment log](logs/practice.md#single-t4-hardware-smoke-validation); real
+two-T4 validation remains pending.
 See the [Phase 4 evidence](logs/practice.md#phase-4-bounded-concurrency-and-cancellation)
 for the fixed-workload comparison and its limitations. Stage 5 now includes CPU
 and T4 static-batching measurements at sizes 1/2/4; the API remains sequential.
