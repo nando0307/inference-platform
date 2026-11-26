@@ -14,6 +14,7 @@ from .inference import ContextLimitError
 from .model_router import CLOSE_TIMEOUT, DRAIN_TIMEOUT, Lease, RouterError, STOP_TIMEOUT, _observe
 from .measurements import DurationWindow, parse_vllm_metrics
 from .serving_config import ServingConfig
+from .routing import Candidate, select
 from .vllm_engine import VLLMEngine
 
 _nvml_initialized = False
@@ -145,6 +146,10 @@ class MultiWorkerManager:
         self.metrics_task = None
         self.http = Observations()
         self.model_http = {model.id: Observations() for model in config.models.values()}
+        self.routing_cursor = {}
+        self.routing_credits = {}
+        self.routing_outcomes = {"reserved": 0, "server_busy": 0, "not_ready": 0}
+        self.routing_decision = DurationWindow()
 
     def emit(self, event, worker=None, **fields):
         self.events.append({"timestamp": perf_counter(), "event": event,
@@ -324,22 +329,30 @@ class MultiWorkerManager:
             worker.http.record(outcome, code, duration_ms, queue_ms, first_ms, usage)
 
     def submit(self, body, request_id):
+        start = perf_counter()
         if not self.accepting:
+            self.routing_outcomes["not_ready"] += 1
             raise RouterError()
-        candidates = sorted((w for w in self.workers.values()
+        candidates = {w.definition.id: w for w in self.workers.values()
             if w.definition.model == body.model and w.state == "ready"
             and (len(w.active) < w.definition.max_sequences
-                 or len(w.queue) < self.config.queue_capacity_per_worker)),
-            key=lambda w: (w.inflight, w.definition.id))
+                 or len(w.queue) < self.config.queue_capacity_per_worker)}
         if not candidates:
             ready = [w for w in self.workers.values()
                      if w.definition.model == body.model and w.state == "ready"]
             if ready:
                 rejected = min(ready, key=lambda w: (w.inflight, w.definition.id))
                 rejected.requests["rejected"] += 1
+                self.routing_outcomes["server_busy"] += 1
                 raise RouterError(429, "server_busy", "All replicas for the requested model are saturated.")
+            self.routing_outcomes["not_ready"] += 1
             raise RouterError(503, "not_ready", "The requested model is unavailable.")
-        worker = candidates[0]
+        view = tuple(Candidate(w.definition.id, w.inflight, len(w.queue), w.definition.capacity_weight)
+                     for w in candidates.values())
+        selected, next_credits = select(view, self.config.policy,
+                                        self.routing_cursor.get(body.model),
+                                        self.routing_credits.get(body.model, {}))
+        worker = candidates[selected]
         lease = Lease(request_id, body, asyncio.get_running_loop().create_future())
         lease.ready.add_done_callback(_observe)
         lease.worker, lease.generation = worker, worker.generation
@@ -347,7 +360,11 @@ class MultiWorkerManager:
             worker.active.add(lease)
         else:
             worker.queue.append(lease)
-        self.emit("queued", worker, request_id=request_id)
+        self.routing_cursor[body.model] = selected
+        self.routing_credits[body.model] = next_credits
+        self.routing_outcomes["reserved"] += 1
+        self.routing_decision.record((perf_counter() - start) * 1000)
+        self.emit("queued", worker, request_id=request_id, policy=self.config.policy)
         task = asyncio.create_task(self._prepare(lease), name=f"prepare-{worker.definition.id}")
         lease.prepare_task = task
         self.tasks.add(task)
@@ -529,7 +546,10 @@ class MultiWorkerManager:
         return {"uptime_seconds": round(uptime, 3),
                 "workers": workers, "worker_requests": worker_counts,
                 "models": models, "physical_gpus": list(devices.values()),
-                "http": self.http.snapshot(uptime), "vllm_metrics_interval_seconds": self.metrics_interval}
+                "http": self.http.snapshot(uptime),
+                "routing": {"policy": self.config.policy, "outcomes": dict(self.routing_outcomes),
+                            "decision_ms": self.routing_decision.snapshot()},
+                "vllm_metrics_interval_seconds": self.metrics_interval}
 
     def _nvml_sample(self, gpu_uuid):
         global _nvml_initialized

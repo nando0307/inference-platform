@@ -42,6 +42,7 @@ class Worker:
     startup_timeout_s: float
     request_timeout_s: float
     service_token_env: str
+    capacity_weight: int = 1
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,7 @@ class ServingConfig:
     queue_capacity_per_worker: int
     health_interval_s: float
     health_timeout_s: float
+    policy: str = "least-inflight"
 
 
 def _positive(value, name, *, maximum=None):
@@ -111,7 +113,8 @@ def validate_config(raw: dict) -> ServingConfig:
         raise ValueError("At least one worker is required.")
     workers, ids, origins, slots, token_envs = [], set(), set(), set(), set()
     for row in workers_raw:
-        if not isinstance(row, dict) or set(row) != set(Worker.__dataclass_fields__):
+        required = set(Worker.__dataclass_fields__) - {"capacity_weight"}
+        if not isinstance(row, dict) or not required <= set(row) <= required | {"capacity_weight"}:
             raise ValueError("Each worker must use the complete supported worker schema.")
         worker = Worker(**row)
         if not isinstance(worker.id, str) or not worker.id or worker.id in ids:
@@ -148,6 +151,8 @@ def validate_config(raw: dict) -> ServingConfig:
             raise ValueError("Each worker requires a distinct service-token environment variable name.")
         token_envs.add(worker.service_token_env)
         _positive(worker.memory_utilization, "memory_utilization", maximum=0.9)
+        if type(worker.capacity_weight) is not int or worker.capacity_weight <= 0:
+            raise ValueError("capacity_weight must be a positive integer.")
         if type(worker.max_sequences) is not int or worker.max_sequences != MAX_SEQUENCES:
             raise ValueError("max_sequences must be 2.")
         _positive(worker.startup_timeout_s, "startup_timeout_s", maximum=360)
@@ -183,17 +188,20 @@ def validate_config(raw: dict) -> ServingConfig:
         raise ValueError("Declared per-process memory budgets exceed the per-GPU policy cap.")
 
     routing = raw.get("routing")
-    if not isinstance(routing, dict) or set(routing) != {
-        "policy", "queue_capacity_per_worker", "health_interval_s", "health_timeout_s",
-    } or routing.get("policy") != "least-inflight":
-        raise ValueError("routing must match the supported least-inflight schema.")
+    if not isinstance(routing, dict) or set(routing) - {"policy"} != {
+        "queue_capacity_per_worker", "health_interval_s", "health_timeout_s",
+    } or routing.get("policy", "least-inflight") not in {
+        "least-inflight", "least-queue-depth", "round-robin", "weighted-capacity",
+    }:
+        raise ValueError("routing must use a supported policy and schema.")
     if routing.get("queue_capacity_per_worker") != MAX_QUEUE_CAPACITY:
         raise ValueError("queue_capacity_per_worker must be 2.")
     interval = _positive(routing.get("health_interval_s"), "health_interval_s", maximum=60)
     timeout = _positive(routing.get("health_timeout_s"), "health_timeout_s", maximum=30)
     if timeout > interval:
         raise ValueError("health timeout may not exceed the health interval.")
-    return ServingConfig(SCHEMA_VERSION, placement, models, hosts, tuple(workers), MAX_QUEUE_CAPACITY, interval, timeout)
+    return ServingConfig(SCHEMA_VERSION, placement, models, hosts, tuple(workers),
+                         MAX_QUEUE_CAPACITY, interval, timeout, routing.get("policy", "least-inflight"))
 
 
 def load_config(path: str | Path) -> ServingConfig:
