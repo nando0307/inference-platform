@@ -98,17 +98,20 @@ class ExecutorTests(unittest.IsolatedAsyncioTestCase):
                 f"data: {json.dumps({**common, 'choices': [], 'usage': {'prompt_tokens': 1, 'completion_tokens': 1, 'total_tokens': 2}})}\n\n"
                 "data: [DONE]\n\n"
             )
-            return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=content)
+            return httpx.Response(200, headers={"content-type": "text/event-stream", "x-request-id": "server-uuid"}, content=content)
 
         record = {
             "request_id": "request-1", "scenario_id": "test", "phase_id": "phase",
-            "scheduled_offset_s": 0, "model": S, "messages": [{"role": "user", "content": "hi"}],
+            "scheduled_offset_s": 0, "model": S, "model_revision": "pinned", "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 1, "temperature": 0, "top_p": 1, "stream": True,
             "request_timeout_s": 2,
         }
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler), trust_env=False) as client:
             result = await _request(client, "http://gateway", record, 0)
         self.assertEqual(result["status"], "success")
+        self.assertEqual(result["request_id"], "request-1")
+        self.assertEqual(result["server_request_id"], "server-uuid")
+        self.assertEqual(result["model_revision"], "pinned")
         self.assertEqual(result["completion_tokens"], 1)
         self.assertIsNotNone(result["first_text_ms"])
 

@@ -11,13 +11,13 @@ import httpx
 from benchmarks.client import _events as _sse_events
 async def _request(client, endpoint, record, origin, *, cancel_after_s=None):
     started = perf_counter()
-    result = {"result_schema_version": 1, "request_id": record["request_id"], "trace_id": record.get("trace_id"), "scenario_id": record["scenario_id"], "phase_id": record["phase_id"], "model": record["model"], "scheduled_offset_s": record["scheduled_offset_s"], "actual_submit_offset_s": started - origin, "scheduling_delay_ms": (started - origin - record["scheduled_offset_s"]) * 1000, "status": "error", "http_status": None, "error_code": None, "first_event_ms": None, "first_text_ms": None, "completion_ms": None, "prompt_tokens": None, "completion_tokens": None, "total_tokens": None}
+    result = {"result_schema_version": 1, "request_id": record["request_id"], "model_revision": record.get("model_revision"), "trace_id": record.get("trace_id"), "scenario_id": record["scenario_id"], "phase_id": record["phase_id"], "model": record["model"], "scheduled_offset_s": record["scheduled_offset_s"], "actual_submit_offset_s": started - origin, "scheduling_delay_ms": (started - origin - record["scheduled_offset_s"]) * 1000, "status": "error", "http_status": None, "error_code": None, "first_event_ms": None, "first_text_ms": None, "completion_ms": None, "prompt_tokens": None, "completion_tokens": None, "total_tokens": None}
     payload = {"model": record["model"], "messages": record["messages"], "max_tokens": record["max_tokens"], "temperature": record["temperature"], "top_p": record["top_p"], "stream": record["stream"]}
     try:
         async with asyncio.timeout(record["request_timeout_s"]):
             async with client.stream("POST", endpoint.rstrip("/") + "/v1/chat/completions", json=payload) as response:
                 result["http_status"] = response.status_code
-                result["request_id"] = response.headers.get("x-request-id", result["request_id"])
+                result["server_request_id"] = response.headers.get("x-request-id")
                 if response.status_code != 200:
                     await response.aread()
                     try:
@@ -92,7 +92,7 @@ async def replay_trace(records, endpoint, *, auth_token=None, max_inflight=64, m
             target = record["scheduled_offset_s"] / time_scale
             await asyncio.sleep(max(0.0, target - (perf_counter() - origin)))
             if len(active) >= max_inflight:
-                results.append({"result_schema_version": 1, "request_id": record["request_id"], "trace_id": record.get("trace_id"), "scenario_id": record["scenario_id"], "phase_id": record["phase_id"], "model": record["model"], "scheduled_offset_s": record["scheduled_offset_s"], "actual_submit_offset_s": None, "scheduling_delay_ms": None, "status": "not_submitted", "error_code": "client_inflight_limit"})
+                results.append({"result_schema_version": 1, "request_id": record["request_id"], "model_revision": record.get("model_revision"), "trace_id": record.get("trace_id"), "scenario_id": record["scenario_id"], "phase_id": record["phase_id"], "model": record["model"], "scheduled_offset_s": record["scheduled_offset_s"], "actual_submit_offset_s": None, "scheduling_delay_ms": None, "status": "not_submitted", "error_code": "client_inflight_limit"})
                 continue
             task = asyncio.create_task(run_one(client, record))
             tasks.append(task)
