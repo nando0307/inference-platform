@@ -71,6 +71,7 @@ class Worker:
     vllm_sample: dict = field(default_factory=dict)
     vllm_sample_at: float | None = None
     vllm_ok: bool = False
+    stop_task: asyncio.Task | None = None
 
     @property
     def inflight(self):
@@ -133,6 +134,8 @@ class MultiWorkerManager:
         self.closing = False
         self.tasks = set()
         self.health_task = None
+        self.startup_tasks = set()
+        self.shutdown_task = None
         self.cleanup_error = None
         self.events = deque(maxlen=2048)
         interval = float(os.environ.get("VLLM_METRICS_INTERVAL_S", "5"))
@@ -176,11 +179,33 @@ class MultiWorkerManager:
     def _revision(self, model_id):
         return next(model.revision for model in self.config.models.values() if model.id == model_id)
 
+    async def _stop_worker(self, worker):
+        if worker.stop_task is None:
+            async def stop():
+                try:
+                    async with asyncio.timeout(STOP_TIMEOUT):
+                        await worker.engine.stop()
+                    if worker.state != "unavailable" or self.closing:
+                        worker.state = "stopped"
+                except BaseException:
+                    worker.state = "cleanup_failed"
+                    self.cleanup_error = True
+                    raise
+            worker.stop_task = asyncio.create_task(stop())
+        await asyncio.shield(worker.stop_task)
+        if self.closing and worker.state == "unavailable":
+            worker.state = "stopped"
+
     async def start(self):
+        if self.closing:
+            return False
+
         async def start_worker(worker):
             try:
                 async with asyncio.timeout(worker.definition.startup_timeout_s):
                     await worker.engine.start(worker.definition.model)
+                if self.closing:
+                    return
                 if worker.engine.model != worker.definition.model or not worker.engine.is_alive():
                     raise RuntimeError("Worker did not serve the configured model.")
                 worker.state = "ready"
@@ -192,11 +217,19 @@ class MultiWorkerManager:
                 worker.last_error = type(error).__name__
                 self.emit("startup_failed", worker)
                 try:
-                    await worker.engine.stop()
+                    await self._stop_worker(worker)
                 except Exception:
                     worker.last_error = "cleanup_failed"
 
-        await asyncio.gather(*(start_worker(w) for w in self.workers.values()))
+        self.startup_tasks = {asyncio.create_task(start_worker(w)) for w in self.workers.values()}
+        try:
+            await asyncio.gather(*self.startup_tasks)
+        except asyncio.CancelledError:
+            if not self.closing:
+                await self.shutdown()
+            raise
+        if self.closing:
+            return False
         self.health_task = asyncio.create_task(self._health_loop(), name="multi-gpu-worker-health")
         self.metrics_task = asyncio.create_task(self._metrics_loop(), name="vllm-metrics-poll")
         return any(w.state == "ready" for w in self.workers.values())
@@ -229,6 +262,9 @@ class MultiWorkerManager:
             worker.last_error = "health_check_failed"
             self.emit("unready", worker)
             self._fail_queued(worker, "not_ready")
+            for lease in list(worker.active):
+                if lease.task and lease.task is not asyncio.current_task():
+                    lease.task.cancel()
 
     async def _health_loop(self):
         try:
@@ -517,17 +553,34 @@ class MultiWorkerManager:
     async def shutdown(self):
         self.accepting = False
         self.closing = True
+        if self.shutdown_task is None:
+            self.shutdown_task = asyncio.create_task(self._shutdown())
+        await asyncio.shield(self.shutdown_task)
+
+    async def _shutdown(self):
+        for task in self.startup_tasks:
+            task.cancel()
+        if self.startup_tasks:
+            done, pending = await asyncio.wait(self.startup_tasks, timeout=DRAIN_TIMEOUT)
+            await asyncio.gather(*done, return_exceptions=True)
+            if pending:
+                self.cleanup_error = True
         if self.health_task:
             self.health_task.cancel()
             await asyncio.gather(self.health_task, return_exceptions=True)
         if self.metrics_task:
             self.metrics_task.cancel()
             await asyncio.gather(self.metrics_task, return_exceptions=True)
-        for task in list(self.tasks):
-            task.cancel()
-        await asyncio.gather(*self.tasks, return_exceptions=True)
         for worker in self.workers.values():
             self._fail_queued(worker, "not_ready")
+        for task in list(self.tasks):
+            task.cancel()
+        if self.tasks:
+            done, pending = await asyncio.wait(self.tasks, timeout=DRAIN_TIMEOUT)
+            await asyncio.gather(*done, return_exceptions=True)
+            if pending:
+                self.cleanup_error = True
+        for worker in self.workers.values():
             for lease in list(worker.active):
                 if lease.task and lease.task is not asyncio.current_task():
                     lease.task.cancel()
@@ -537,14 +590,7 @@ class MultiWorkerManager:
                     await asyncio.sleep(0.01)
         except TimeoutError:
             self.cleanup_error = True
-        async def stop(worker):
-            try:
-                async with asyncio.timeout(STOP_TIMEOUT):
-                    await worker.engine.stop()
-                worker.state = "stopped"
-            except Exception:
-                worker.state = "cleanup_failed"
-                self.cleanup_error = True
-        await asyncio.gather(*(stop(worker) for worker in self.workers.values()))
+        await asyncio.gather(*(self._stop_worker(worker) for worker in self.workers.values()),
+                             return_exceptions=True)
         if self.cleanup_error:
             raise RuntimeError("At least one worker process group failed cleanup.")

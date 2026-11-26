@@ -336,6 +336,165 @@ class WorkerManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(worker.state, "unavailable")
         self.assertEqual(worker.requests["failed"], 1)
 
+    async def test_startup_crash_cleans_partial_engine_once_and_preserves_readiness(self):
+        class CrashingEngine(FakeEngine):
+            async def start(self, model):
+                await super().start(model)
+                if self.definition.model == LOW_MODEL:
+                    raise RuntimeError("private partial startup")
+
+        manager = MultiWorkerManager(self.config("D"), engine_factory=CrashingEngine)
+        self.assertTrue(await manager.start())
+        failed = manager.workers["small-0"]
+        self.assertEqual(failed.state, "unavailable")
+        self.assertEqual(failed.last_error, "RuntimeError")
+        self.assertFalse(manager.readiness()["ready"])
+        self.assertEqual(failed.engine.stops, 1)
+        self.assertFalse(failed.engine.is_alive())
+        await asyncio.gather(manager.shutdown(), manager.shutdown())
+        await manager.shutdown()
+        self.assertEqual(failed.engine.stops, 1)
+        self.assertEqual(failed.state, "stopped")
+        self.assertEqual(manager.workers["large-0"].engine.stops, 1)
+        self.assertFalse(manager.tasks)
+
+    async def test_shutdown_during_startup_cancels_load_and_cleans_once(self):
+        entered = asyncio.Event()
+        class SlowEngine(FakeEngine):
+            async def start(self, model):
+                self.starts += 1
+                entered.set()
+                await asyncio.Event().wait()
+
+        manager = MultiWorkerManager(self.config("D"), engine_factory=SlowEngine)
+        starting = asyncio.create_task(manager.start())
+        await asyncio.wait_for(entered.wait(), 1)
+        await asyncio.wait_for(manager.shutdown(), 1)
+        with self.assertRaises(asyncio.CancelledError):
+            await starting
+        self.assertFalse(manager.readiness()["ready"])
+        self.assertTrue(all(w.engine.stops == 1 and w.state == "stopped"
+                            for w in manager.workers.values()))
+        await manager.shutdown()
+        self.assertTrue(all(w.engine.stops == 1 for w in manager.workers.values()))
+
+    async def test_health_loss_fails_queue_and_cancels_active_before_shutdown(self):
+        manager = MultiWorkerManager(self.config("D"), engine_factory=FakeEngine)
+        await manager.start()
+        worker = manager.workers["small-0"]
+        first, second, queued = [manager.submit(request(), str(i)) for i in range(3)]
+        await asyncio.gather(first.ready, second.ready)
+        async def hold(lease):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await manager.release(lease, False, "canceled")
+        first.task, second.task = asyncio.create_task(hold(first)), asyncio.create_task(hold(second))
+        await asyncio.sleep(0)
+        worker.engine.alive = False
+        await manager._probe(worker, worker.generation)
+        with self.assertRaises(RouterError):
+            await queued.ready
+        await asyncio.gather(first.task, second.task, return_exceptions=True)
+        await asyncio.gather(*manager.tasks)
+        self.assertEqual(worker.state, "unavailable")
+        self.assertEqual(worker.requests["failed"], 1)
+        self.assertEqual(worker.requests["canceled"], 2)
+        self.assertEqual((len(worker.active), len(worker.queue)), (0, 0))
+        await manager.shutdown()
+        self.assertEqual(worker.engine.stops, 1)
+        self.assertFalse(manager.readiness()["ready"])
+
+    async def test_shutdown_drains_cancelled_request_and_fails_queued_once(self):
+        manager = MultiWorkerManager(self.config("D"), engine_factory=FakeEngine)
+        await manager.start()
+        worker = manager.workers["small-0"]
+        first, second, queued = [manager.submit(request(), str(i)) for i in range(3)]
+        await asyncio.gather(first.ready, second.ready)
+        draining = asyncio.Event()
+        finish = asyncio.Event()
+        async def hold(lease):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                draining.set()
+                await finish.wait()
+                await manager.release(lease, False, "canceled")
+        first.task, second.task = asyncio.create_task(hold(first)), asyncio.create_task(hold(second))
+        await asyncio.sleep(0)
+        shutting = asyncio.create_task(manager.shutdown())
+        await asyncio.wait_for(draining.wait(), 1)
+        self.assertEqual(worker.engine.stops, 0)
+        with self.assertRaises(RouterError):
+            await queued.ready
+        finish.set()
+        await asyncio.wait_for(shutting, 1)
+        await asyncio.gather(first.task, second.task, return_exceptions=True)
+        self.assertEqual(worker.requests["failed"], 1)
+        self.assertEqual(worker.requests["canceled"], 2)
+        self.assertEqual((len(worker.active), len(worker.queue)), (0, 0))
+        self.assertEqual(worker.engine.stops, 1)
+
+    async def test_shutdown_timeout_reports_failure_and_stops_once(self):
+        manager = MultiWorkerManager(self.config("D"), engine_factory=FakeEngine)
+        await manager.start()
+        lease = manager.submit(request(), "stuck")
+        await lease.ready
+        with patch("src.worker_manager.DRAIN_TIMEOUT", 0.01):
+            with self.assertRaisesRegex(RuntimeError, "cleanup"):
+                await asyncio.wait_for(manager.shutdown(), 1)
+        self.assertFalse(manager.readiness()["ready"])
+        self.assertEqual(lease.worker.engine.stops, 1)
+        with self.assertRaisesRegex(RuntimeError, "cleanup"):
+            await manager.shutdown()
+        self.assertEqual(lease.worker.engine.stops, 1)
+        await manager.release(lease, False)
+
+    async def test_stuck_preparation_cannot_hold_shutdown_forever(self):
+        preparing = asyncio.Event()
+        finish = asyncio.Event()
+        class SlowPrepare(FakeEngine):
+            async def prepare(self, model, messages, max_tokens):
+                preparing.set()
+                try:
+                    await finish.wait()
+                except asyncio.CancelledError:
+                    await finish.wait()
+                return await super().prepare(model, messages, max_tokens)
+
+        manager = MultiWorkerManager(self.config("D"), engine_factory=SlowPrepare)
+        await manager.start()
+        lease = manager.submit(request(), "stuck-prepare")
+        await asyncio.wait_for(preparing.wait(), 1)
+        with patch("src.worker_manager.DRAIN_TIMEOUT", 0.01):
+            with self.assertRaisesRegex(RuntimeError, "cleanup"):
+                await asyncio.wait_for(manager.shutdown(), 1)
+        self.assertFalse(manager.readiness()["ready"])
+        self.assertEqual(lease.worker.engine.stops, 1)
+        finish.set()
+        await asyncio.gather(*manager.tasks, return_exceptions=True)
+        self.assertFalse(lease.worker.active)
+        self.assertFalse(manager.tasks)
+        with self.assertRaisesRegex(RuntimeError, "cleanup"):
+            await manager.shutdown()
+
+    async def test_stop_timeout_is_reported_without_duplicate_cleanup(self):
+        class StuckEngine(FakeEngine):
+            async def stop(self):
+                self.stops += 1
+                await asyncio.Event().wait()
+
+        manager = MultiWorkerManager(self.config("D"), engine_factory=StuckEngine)
+        await manager.start()
+        with patch("src.worker_manager.STOP_TIMEOUT", 0.01):
+            with self.assertRaisesRegex(RuntimeError, "cleanup"):
+                await asyncio.wait_for(manager.shutdown(), 1)
+        self.assertTrue(all(w.state == "cleanup_failed" and w.engine.stops == 1
+                            for w in manager.workers.values()))
+        with self.assertRaisesRegex(RuntimeError, "cleanup"):
+            await manager.shutdown()
+        self.assertTrue(all(w.engine.stops == 1 for w in manager.workers.values()))
+
     async def test_metrics_report_configured_idle_gpu_and_lifecycle_evidence(self):
         manager = MultiWorkerManager(self.config("D"), engine_factory=FakeEngine)
         self.addAsyncCleanup(manager.shutdown)
