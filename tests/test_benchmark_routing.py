@@ -9,8 +9,10 @@ class RoutingSimulationTests(unittest.IsolatedAsyncioTestCase):
             results = [await simulate(policy, scenario, seed=17) for policy in POLICIES]
             self.assertEqual(results, [await simulate(policy, scenario, seed=17) for policy in POLICIES])
             self.assertTrue(all(result["evidence"] == "simulation" for result in results))
-            self.assertEqual(len({sum(result["outcomes"][key] for key in
-                                      ("reserved", "server_busy", "not_ready")) for result in results}), 1)
+            expected_arrivals = 104 if scenario == "saturation" else 27
+            self.assertTrue(all(sum(result["outcomes"][key] for key in
+                                    ("reserved", "server_busy", "not_ready")) == expected_arrivals
+                                for result in results))
             self.assertTrue(all(sum(result["assignments"].values()) == result["outcomes"]["reserved"]
                                 for result in results))
         self.assertGreater(results[0]["outcomes"]["server_busy"], 0)
