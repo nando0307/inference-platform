@@ -219,6 +219,7 @@ dependencies = [
  "num-bigint",
  "serde",
  "serde_json",
+ "unicode-ident",
  "url",
 ]
 

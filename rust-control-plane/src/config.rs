@@ -96,8 +96,8 @@ fn gpu_uuid(s: &str) -> bool {
 }
 fn token_env(s: &str) -> bool {
     let mut chars = s.chars();
-    chars.next().is_some_and(|c| c == '_' || c.is_alphabetic())
-        && chars.all(|c| c == '_' || c.is_alphanumeric())
+    chars.next().is_some_and(|c| c == '_' || unicode_ident::is_xid_start(c))
+        && chars.all(|c| c == '_' || unicode_ident::is_xid_continue(c))
 }
 
 impl ServingConfig {
@@ -280,12 +280,19 @@ impl ServingConfig {
                 .nth(2)
                 .and_then(|authority| authority.rsplit_once(':'))
                 .is_some_and(|(_, port)| !port.is_empty());
+            let raw_path = endpoint
+                .split_once("://")
+                .and_then(|(_, rest)| rest.split(['?', '#']).next())
+                .and_then(|rest| rest.split_once('/').map(|(_, path)| path))
+                .unwrap_or("");
             if url.scheme() != "http"
                 || url.host_str().is_none()
                 || !explicit_port
                 || url.port_or_known_default() == Some(0)
                 || !url.username().is_empty()
                 || url.password().is_some()
+                || !raw_path.is_empty()
+                || endpoint.contains('\\')
                 || !["", "/"].contains(&url.path())
                 || url.query().is_some_and(|q| !q.is_empty())
                 || url.fragment().is_some_and(|f| !f.is_empty())

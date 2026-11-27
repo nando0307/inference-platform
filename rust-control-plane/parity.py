@@ -59,9 +59,15 @@ def config_fixtures():
         case = copy.deepcopy(source)
         case["workers"][0]["endpoint"] = "http://127.0.0.1:80"
         yield case
-        for endpoint in ("http://127.0.0.1:0", "http://127.0.0.1:80?", "http://127.0.0.1:80#"):
+        for endpoint in ("http://127.0.0.1:0", "http://127.0.0.1:80?", "http://127.0.0.1:80#",
+                         "http://127.0.0.1:8101/./", "http://127.0.0.1:8101/%2e/",
+                         "http://127.0.0.1:8101\\"):
             case = copy.deepcopy(source)
             case["workers"][0]["endpoint"] = endpoint
+            yield case
+        for name in ("TOKEN²", "TOKEN\u0301"):
+            case = copy.deepcopy(source)
+            case["workers"][0]["service_token_env"] = name
             yield case
         case = copy.deepcopy(source)
         case["workers"][0]["id"], case["workers"][1]["id"] = case["workers"][1]["id"], case["workers"][0]["id"]
