@@ -1,4 +1,5 @@
 use crate::error::Error;
+use num_bigint::BigUint;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -33,11 +34,15 @@ pub struct Worker {
     pub startup_timeout_s: f64,
     pub request_timeout_s: f64,
     pub service_token_env: String,
-    #[serde(default = "one")]
-    pub capacity_weight: u64,
+    #[serde(default = "one", deserialize_with = "parse_weight")]
+    pub capacity_weight: BigUint,
 }
-fn one() -> u64 {
-    1
+fn parse_weight<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<BigUint, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    value.parse().map_err(serde::de::Error::custom)
+}
+fn one() -> BigUint {
+    BigUint::from(1u8)
 }
 #[derive(Debug, Clone)]
 pub struct ServingConfig {
@@ -317,13 +322,20 @@ impl ServingConfig {
             number(&row["startup_timeout_s"], "startup_timeout_s", 360.0)?;
             number(&row["request_timeout_s"], "request_timeout_s", 180.0)?;
             if let Some(weight) = row.get("capacity_weight") {
-                // ponytail: u64 ceiling; use arbitrary-precision weights if schema-v1 configs require larger Python integers.
-                if weight.as_u64().filter(|n| *n > 0).is_none() {
+                if weight
+                    .as_number()
+                    .and_then(|n| n.to_string().parse::<BigUint>().ok())
+                    .is_none_or(|n| n == BigUint::default())
+                {
                     return Err(invalid("capacity_weight must be a positive integer."));
                 }
             }
+            let mut worker_value = value.clone();
+            if let Some(weight) = row.get("capacity_weight") {
+                worker_value["capacity_weight"] = Value::String(weight.to_string());
+            }
             workers.push(
-                serde_json::from_value::<Worker>(value.clone())
+                serde_json::from_value::<Worker>(worker_value)
                     .map_err(|e| invalid(&e.to_string()))?,
             );
         }
@@ -439,6 +451,19 @@ mod tests {
             bad = raw.clone();
             bad["workers"][0]["capacity_weight"] = Value::Bool(true);
             assert!(ServingConfig::validate(&bad).is_err());
+            for weight in [
+                "18446744073709551616",
+                "100000000000000000000000000000000000000000000000000",
+            ] {
+                bad = raw.clone();
+                bad["workers"][0]["capacity_weight"] = serde_json::from_str(weight).unwrap();
+                assert_eq!(
+                    ServingConfig::validate(&bad).unwrap().workers[0]
+                        .capacity_weight
+                        .to_string(),
+                    weight
+                );
+            }
         }
     }
 }

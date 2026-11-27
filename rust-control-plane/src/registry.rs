@@ -32,7 +32,7 @@ impl WorkerRecord {
                 id: self.identity.id.clone(),
                 inflight: self.inflight(),
                 queued: self.queue.len(),
-                weight: self.identity.weight,
+                weight: self.identity.weight.clone(),
             })
     }
 }
@@ -48,7 +48,7 @@ impl Registry {
             ..Self::default()
         };
         for identity in identities {
-            if identity.max_sequences == 0 || identity.weight == 0 {
+            if identity.max_sequences == 0 || identity.weight == 0u8.into() {
                 return Err(Error::Config(
                     "Worker capacity and weight must be positive".into(),
                 ));

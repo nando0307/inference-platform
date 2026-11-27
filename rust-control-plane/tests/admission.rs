@@ -135,7 +135,7 @@ fn weighted_admission_sequence_and_model_isolation() {
     let identities = config.workers.iter().map(|w| {
         let mut id = WorkerIdentity::from_config(w, config.queue_capacity_per_worker);
         if id.id.0 == "small-0" {
-            id.weight = 3;
+            id.weight = 3u8.into();
         }
         id
     });

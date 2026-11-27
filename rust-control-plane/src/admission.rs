@@ -2,6 +2,7 @@ use crate::error::Error;
 use crate::identity::{Generation, ModelId, WorkerId, WorkerIdentity, WorkerState};
 use crate::registry::{Counters, Registry};
 use crate::routing::{self, Policy};
+use num_bigint::BigInt;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -22,7 +23,7 @@ pub struct RoutingOutcomes {
 struct State {
     registry: Registry,
     cursor: HashMap<ModelId, WorkerId>,
-    credits: HashMap<ModelId, HashMap<WorkerId, i128>>,
+    credits: HashMap<ModelId, HashMap<WorkerId, BigInt>>,
     next_id: u64,
     outcomes: RoutingOutcomes,
 }

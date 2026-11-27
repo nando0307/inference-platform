@@ -1,4 +1,5 @@
 use crate::config::Worker as ConfigWorker;
+use num_bigint::BigUint;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WorkerId(pub String);
@@ -23,7 +24,7 @@ pub struct WorkerIdentity {
     pub cuda_device: usize,
     pub max_sequences: usize,
     pub queue_capacity: usize,
-    pub weight: u64,
+    pub weight: BigUint,
 }
 impl WorkerIdentity {
     pub fn from_config(worker: &ConfigWorker, queue_capacity: usize) -> Self {
@@ -35,7 +36,7 @@ impl WorkerIdentity {
             cuda_device: worker.cuda_device,
             max_sequences: worker.max_sequences,
             queue_capacity,
-            weight: worker.capacity_weight,
+            weight: worker.capacity_weight.clone(),
         }
     }
 }

@@ -1,4 +1,5 @@
 //! CPU-only deterministic control-plane microbenchmarks; emits every measured latency (ns).
+use num_bigint::BigUint;
 use rust_control_plane::{
     admission::{Admission, Outcome},
     config::{ServingConfig, SMALL},
@@ -40,13 +41,13 @@ fn sample(kind: &str, iterations: usize) -> (Vec<u64>, u64, u64, u64) {
             id: WorkerId("small-0".into()),
             inflight: 0,
             queued: 0,
-            weight: 1,
+            weight: BigUint::from(1u8),
         },
         Candidate {
             id: WorkerId("small-1".into()),
             inflight: 1,
             queued: 0,
-            weight: 1,
+            weight: BigUint::from(1u8),
         },
     ];
     let wall = Instant::now();

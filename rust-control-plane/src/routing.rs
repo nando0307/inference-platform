@@ -1,5 +1,6 @@
 use crate::error::Error;
 use crate::identity::WorkerId;
+use num_bigint::{BigInt, BigUint};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,7 +27,7 @@ pub struct Candidate {
     pub id: WorkerId,
     pub inflight: usize,
     pub queued: usize,
-    pub weight: u64,
+    pub weight: BigUint,
 }
 
 /// Pure selection; credit state is returned separately and committed only on reservation.
@@ -34,8 +35,8 @@ pub fn select(
     candidates: &[Candidate],
     policy: Policy,
     cursor: Option<&WorkerId>,
-    credits: &HashMap<WorkerId, i128>,
-) -> Result<(WorkerId, HashMap<WorkerId, i128>), Error> {
+    credits: &HashMap<WorkerId, BigInt>,
+) -> Result<(WorkerId, HashMap<WorkerId, BigInt>), Error> {
     if candidates.is_empty() {
         return Err(Error::NotReady);
     }
@@ -64,14 +65,16 @@ pub fn select(
         Policy::WeightedCapacity => {
             // Credits are per model; only currently eligible workers accrue credit.
             for c in &ordered {
-                *next.entry(c.id.clone()).or_default() += i128::from(c.weight);
+                *next.entry(c.id.clone()).or_default() += BigInt::from(c.weight.clone());
             }
             let selected = ordered
                 .iter()
                 .max_by(|a, b| next[&a.id].cmp(&next[&b.id]).then_with(|| b.id.cmp(&a.id)))
                 .unwrap();
-            *next.get_mut(&selected.id).unwrap() -=
-                ordered.iter().map(|c| i128::from(c.weight)).sum::<i128>();
+            *next.get_mut(&selected.id).unwrap() -= ordered
+                .iter()
+                .map(|c| BigInt::from(c.weight.clone()))
+                .sum::<BigInt>();
             selected.id.clone()
         }
     };
@@ -87,13 +90,13 @@ mod tests {
                 id: WorkerId("b".into()),
                 inflight: 0,
                 queued: 0,
-                weight: 1,
+                weight: BigUint::from(1u8),
             },
             Candidate {
                 id: WorkerId("a".into()),
                 inflight: 0,
                 queued: 0,
-                weight: 3,
+                weight: BigUint::from(3u8),
             },
         ];
         for policy in [
@@ -113,6 +116,17 @@ mod tests {
             })
             .collect();
         assert_eq!(got, ["a", "a", "b", "a", "a", "a", "b", "a"]);
-        assert!(credits.values().all(|value| *value == 0));
+        assert!(credits.values().all(|value| *value == BigInt::from(0)));
+        let huge = BigUint::parse_bytes(b"18446744073709551616", 10).unwrap();
+        let candidates = vec![Candidate {
+            id: WorkerId("large".into()),
+            inflight: 0,
+            queued: 0,
+            weight: huge.clone(),
+        }];
+        let (chosen, credits) =
+            select(&candidates, Policy::WeightedCapacity, None, &HashMap::new()).unwrap();
+        assert_eq!(chosen.0, "large");
+        assert_eq!(credits[&chosen], BigInt::from(0));
     }
 }

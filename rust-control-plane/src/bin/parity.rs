@@ -1,3 +1,4 @@
+use num_bigint::{BigInt, BigUint};
 use rust_control_plane::{
     admission::{Admission, Outcome, Reservation},
     config::ServingConfig,
@@ -20,7 +21,7 @@ fn evaluate(raw: &Value) -> Value {
                     id: WorkerId(c["id"].as_str().unwrap().into()),
                     inflight: c["inflight"].as_u64().unwrap() as usize,
                     queued: c["queued"].as_u64().unwrap() as usize,
-                    weight: c["weight"].as_u64().unwrap(),
+                    weight: BigUint::parse_bytes(c["weight"].to_string().as_bytes(), 10).unwrap(),
                 })
                 .collect();
             let cursor = raw["cursor"].as_str().map(|s| WorkerId(s.into()));
@@ -28,7 +29,7 @@ fn evaluate(raw: &Value) -> Value {
                 .as_object()
                 .unwrap()
                 .iter()
-                .map(|(k, v)| (WorkerId(k.clone()), v.as_i64().unwrap() as i128))
+                .map(|(k, v)| (WorkerId(k.clone()), BigInt::from(v.as_i64().unwrap())))
                 .collect();
             match select(
                 &candidates,
