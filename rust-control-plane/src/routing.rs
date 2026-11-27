@@ -42,7 +42,19 @@ pub fn select(
     }
     let mut ordered: Vec<_> = candidates.iter().collect();
     ordered.sort_by(|a, b| a.id.cmp(&b.id));
-    let mut next = credits.clone();
+    let mut next = if policy == Policy::WeightedCapacity {
+        ordered
+            .iter()
+            .map(|c| {
+                (
+                    c.id.clone(),
+                    credits.get(&c.id).cloned().unwrap_or_default(),
+                )
+            })
+            .collect()
+    } else {
+        credits.clone()
+    };
     let chosen = match policy {
         Policy::LeastInflight => ordered
             .iter()
@@ -128,5 +140,35 @@ mod tests {
             select(&candidates, Policy::WeightedCapacity, None, &HashMap::new()).unwrap();
         assert_eq!(chosen.0, "large");
         assert_eq!(credits[&chosen], BigInt::from(0));
+    }
+
+    #[test]
+    fn weighted_credits_follow_eligibility() {
+        let a = Candidate {
+            id: WorkerId("a".into()),
+            inflight: 0,
+            queued: 0,
+            weight: 1u8.into(),
+        };
+        let b = Candidate {
+            id: WorkerId("b".into()),
+            inflight: 0,
+            queued: 0,
+            weight: 3u8.into(),
+        };
+        let both = [a.clone(), b.clone()];
+        let (chosen, credits) =
+            select(&both, Policy::WeightedCapacity, None, &HashMap::new()).unwrap();
+        assert_eq!(chosen, b.id);
+        let (chosen, credits) = select(&[a], Policy::WeightedCapacity, None, &credits).unwrap();
+        assert_eq!(chosen.0, "a");
+        assert_eq!(
+            credits,
+            HashMap::from([(WorkerId("a".into()), BigInt::from(1))])
+        );
+        let (chosen, credits) = select(&both, Policy::WeightedCapacity, None, &credits).unwrap();
+        assert_eq!(chosen.0, "b");
+        let (chosen, _) = select(&both, Policy::WeightedCapacity, None, &credits).unwrap();
+        assert_eq!(chosen.0, "a");
     }
 }

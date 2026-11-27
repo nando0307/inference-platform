@@ -38,7 +38,7 @@ fn evaluate(raw: &Value) -> Value {
                 &credits,
             ) {
                 Ok((id, next)) => {
-                    json!({"chosen": id.0, "credits": next.into_iter().map(|(k, v)| (k.0, v)).collect::<HashMap<_, _>>() })
+                    json!({"chosen": id.0, "credits": next.into_iter().map(|(k, v)| (k.0, serde_json::from_str::<Value>(&v.to_string()).unwrap())).collect::<HashMap<_, _>>() })
                 }
                 Err(_) => json!({"error": "no_eligible"}),
             }

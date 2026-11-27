@@ -85,6 +85,11 @@ def routing_fixtures():
         if policy == "weighted-capacity":
             for credits in ({"a": -2, "b": 2}, {"a": 2, "b": -2}):
                 yield dict(kind="select", candidates=[dict(id="a", inflight=0, queued=0, weight=3), dict(id="b", inflight=0, queued=0, weight=1)], policy=policy, cursor=None, credits=credits)
+            a = dict(id="a", inflight=0, queued=0, weight=1)
+            b = dict(id="b", inflight=0, queued=0, weight=3)
+            for candidates, credits in (([a, b], {}), ([a], {"a": 1, "b": -1}),
+                                        ([a, b], {"a": 1}), ([a, b], {"a": 2, "b": -1})):
+                yield dict(kind="select", candidates=candidates, policy=policy, cursor=None, credits=credits)
 
 
 async def python_trace(case):
