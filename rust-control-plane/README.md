@@ -9,8 +9,6 @@ Independent library for configuration, typed worker identity/registry, determini
 ```sh
 cargo test --manifest-path rust-control-plane/Cargo.toml
 PYTHONPATH="$PWD" python3 rust-control-plane/parity.py
-# Config and pure routing parity without gateway/worker dependencies:
-PYTHONPATH="$PWD" python3 rust-control-plane/parity.py --pure
 python -m unittest tests.test_worker_manager tests.test_serving_config tests.test_routing -q
 ```
 

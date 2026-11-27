@@ -4,7 +4,6 @@ import copy
 from dataclasses import replace
 import json
 import subprocess
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -147,7 +146,7 @@ async def python_trace(case):
         for id, w in manager.workers.items()}, outcomes=manager.routing_outcomes)
 
 
-def fixtures(pure=False):
+def fixtures():
     for raw in config_fixtures():
         try:
             validate_config(raw)
@@ -158,8 +157,6 @@ def fixtures(pure=False):
     for case in routing_fixtures():
         chosen, credits = select(tuple(Candidate(**c) for c in case["candidates"]), case["policy"], case["cursor"], case["credits"])
         yield case, dict(chosen=chosen, credits=credits)
-    if pure:
-        return
     for policy in ("least-inflight", "least-queue-depth", "round-robin", "weighted-capacity"):
         for placement in ("b", "d"):
             actions = [dict(op="reserve", name=str(i), model=LOW_MODEL if i < 9 else HIGH_MODEL)
@@ -172,7 +169,7 @@ def fixtures(pure=False):
 
 def main():
     subprocess.run(["cargo", "build", "--quiet", "--manifest-path", str(RUST / "Cargo.toml"), "--bin", "parity"], check=True)
-    pairs = list(fixtures(pure=sys.argv[1:] == ["--pure"]))
+    pairs = list(fixtures())
     proc = subprocess.run([str(RUST / "target/debug/parity")], input="".join(json.dumps(case) + "\n" for case, _ in pairs), text=True, capture_output=True, check=True)
     actual = [json.loads(line) for line in proc.stdout.splitlines()]
     assert len(actual) == len(pairs)
