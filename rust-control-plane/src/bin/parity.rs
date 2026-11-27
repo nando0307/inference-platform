@@ -29,7 +29,12 @@ fn evaluate(raw: &Value) -> Value {
                 .as_object()
                 .unwrap()
                 .iter()
-                .map(|(k, v)| (WorkerId(k.clone()), BigInt::from(v.as_i64().unwrap())))
+                .map(|(k, v)| {
+                    (
+                        WorkerId(k.clone()),
+                        v.to_string().parse::<BigInt>().unwrap(),
+                    )
+                })
                 .collect();
             match select(
                 &candidates,

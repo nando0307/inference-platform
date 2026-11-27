@@ -1,6 +1,6 @@
 # Rust control plane (schema v1)
 
-Independent library for configuration, typed worker identity/registry, deterministic routing, atomic admission and reservation ownership. It has no Python binding or production integration protocol: Python still owns the gateway, worker execution/lifecycle/health, stream cleanup, and inference. It does not depend on the unfinished placement executor and starts no processes or GPUs. Capacity weights accept positive arbitrary-precision integers, matching Python's schema-v1 behavior. `unicode-ident` supplies the XID character properties used by Python's `str.isidentifier()`; the standard library's alphabetic/alphanumeric checks do not.
+Independent library for configuration, typed worker identity/registry, deterministic routing, atomic admission and reservation ownership. It has no Python binding or production integration protocol: Python still owns the gateway, worker execution/lifecycle/health, stream cleanup, and inference. It does not depend on the unfinished placement executor and starts no processes or GPUs. Capacity weights accept positive arbitrary-precision integers, matching Python's schema-v1 behavior. `unicode-ident` supplies the XID character properties used by Python's `str.isidentifier()`; `unicode-normalization` enforces Python's NFKC hostname delimiter check. Rust's standard library has neither.
 
 `ServingConfig::load` validates the existing A–D JSON topology before constructing identities. `Admission::reserve` holds one mutex across eligibility, policy selection, slot assignment, credit/cursor commit and counters; it returns a non-cloneable `Reservation`. Call `dispatchable` just before handing work off, then `release` once. Dropping the owner (including an aborted future) cancels it. `advance_generation` retires active/queued reservations as failed and fences old owners and stale health updates; a failed worker cannot become ready in the same generation. External/async work must occur **outside** the mutex. No lifecycle work belongs in this crate.
 
@@ -9,6 +9,8 @@ Independent library for configuration, typed worker identity/registry, determini
 ```sh
 cargo test --manifest-path rust-control-plane/Cargo.toml
 PYTHONPATH="$PWD" python3 rust-control-plane/parity.py
+# Config and pure routing parity without gateway/worker dependencies:
+PYTHONPATH="$PWD" python3 rust-control-plane/parity.py --pure
 python -m unittest tests.test_worker_manager tests.test_serving_config tests.test_routing -q
 ```
 

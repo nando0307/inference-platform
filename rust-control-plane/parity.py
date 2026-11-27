@@ -4,14 +4,13 @@ import copy
 from dataclasses import replace
 import json
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 from src.routing import Candidate, select
 from src.serving_config import validate_config
-from src.worker_manager import MultiWorkerManager
 from src.vllm_engine import LOW_MODEL, HIGH_MODEL
-from src.model_router import RouterError
 
 ROOT = Path(__file__).resolve().parents[1]
 RUST = ROOT / "rust-control-plane"
@@ -61,14 +60,25 @@ def config_fixtures():
         yield case
         for endpoint in ("http://127.0.0.1:0", "http://127.0.0.1:80?", "http://127.0.0.1:80#",
                          "http://127.0.0.1:8101/./", "http://127.0.0.1:8101/%2e/",
-                         "http://127.0.0.1:8101\\"):
+                         "http://127.0.0.1:8101\\", "http://a／b:8101",
+                         "http://exa mple.com:8101", "http://a%20b:8101",
+                         "http://[fe80::1%25eth0]:8101", "http://[v1.abc]:8101",
+                         " \tHTTP://example.com:8101/", "http://example.com:8101/#?"):
             case = copy.deepcopy(source)
             case["workers"][0]["endpoint"] = endpoint
             yield case
-        for name in ("TOKEN²", "TOKEN\u0301"):
+        for name in ("TOKEN²", "TOKEN\u0301", "TOKEN\u200c", "℘TOKEN"):
             case = copy.deepcopy(source)
             case["workers"][0]["service_token_env"] = name
             yield case
+        if placement in "bc":
+            for first, second in (("bücher.de", "xn--bcher-kva.de"),
+                                  ("0x7f000001", "127.0.0.1"),
+                                  ("EXAMPLE.COM", "example.com")):
+                case = copy.deepcopy(source)
+                case["workers"][0]["endpoint"] = f"http://{first}:8101"
+                case["workers"][1]["endpoint"] = f"http://{second}:8101"
+                yield case
         case = copy.deepcopy(source)
         case["workers"][0]["id"], case["workers"][1]["id"] = case["workers"][1]["id"], case["workers"][0]["id"]
         yield case
@@ -94,11 +104,16 @@ def routing_fixtures():
             a = dict(id="a", inflight=0, queued=0, weight=1)
             b = dict(id="b", inflight=0, queued=0, weight=3)
             for candidates, credits in (([a, b], {}), ([a], {"a": 1, "b": -1}),
-                                        ([a, b], {"a": 1}), ([a, b], {"a": 2, "b": -1})):
+                                        ([a, b], {"a": 1}), ([a, b], {"a": 2, "b": -1}),
+                                        ([dict(a, weight=18446744073709551616), b], {}),
+                                        ([a, b], {"a": -18446744073709551616, "b": 18446744073709551616})):
                 yield dict(kind="select", candidates=candidates, policy=policy, cursor=None, credits=credits)
 
 
 async def python_trace(case):
+    from src.worker_manager import MultiWorkerManager
+    from src.model_router import RouterError
+
     class Engine:
         async def prepare(self, *args):
             return {}
@@ -132,7 +147,7 @@ async def python_trace(case):
         for id, w in manager.workers.items()}, outcomes=manager.routing_outcomes)
 
 
-def fixtures():
+def fixtures(pure=False):
     for raw in config_fixtures():
         try:
             validate_config(raw)
@@ -143,6 +158,8 @@ def fixtures():
     for case in routing_fixtures():
         chosen, credits = select(tuple(Candidate(**c) for c in case["candidates"]), case["policy"], case["cursor"], case["credits"])
         yield case, dict(chosen=chosen, credits=credits)
+    if pure:
+        return
     for policy in ("least-inflight", "least-queue-depth", "round-robin", "weighted-capacity"):
         for placement in ("b", "d"):
             actions = [dict(op="reserve", name=str(i), model=LOW_MODEL if i < 9 else HIGH_MODEL)
@@ -155,7 +172,7 @@ def fixtures():
 
 def main():
     subprocess.run(["cargo", "build", "--quiet", "--manifest-path", str(RUST / "Cargo.toml"), "--bin", "parity"], check=True)
-    pairs = list(fixtures())
+    pairs = list(fixtures(pure=sys.argv[1:] == ["--pure"]))
     proc = subprocess.run([str(RUST / "target/debug/parity")], input="".join(json.dumps(case) + "\n" for case, _ in pairs), text=True, capture_output=True, check=True)
     actual = [json.loads(line) for line in proc.stdout.splitlines()]
     assert len(actual) == len(pairs)

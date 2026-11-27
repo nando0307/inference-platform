@@ -3,8 +3,9 @@ use num_bigint::BigUint;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
+use std::net::Ipv6Addr;
 use std::path::Path;
-use url::Url;
+use unicode_normalization::UnicodeNormalization;
 
 pub const SMALL: &str = "Qwen/Qwen2.5-0.5B-Instruct";
 pub const LARGE: &str = "Qwen/Qwen3-1.7B";
@@ -96,8 +97,90 @@ fn gpu_uuid(s: &str) -> bool {
 }
 fn token_env(s: &str) -> bool {
     let mut chars = s.chars();
-    chars.next().is_some_and(|c| c == '_' || unicode_ident::is_xid_start(c))
+    chars
+        .next()
+        .is_some_and(|c| c == '_' || unicode_ident::is_xid_start(c))
         && chars.all(|c| c == '_' || unicode_ident::is_xid_continue(c))
+}
+fn endpoint_origin(endpoint: &str) -> Option<(String, u16)> {
+    let clean: String = endpoint
+        .trim_start_matches(|c: char| c <= ' ')
+        .chars()
+        .filter(|c| !matches!(c, '\r' | '\n' | '\t'))
+        .collect();
+    let (scheme, rest) = clean.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("http") {
+        return None;
+    }
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    if authority
+        .chars()
+        .filter(|c| !matches!(c, '@' | ':' | '?' | '#'))
+        .nfkc()
+        .any(|c| matches!(c, '/' | '?' | '#' | '@' | ':'))
+    {
+        return None;
+    }
+    let (before_fragment, fragment) = tail.split_once('#').unwrap_or((tail, ""));
+    let (path, query) = before_fragment
+        .split_once('?')
+        .unwrap_or((before_fragment, ""));
+    if !["", "/"].contains(&path) || !query.is_empty() || !fragment.is_empty() {
+        return None;
+    }
+    let host_port = match authority.rsplit_once('@') {
+        Some(("" | ":", host)) => host,
+        Some(_) => return None,
+        None => authority,
+    };
+    let (host, port) = host_port.rsplit_once(':')?;
+    let port: u16 = if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    } else {
+        port.parse().ok().filter(|n| *n > 0)?
+    };
+    let host = if let Some(inner) = host.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        let ipv_future = inner
+            .strip_prefix(['v', 'V'])
+            .and_then(|s| s.split_once('.'))
+            .is_some_and(|(version, address)| {
+                !version.is_empty()
+                    && version.bytes().all(|b| b.is_ascii_hexdigit())
+                    && !address.is_empty()
+            });
+        let ipv6 = inner.split_once('%').map_or(inner, |(address, zone)| {
+            if zone.is_empty() || zone.contains('%') {
+                ""
+            } else {
+                address
+            }
+        });
+        if !ipv_future && ipv6.parse::<Ipv6Addr>().is_err() {
+            return None;
+        }
+        inner
+    } else if host.contains(['[', ']', ':']) {
+        return None;
+    } else {
+        host
+    };
+    if host.is_empty() {
+        return None;
+    }
+    let hostname = if let Some((name, zone)) = host.split_once('%') {
+        format!("{}%{zone}", name.to_lowercase())
+    } else {
+        host.to_lowercase()
+    };
+    Some((
+        if hostname == "localhost" {
+            "127.0.0.1".into()
+        } else {
+            hostname
+        },
+        port,
+    ))
 }
 
 impl ServingConfig {
@@ -270,44 +353,12 @@ impl ServingConfig {
             let endpoint = row["endpoint"]
                 .as_str()
                 .ok_or_else(|| invalid("Worker endpoint must be a string."))?;
-            let url = Url::parse(endpoint).map_err(|_| {
+            let origin = endpoint_origin(endpoint).ok_or_else(|| {
                 invalid(
                     "Worker endpoint must be an explicit credential-free HTTP origin with a port.",
                 )
             })?;
-            let explicit_port = endpoint
-                .split('/')
-                .nth(2)
-                .and_then(|authority| authority.rsplit_once(':'))
-                .is_some_and(|(_, port)| !port.is_empty());
-            let raw_path = endpoint
-                .split_once("://")
-                .and_then(|(_, rest)| rest.split(['?', '#']).next())
-                .and_then(|rest| rest.split_once('/').map(|(_, path)| path))
-                .unwrap_or("");
-            if url.scheme() != "http"
-                || url.host_str().is_none()
-                || !explicit_port
-                || url.port_or_known_default() == Some(0)
-                || !url.username().is_empty()
-                || url.password().is_some()
-                || !raw_path.is_empty()
-                || endpoint.contains('\\')
-                || !["", "/"].contains(&url.path())
-                || url.query().is_some_and(|q| !q.is_empty())
-                || url.fragment().is_some_and(|f| !f.is_empty())
-            {
-                return Err(invalid(
-                    "Worker endpoint must be an explicit credential-free HTTP origin with a port.",
-                ));
-            }
-            let host_name = url.host_str().unwrap();
-            let normalized = if host_name == "localhost" {
-                "127.0.0.1"
-            } else {
-                host_name
-            };
-            if !origins.insert((normalized.to_string(), url.port_or_known_default().unwrap())) {
+            if !origins.insert(origin) {
                 return Err(invalid("Worker endpoints must be unique."));
             }
             let env = row["service_token_env"]
