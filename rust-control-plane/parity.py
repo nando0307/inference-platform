@@ -57,7 +57,11 @@ def config_fixtures():
         case = copy.deepcopy(source)
         case["workers"][0]["endpoint"] = "http://127.0.0.1:80"
         yield case
-        for endpoint in ("http://127.0.0.1:0", "http://127.0.0.1:80?", "http://127.0.0.1:80#",
+        for endpoint in ("http://127.0.0.1:0", "http://127.0.0.1:00000000000000000000000",
+                         "http://127.0.0.1:00000000000000000000080",
+                         "http://127.0.0.1:00000000000000000065535",
+                         "http://127.0.0.1:00000000000000000065536",
+                         "http://127.0.0.1:80?", "http://127.0.0.1:80#",
                          "http://127.0.0.1:8101/./", "http://127.0.0.1:8101/%2e/",
                          "http://127.0.0.1:8101\\", "http://a／b:8101",
                          "http://exa mple.com:8101", "http://a%20b:8101",
@@ -71,6 +75,9 @@ def config_fixtures():
             case["workers"][0]["service_token_env"] = name
             yield case
         if placement in "bc":
+            case = copy.deepcopy(source)
+            case["workers"][1]["endpoint"] = "http://127.0.0.1:00000000000000000008101"
+            yield case
             for first, second in (("bücher.de", "xn--bcher-kva.de"),
                                   ("0x7f000001", "127.0.0.1"),
                                   ("EXAMPLE.COM", "example.com")):
