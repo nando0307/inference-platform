@@ -1,0 +1,88 @@
+{
+  "metadata": {
+    "platform": "macOS-26.6.2-arm64-arm-64bit",
+    "cpu": "Apple M1 Pro",
+    "cpu_count": "8",
+    "memory_bytes": "17179869184",
+    "python": "Python 3.12.13",
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14) (built from a source tarball)",
+    "cargo": "cargo 1.95.0 (f2d3ce0bd 2026-03-21)",
+    "repeats": 5,
+    "workloads": {
+      "selector": [
+        1000,
+        10000
+      ],
+      "reservation": [
+        300,
+        3000
+      ],
+      "synthetic": [
+        50,
+        500
+      ]
+    }
+  },
+  "results": {
+    "selector/python": {
+      "p50_ns": 583,
+      "p95_ns": 625,
+      "p99_ns": 708,
+      "requests_per_second": 1510923.9,
+      "peak_rss_bytes": 352583680,
+      "max_synthetic_capacity": 0,
+      "rejected": 0,
+      "total_elapsed_ns": 33092335
+    },
+    "selector/rust": {
+      "p50_ns": 42,
+      "p95_ns": 84,
+      "p99_ns": 125,
+      "requests_per_second": 11190170.9,
+      "peak_rss_bytes": 2572288,
+      "max_synthetic_capacity": 0,
+      "rejected": 0,
+      "total_elapsed_ns": 4468207
+    },
+    "reservation/python": {
+      "p50_ns": 4208,
+      "p95_ns": 4916,
+      "p99_ns": 41208,
+      "requests_per_second": 82666.7,
+      "peak_rss_bytes": 354713600,
+      "max_synthetic_capacity": 0,
+      "rejected": 0,
+      "total_elapsed_ns": 181451543
+    },
+    "reservation/rust": {
+      "p50_ns": 333,
+      "p95_ns": 375,
+      "p99_ns": 458,
+      "requests_per_second": 2303410.4,
+      "peak_rss_bytes": 2359296,
+      "max_synthetic_capacity": 0,
+      "rejected": 0,
+      "total_elapsed_ns": 6512083
+    },
+    "synthetic/python": {
+      "p50_ns": 116916,
+      "p95_ns": 180500,
+      "p99_ns": 238916,
+      "requests_per_second": 71274.1,
+      "peak_rss_bytes": 353107968,
+      "max_synthetic_capacity": 8,
+      "rejected": 2500,
+      "total_elapsed_ns": 315682790
+    },
+    "synthetic/rust": {
+      "p50_ns": 3708,
+      "p95_ns": 4292,
+      "p99_ns": 14000,
+      "requests_per_second": 2239409.6,
+      "peak_rss_bytes": 2293760,
+      "max_synthetic_capacity": 8,
+      "rejected": 2500,
+      "total_elapsed_ns": 10047291
+    }
+  }
+}
