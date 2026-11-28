@@ -138,7 +138,10 @@ fn endpoint_origin(endpoint: &str) -> Option<(String, u16)> {
     let port: u16 = if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     } else {
-        port.trim_start_matches('0').parse().ok().filter(|n| *n > 0)?
+        port.trim_start_matches('0')
+            .parse()
+            .ok()
+            .filter(|n| *n > 0)?
     };
     let host = if let Some(inner) = host.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
         let ipv_future = inner
